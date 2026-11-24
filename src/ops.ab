@@ -1,0 +1,125 @@
+// Typed ops over the Backend interface (docs/interfaces.md section 6, kernel signatures in docs/kernels.md). The model calls only these;
+// each builds the KernelArgs in the kernel's parameter order and launches it by name. Buffers are passed with a byte offset.
+// `kind` is the weight storage type's kernel suffix: "f32", "bf16", "q8_0", "q4_k", "q5_k", "q6_k", "nvfp4".
+import "backend/backend.ab"
+
+fun opMatvec(
+    var backend: Backend, kind: string,
+    w: DeviceBuffer, wOffset: int, x: DeviceBuffer, xOffset: int, y: DeviceBuffer, yOffset: int,
+    rows: int, cols: int
+): bool = backend.launch(
+    "matvec_$kind",
+    kernelArgs().pointer(w, wOffset).pointer(x, xOffset).pointer(y, yOffset).u32(rows).u32(cols),
+    [rows]
+)
+
+// Experts selected by `ids` (u32 each, on the device). `xStrideElems` 0 broadcasts one x to every expert (gate/up), `cols` gives each
+// expert its own x (down).
+fun opMatvecIndexed(
+    var backend: Backend, kind: string,
+    w: DeviceBuffer, wOffset: int, x: DeviceBuffer, xOffset: int, y: DeviceBuffer, yOffset: int,
+    rows: int, cols: int, ids: DeviceBuffer, idsOffset: int, nUsed: int, expertStrideBytes: int, xStrideElems: int
+): bool = backend.launch(
+    "matvec_${kind}_indexed",
+    kernelArgs().pointer(w, wOffset).pointer(x, xOffset).pointer(y, yOffset).u32(rows).u32(cols)
+        .pointer(ids, idsOffset).u32(nUsed).u64(expertStrideBytes).u32(xStrideElems),
+    [rows, nUsed]
+)
+
+fun opRmsNorm(
+    var backend: Backend, x: DeviceBuffer, xOffset: int, w: DeviceBuffer, wOffset: int, y: DeviceBuffer, yOffset: int,
+    n: int, eps: f32, vectors: int
+): bool = backend.launch(
+    "rmsnorm",
+    kernelArgs().pointer(x, xOffset).pointer(w, wOffset).pointer(y, yOffset).u32(n).f32(eps),
+    [vectors]
+)
+
+fun opAdd(
+    var backend: Backend, a: DeviceBuffer, aOffset: int, b: DeviceBuffer, bOffset: int, out: DeviceBuffer, outOffset: int, n: int
+): bool = backend.launch(
+    "add", kernelArgs().pointer(a, aOffset).pointer(b, bOffset).pointer(out, outOffset).u32(n), [n]
+)
+
+fun opSiluMul(
+    var backend: Backend, gate: DeviceBuffer, gateOffset: int, up: DeviceBuffer, upOffset: int,
+    out: DeviceBuffer, outOffset: int, n: int
+): bool = backend.launch(
+    "silu_mul", kernelArgs().pointer(gate, gateOffset).pointer(up, upOffset).pointer(out, outOffset).u32(n), [n]
+)
+
+fun opSoftcap(var backend: Backend, x: DeviceBuffer, xOffset: int, cap: f32, n: int): bool =
+    backend.launch("softcap", kernelArgs().pointer(x, xOffset).f32(cap).u32(n), [n])
+
+// Rotary embedding in place on `nHeads` heads of `headDim` values; `ropeDim` of them rotate. Without factors (`useFactors` false) the kernel gets a null pointer.
+fun opRope(
+    var backend: Backend, x: DeviceBuffer, xOffset: int, freqFactors: DeviceBuffer, factorsOffset: int, useFactors: bool,
+    nHeads: int, headDim: int, ropeDim: int, pos: int, freqBase: f32, mode: int
+): bool {
+    val problem = [nHeads * ropeDim / 2]
+    if (useFactors) {
+        return backend.launch(
+            "rope",
+            kernelArgs().pointer(x, xOffset).pointer(freqFactors, factorsOffset)
+                .u32(nHeads).u32(headDim).u32(ropeDim).u32(pos).f32(freqBase).u32(mode),
+            problem
+        )
+    }
+    backend.launch(
+        "rope",
+        kernelArgs().pointer(x, xOffset).u64(0).u32(nHeads).u32(headDim).u32(ropeDim).u32(pos).f32(freqBase).u32(mode),
+        problem
+    )
+}
+
+fun opKvStore(
+    var backend: Backend, k: DeviceBuffer, kOffset: int, v: DeviceBuffer, vOffset: int,
+    kCache: DeviceBuffer, kCacheOffset: int, vCache: DeviceBuffer, vCacheOffset: int,
+    pos: int, nKvHead: int, headDim: int, maxCtx: int
+): bool = backend.launch(
+    "kv_store",
+    kernelArgs().pointer(k, kOffset).pointer(v, vOffset).pointer(kCache, kCacheOffset).pointer(vCache, vCacheOffset)
+        .u32(pos).u32(nKvHead).u32(headDim).u32(maxCtx),
+    [nKvHead * headDim]
+)
+
+fun opAttentionDecode(
+    var backend: Backend, q: DeviceBuffer, qOffset: int, kCache: DeviceBuffer, kCacheOffset: int,
+    vCache: DeviceBuffer, vCacheOffset: int, out: DeviceBuffer, outOffset: int,
+    nHead: int, nKvHead: int, headDim: int, first: int, last: int, maxCtx: int, scale: f32
+): bool = backend.launch(
+    "attention_decode",
+    kernelArgs().pointer(q, qOffset).pointer(kCache, kCacheOffset).pointer(vCache, vCacheOffset).pointer(out, outOffset)
+        .u32(nHead).u32(nKvHead).u32(headDim).u32(first).u32(last).u32(maxCtx).f32(scale),
+    [nHead]
+)
+
+fun opGatherRow(
+    var backend: Backend, kind: string, table: DeviceBuffer, tableOffset: int, token: int, out: DeviceBuffer, outOffset: int, cols: int
+): bool = backend.launch(
+    "gather_row_$kind", kernelArgs().pointer(table, tableOffset).u32(token).pointer(out, outOffset).u32(cols), [cols]
+)
+
+fun opTopkSoftmax(
+    var backend: Backend, logits: DeviceBuffer, logitsOffset: int, nExpert: int, k: int,
+    ids: DeviceBuffer, idsOffset: int, weights: DeviceBuffer, weightsOffset: int, mode: int
+): bool = backend.launch(
+    "topk_softmax",
+    kernelArgs().pointer(logits, logitsOffset).u32(nExpert).u32(k).pointer(ids, idsOffset).pointer(weights, weightsOffset).u32(mode),
+    [1]
+)
+
+fun opMoeCombine(
+    var backend: Backend, expertOut: DeviceBuffer, expertOutOffset: int, weights: DeviceBuffer, weightsOffset: int,
+    out: DeviceBuffer, outOffset: int, rows: int, nUsed: int
+): bool = backend.launch(
+    "moe_combine",
+    kernelArgs().pointer(expertOut, expertOutOffset).pointer(weights, weightsOffset).pointer(out, outOffset).u32(rows).u32(nUsed),
+    [rows]
+)
+
+fun opArgmax(var backend: Backend, x: DeviceBuffer, xOffset: int, n: int, out: DeviceBuffer, outOffset: int): bool =
+    backend.launch("argmax", kernelArgs().pointer(x, xOffset).u32(n).pointer(out, outOffset), [1])
+
+fun opCopy(var backend: Backend, src: DeviceBuffer, srcOffset: int, dst: DeviceBuffer, dstOffset: int, n: int): bool =
+    backend.launch("copy_f32", kernelArgs().pointer(src, srcOffset).pointer(dst, dstOffset).u32(n), [n])

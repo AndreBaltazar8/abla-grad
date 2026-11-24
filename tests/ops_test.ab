@@ -1,0 +1,73 @@
+// ops.ab builds each kernel launch in docs/kernels.md's parameter order. A recording Backend notes the kernel, the number and kinds of
+// parameters and the problem; no device is involved.
+import "abla/io"
+import "../src/backend/backend.ab"
+import "../src/ops.ab"
+
+class Recorder(var kernels: array<string>, var kindsSeen: array<string>, var problems: array<int>, var live: int) : Backend {
+    fun name(): string = "recorder"
+    fun allocate(bytes: int): DeviceBuffer? {
+        this.live = this.live + 1
+        DeviceBuffer(this, 65536, bytes)
+    }
+    fun upload(destination: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool = true
+    fun download(source: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool = true
+    fun launch(kernel: string, args: KernelArgs, problem: array<int>): bool {
+        this.kernels.append(kernel)
+        var kinds = ""
+        for (kind in args.kinds) kinds = "$kinds$kind"
+        this.kindsSeen.append(kinds)
+        this.problems.append(problem[0])
+        true
+    }
+    fun synchronize(): bool = true
+    fun freeMemory(): int = 0
+    fun release(handle: int, bytes: int): void {
+        this.live = this.live - 1
+    }
+}
+
+// Parameter kinds: 0 pointer, 1 u32, 2 i32, 3 u64, 4 f32.
+fun run(var recorder: Recorder): bool {
+    val a = recorder.allocate(1 << 20)
+    val b = recorder.allocate(1 << 20)
+    val c = recorder.allocate(1 << 20)
+    if (a == null || b == null || c == null) return false
+    var ok = opMatvec(recorder, "q4_k", a, 0, b, 0, c, 0, 2048, 2048)
+    ok = ok && opMatvecIndexed(recorder, "nvfp4", a, 0, b, 0, c, 0, 512, 2048, c, 0, 8, 4096, 0)
+    ok = ok && opRmsNorm(recorder, a, 0, b, 0, c, 0, 2048, 0.00001, 1)
+    ok = ok && opRope(recorder, a, 0, b, 0, false, 32, 64, 64, 5, 500000.0, 0)
+    ok = ok && opAttentionDecode(recorder, a, 0, b, 0, c, 0, a, 0, 32, 8, 64, 0, 5, 4096, 0.125)
+    ok = ok && opSiluMul(recorder, a, 0, b, 0, c, 0, 8192) && opAdd(recorder, a, 0, b, 0, a, 0, 2048)
+    ok
+}
+
+fun main: int {
+    var recorder = Recorder([], [], [], 0)
+    val ok = run(recorder)
+    val expectedKernels = ["matvec_q4_k", "matvec_nvfp4_indexed", "rmsnorm", "rope", "attention_decode", "silu_mul", "add"]
+    // matvec: w x y rows cols; indexed adds ids nUsed expertStride(u64) xStride; rmsnorm: x w y n eps; rope with no factors: x, u64 0, six scalars.
+    val expectedKinds = ["00011", "000110131", "00014", "03111141", "00001111114", "0001", "0001"]
+    if (!ok || recorder.kernels.size != expectedKernels.size) {
+        println("ops test FAILED: launched ${recorder.kernels.size} of ${expectedKernels.size}")
+        return 1
+    }
+    for (index in 0 until expectedKernels.size) {
+        if (recorder.kernels[index] != expectedKernels[index]) {
+            println("ops test FAILED: kernel $index is ${recorder.kernels[index]}, not ${expectedKernels[index]}")
+            return 1
+        }
+    }
+    for (index in 0 until expectedKinds.size) {
+        if (recorder.kindsSeen[index] != expectedKinds[index]) {
+            println("ops test FAILED: ${expectedKernels[index]} parameter kinds ${recorder.kindsSeen[index]}, not ${expectedKinds[index]}")
+            return 1
+        }
+    }
+    if (recorder.problems[0] != 2048 || recorder.live != 0) {
+        println("ops test FAILED: problem ${recorder.problems[0]} live ${recorder.live}")
+        return 1
+    }
+    println("ops test passed")
+    0
+}
