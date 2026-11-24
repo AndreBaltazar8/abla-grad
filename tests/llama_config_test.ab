@@ -1,0 +1,26 @@
+// The real Llama-3.2-1B GGUF (when present in ~/models) gives the published hyper-parameters.
+import "abla/io"
+import "abla/process"
+import "abla/process/arguments"
+import "../src/gguf/reader.ab"
+import "../src/model/llama_config.ab"
+
+fun main: int {
+    val file = ggufOpen(processArgument(0))
+    if (file == null) {
+        println("llama config test: cannot open the model: ${ggufLastError()}")
+        return 1
+    }
+    val config = llamaConfigFrom(file)
+    if (config == null) {
+        println("llama config test FAILED: ${llamaConfigLastError()}")
+        return 1
+    }
+    println("layers ${config.nLayer} embd ${config.nEmbd} ff ${config.nFf} heads ${config.nHead}/${config.nHeadKv} headDim ${config.headDim} ropeDim ${config.ropeDim} vocab ${config.nVocab} ctx ${config.nCtxTrain}")
+    if (config.nLayer != 16 || config.nEmbd != 2048 || config.nHead != 32 || config.nHeadKv != 8 || config.headDim != 64 || config.nVocab != 128256) {
+        println("llama config test FAILED: not the Llama-3.2-1B shape")
+        return 1
+    }
+    println("llama config test passed")
+    0
+}

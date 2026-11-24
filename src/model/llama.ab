@@ -1,0 +1,246 @@
+// The llama-family decoder (Llama-3.2-1B for the proof): weights in one device arena in their stored quantization, a KV cache, a
+// scratch buffer, and `forward` for one token (prefill = repeated decode). Everything goes through ops.ab / the Backend interface.
+import "abla/float"
+import "abla/math"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "../backend/backend.ab"
+import "../ops.ab"
+import "../gguf/reader.ab"
+import "../gguf/quant.ab"
+import "llama_config.ab"
+
+private var llamaError = ""
+
+fun llamaLastError(): string = llamaError
+
+// The kernel-name suffix of a weight storage type ("" when no kernel exists for it).
+fun weightKind(type: int): string = when (type) {
+    GGML_TYPE_F32 -> "f32"
+    GGML_TYPE_BF16 -> "bf16"
+    GGML_TYPE_Q8_0 -> "q8_0"
+    GGML_TYPE_Q4_K -> "q4_k"
+    GGML_TYPE_Q5_K -> "q5_k"
+    GGML_TYPE_Q6_K -> "q6_k"
+    GGML_TYPE_NVFP4 -> "nvfp4"
+    else -> ""
+}
+
+// A tensor in the weight arena: byte offset, stored size, ggml type, and matrix shape (cols = elements per row).
+class WeightRef(val offset: int, val bytes: int, val type: int, val rows: int, val cols: int)
+
+class LlamaLayer(
+    val attnNorm: WeightRef, val wq: WeightRef, val wk: WeightRef, val wv: WeightRef, val wo: WeightRef,
+    val ffnNorm: WeightRef, val wGate: WeightRef, val wUp: WeightRef, val wDown: WeightRef
+)
+
+// Offsets (bytes) of the f32 activation vectors inside the scratch buffer.
+class ScratchLayout(
+    val x: int, val xn: int, val q: int, val k: int, val v: int, val att: int, val proj: int,
+    val gate: int, val up: int, val act: int, val logits: int, val total: int
+)
+
+private fun alignUp(value: int): int = (value + 255) / 256 * 256
+
+fun scratchLayout(config: LlamaConfig): ScratchLayout {
+    val qSize = config.nHead * config.headDim * 4
+    val kvSize = config.nHeadKv * config.headDim * 4
+    var at = 0
+    val x = at
+    at = at + alignUp(config.nEmbd * 4)
+    val xn = at
+    at = at + alignUp(config.nEmbd * 4)
+    val q = at
+    at = at + alignUp(qSize)
+    val k = at
+    at = at + alignUp(kvSize)
+    val v = at
+    at = at + alignUp(kvSize)
+    val att = at
+    at = at + alignUp(qSize)
+    val proj = at
+    at = at + alignUp(config.nEmbd * 4)
+    val gate = at
+    at = at + alignUp(config.nFf * 4)
+    val up = at
+    at = at + alignUp(config.nFf * 4)
+    val act = at
+    at = at + alignUp(config.nFf * 4)
+    val logits = at
+    at = at + alignUp(config.nVocab * 4)
+    ScratchLayout(x, xn, q, k, v, att, proj, gate, up, act, logits, at)
+}
+
+// Plans the arena: every tensor the model needs, in order, with 256-byte aligned offsets. `total` is the arena size.
+class ArenaPlan(val refs: Map<string, WeightRef>, val total: int)
+
+private fun planTensor(file: GgufFile, name: string, var refs: Map<string, WeightRef>, at: int): int {
+    val info = file.tensor(name)
+    if (info == null) {
+        llamaError = "tensor $name is missing"
+        return -1
+    }
+    val cols = info.dims[0]
+    var rows = 1
+    for (index in 1 until info.dims.size) rows = rows * info.dims[index]
+    refs.set(name, WeightRef(at, info.bytes, info.type, rows, cols))
+    at + alignUp(info.bytes)
+}
+
+fun llamaPlan(file: GgufFile, config: LlamaConfig): ArenaPlan? {
+    llamaError = ""
+    val refs: Map<string, WeightRef> = Map()
+    var at = 0
+    val names: array<string> = ["token_embd.weight", "output_norm.weight"]
+    if (file.tensor("output.weight") != null) names.append("output.weight")
+    if (file.tensor("rope_freqs.weight") != null) names.append("rope_freqs.weight")
+    for (layer in 0 until config.nLayer) {
+        for (part in ["attn_norm", "attn_q", "attn_k", "attn_v", "attn_output", "ffn_norm", "ffn_gate", "ffn_up", "ffn_down"]) {
+            names.append("blk.$layer.$part.weight")
+        }
+    }
+    for (name in names) {
+        at = planTensor(file, name, refs, at)
+        if (at < 0) return null
+    }
+    ArenaPlan(refs, at)
+}
+
+private fun refOf(plan: ArenaPlan, name: string): WeightRef =
+    plan.refs.get(name) ?? WeightRef(0, 0, 0, 0, 0)
+
+fun llamaLayers(plan: ArenaPlan, config: LlamaConfig): array<LlamaLayer> {
+    val layers: array<LlamaLayer> = []
+    for (layer in 0 until config.nLayer) {
+        layers.append(LlamaLayer(
+            refOf(plan, "blk.$layer.attn_norm.weight"), refOf(plan, "blk.$layer.attn_q.weight"),
+            refOf(plan, "blk.$layer.attn_k.weight"), refOf(plan, "blk.$layer.attn_v.weight"),
+            refOf(plan, "blk.$layer.attn_output.weight"), refOf(plan, "blk.$layer.ffn_norm.weight"),
+            refOf(plan, "blk.$layer.ffn_gate.weight"), refOf(plan, "blk.$layer.ffn_up.weight"),
+            refOf(plan, "blk.$layer.ffn_down.weight")
+        ))
+    }
+    layers
+}
+
+// The loaded model: the weight arena, the KV cache (`[layer][kvHead][maxCtx][headDim]` f32, K and V), the scratch buffer.
+resource class LlamaModel(
+    val config: LlamaConfig,
+    val layers: array<LlamaLayer>,
+    val tokenEmbd: WeightRef,
+    val outputNorm: WeightRef,
+    val output: WeightRef,
+    val ropeFreqs: WeightRef?,
+    val maxCtx: int,
+    val scratchPlan: ScratchLayout,
+    val arena: DeviceBuffer,
+    val scratch: DeviceBuffer,
+    val kCache: DeviceBuffer,
+    val vCache: DeviceBuffer
+)
+
+fun llamaLoad(var backend: Backend, file: GgufFile, config: LlamaConfig, maxCtx: int): LlamaModel? {
+    val plan = llamaPlan(file, config)
+    if (plan == null) return null
+    val arena = backend.allocate(plan.total)
+    if (arena == null) {
+        llamaError = "device memory for ${plan.total} bytes of weights is not available"
+        return null
+    }
+    for (name in plan.refs.keys()) {
+        val info = file.tensor(name)
+        val ref = plan.refs.get(name)
+        if (info == null || ref == null) return null
+        val address = file.tensorAddress(info)
+        if (address == 0 || !backend.upload(arena, ref.offset, address, info.bytes)) {
+            llamaError = "uploading $name failed"
+            return null
+        }
+    }
+    val layout = scratchLayout(config)
+    val scratch = backend.allocate(layout.total)
+    val cacheBytes = config.nLayer * config.nHeadKv * maxCtx * config.headDim * 4
+    val kCache = backend.allocate(cacheBytes)
+    val vCache = backend.allocate(cacheBytes)
+    if (scratch == null || kCache == null || vCache == null) {
+        llamaError = "device memory for the scratch buffer and KV cache is not available"
+        return null
+    }
+    val output = plan.refs.get("output.weight") ?? refOf(plan, "token_embd.weight")
+    LlamaModel(
+        config, llamaLayers(plan, config), refOf(plan, "token_embd.weight"), refOf(plan, "output_norm.weight"), output,
+        plan.refs.get("rope_freqs.weight"), maxCtx, layout, move(arena), move(scratch), move(kCache), move(vCache)
+    )
+}
+
+private fun ropeFactorsAvailable(model: LlamaModel): bool = model.ropeFreqs != null
+
+// One token at position `pos`: embeds it, runs every layer, leaves the logits in the scratch buffer. False when a launch failed.
+fun LlamaModel.forward(var backend: Backend, token: int, pos: int): bool {
+    val config = this.config
+    val s = this.scratchPlan
+    if (pos < 0 || pos >= this.maxCtx) {
+        llamaError = "position $pos is outside the cache of ${this.maxCtx}"
+        return false
+    }
+    val embdKind = weightKind(this.tokenEmbd.type)
+    if (embdKind == "") {
+        llamaError = "no kernel for the embedding type ${ggmlTypeName(this.tokenEmbd.type)}"
+        return false
+    }
+    var ok = opGatherRow(backend, embdKind, this.arena, this.tokenEmbd.offset, token, this.scratch, s.x, config.nEmbd)
+    val qDim = config.nHead * config.headDim
+    val kvDim = config.nHeadKv * config.headDim
+    val layerCacheBytes = config.nHeadKv * this.maxCtx * config.headDim * 4
+    val scale = f64ToF32(1.0 / sqrt(f64FromInt(config.headDim)))
+    val freqs = this.ropeFreqs
+    val freqOffset = if (freqs == null) 0 else freqs.offset
+    for (index in 0 until config.nLayer) {
+        val layer = this.layers[index]
+        ok = ok && opRmsNorm(backend, this.scratch, s.x, this.arena, layer.attnNorm.offset, this.scratch, s.xn, config.nEmbd, config.rmsEps, 1)
+        ok = ok && opMatvec(backend, weightKind(layer.wq.type), this.arena, layer.wq.offset, this.scratch, s.xn, this.scratch, s.q, layer.wq.rows, layer.wq.cols)
+        ok = ok && opMatvec(backend, weightKind(layer.wk.type), this.arena, layer.wk.offset, this.scratch, s.xn, this.scratch, s.k, layer.wk.rows, layer.wk.cols)
+        ok = ok && opMatvec(backend, weightKind(layer.wv.type), this.arena, layer.wv.offset, this.scratch, s.xn, this.scratch, s.v, layer.wv.rows, layer.wv.cols)
+        ok = ok && opRope(backend, this.scratch, s.q, this.arena, freqOffset, freqs != null, config.nHead, config.headDim, config.ropeDim, pos, config.ropeBase, 0)
+        ok = ok && opRope(backend, this.scratch, s.k, this.arena, freqOffset, freqs != null, config.nHeadKv, config.headDim, config.ropeDim, pos, config.ropeBase, 0)
+        ok = ok && opKvStore(backend, this.scratch, s.k, this.scratch, s.v, this.kCache, index * layerCacheBytes, this.vCache, index * layerCacheBytes,
+            pos, config.nHeadKv, config.headDim, this.maxCtx)
+        ok = ok && opAttentionDecode(backend, this.scratch, s.q, this.kCache, index * layerCacheBytes, this.vCache, index * layerCacheBytes,
+            this.scratch, s.att, config.nHead, config.nHeadKv, config.headDim, 0, pos, this.maxCtx, scale)
+        ok = ok && opMatvec(backend, weightKind(layer.wo.type), this.arena, layer.wo.offset, this.scratch, s.att, this.scratch, s.proj, layer.wo.rows, layer.wo.cols)
+        ok = ok && opAdd(backend, this.scratch, s.x, this.scratch, s.proj, this.scratch, s.x, config.nEmbd)
+        ok = ok && opRmsNorm(backend, this.scratch, s.x, this.arena, layer.ffnNorm.offset, this.scratch, s.xn, config.nEmbd, config.rmsEps, 1)
+        ok = ok && opMatvec(backend, weightKind(layer.wGate.type), this.arena, layer.wGate.offset, this.scratch, s.xn, this.scratch, s.gate, layer.wGate.rows, layer.wGate.cols)
+        ok = ok && opMatvec(backend, weightKind(layer.wUp.type), this.arena, layer.wUp.offset, this.scratch, s.xn, this.scratch, s.up, layer.wUp.rows, layer.wUp.cols)
+        ok = ok && opSiluMul(backend, this.scratch, s.gate, this.scratch, s.up, this.scratch, s.act, config.nFf)
+        ok = ok && opMatvec(backend, weightKind(layer.wDown.type), this.arena, layer.wDown.offset, this.scratch, s.act, this.scratch, s.proj, layer.wDown.rows, layer.wDown.cols)
+        ok = ok && opAdd(backend, this.scratch, s.x, this.scratch, s.proj, this.scratch, s.x, config.nEmbd)
+        if (!ok) {
+            llamaError = "a launch failed in layer $index"
+            return false
+        }
+    }
+    ok = ok && opRmsNorm(backend, this.scratch, s.x, this.arena, this.outputNorm.offset, this.scratch, s.xn, config.nEmbd, config.rmsEps, 1)
+    ok = ok && opMatvec(backend, weightKind(this.output.type), this.arena, this.output.offset, this.scratch, s.xn, this.scratch, s.logits, this.output.rows, this.output.cols)
+    if (!ok) llamaError = "a launch failed in the output projection"
+    ok
+}
+
+// The logits of the last `forward`, as host floats (waits for the device).
+trusted fun LlamaModel.readLogits(var backend: Backend): array<f32>? {
+    val bytes = this.config.nVocab * 4
+    val host = nativeByteBuffer(bytes)
+    if (!backend.download(this.scratch, this.scratchPlan.logits, nativePointerAddress(host.address), bytes)) {
+        llamaError = "downloading the logits failed"
+        host.close()
+        return null
+    }
+    val logits: array<f32> = []
+    for (index in 0 until this.config.nVocab) {
+        val at = index * 4
+        val bits = host.load(at) | (host.load(at + 1) << 8) | (host.load(at + 2) << 16) | (host.load(at + 3) << 24)
+        logits.append(f32FromBits(u32(bits)))
+    }
+    host.close()
+    logits
+}

@@ -1,0 +1,2 @@
+import "../src/model/llama.ab"
+fun main: int = 0

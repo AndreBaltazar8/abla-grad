@@ -31,3 +31,32 @@ Tolerances: each kernel's test compares with an f64 CPU reference; matvec and at
 elementwise ops at 1 ulp-ish (1e-6 relative); write the number in the test.
 Where Inkling needs something this table does not cover (relative-position attention terms, gate/up softcap placement), I add a row
 after reading llama.cpp's implementation at the oracle's pinned commit, and tell e7.
+
+## Rope convention (Llama bring-up)
+`rope` with `mode` 0 (adjacent pairs, llama.cpp's LLAMA_ROPE_TYPE_NORM): for head h and pair i in [0, ropeDim/2): the pair is `(x[2i], x[2i+1])`,
+`theta_i = pos / (freqFactors[i] * freqBase^(2i/ropeDim))` (`freqFactors` all 1 when null), rotated by `theta_i`
+(`x0' = x0 cos - x1 sin`, `x1' = x0 sin + x1 cos`). Llama-3.2 supplies `rope_freqs.weight` (f32, ropeDim/2 values) as `freqFactors`. Mode 1 (neox)
+pairs `x[i]` with `x[i + ropeDim/2]`. The rest of each head (`ropeDim..headDim`) is unchanged.
+
+## Inkling additions (semantics: docs/inkling-graph.md)
+Weights that are small tensors (norm weights, conv weights, queries, clip scales, relative bias, router, loop controller tensors) are converted to f32
+on load unless noted; kernels read them as `const float*`. Matvec kernels with `<t>` handle the big weights (Q8_0, Q5_K, BF16, NVFP4, F32).
+| kernel | parameters | problem | meaning |
+|---|---|---|---|
+| `rmsnorm` (extended) | as above, with `w` allowed to be a null pointer (`u64(0)`) | `[nVectors]` | weightless form: `y = x * rsqrt(mean(x^2)+eps)` |
+| `l2clip` | `const float* x, const float* scale, float* y, u32 rows, u32 dim, f32 t` | `[rows]` | per row: `v = scale ? x*scale : x` (scale has `rows*dim` values or `dim` values broadcast per row: see `scaleStride`), `y = v * t / max(|v|_2, t)`; in place allowed |
+| `scale_f32` | `float* x, f32 s, u32 n` | `[n]` | in place `x *= s` (tau, vocabulary softcap factors) |
+| `sigmoid_mul` | `const float* a, const float* g, float* out, u32 n` | `[n]` | `out = a * sigmoid(g)` |
+| `depth_mix` | `const float* bank, u32 nBank, const float* cur, const float* queries, u32 nQuery, float* out, u32 n, f32 eps` | `[nQuery]` | states = `bank[0..nBank)` (contiguous n floats each) + `cur`; each state weightless-rmsnormed with `eps`; per query q: `s_i = state_i . queries[q*n..]`, `/ sqrt(n)`, softmax over the nBank+1 states, `out[q*n..] = sum_i p_i state_i` (normalized states) |
+| `conv_step` | `const float* x, float* history, const float* w, const float* dyn, float* out, u32 channels, u32 nConv, u32 heads, f32 outScale` | `[channels]` | the short causal conv: window = `history[0..nConv-1][c]` then `x[c]` (oldest first); `out[c] = (x[c] + sum_k w[k*channels + c]*window[k] + (dyn ? sum_lag dyn[head(c)*nConv + lag] * window[nConv-1-lag] : 0)) * outScale`; then history shifts by one and appends `x[c]`; `history` layout `[nConv-1][channels]`; `head(c) = c / (channels/heads)`; `outScale = 1/sqrt((dyn?2:1)*nConv+1)` (ops computes it); in-place on `x == out` allowed if the kernel reads before writing |
+| `rel_table` | `const float* relBias, const float* r, const float* sinks, float* table, u32 nRel, u32 extent, u32 nHead` | `[nHead * (extent+1)]` | `table[h*(extent+1)+d] = sum_k relBias[k*extent+d] * r[h*nRel+k]` for d < extent; `table[h*(extent+1)+extent] = 0`; then every entry of head h `-= sinks[h]` |
+| `attention_decode_rel` | `const float* q, const float* kCache, const float* vCache, const float* table, float* out, u32 nHead, u32 nKvHead, u32 headDim, u32 first, u32 last, u32 pos, u32 extent, u32 maxCtx, f32 scale` | `[nHead]` | per head: positions j in `first..last`: `logit = q.K_j*scale + table[h*(extent+1) + (pos-j < extent ? pos-j : extent)]`; softmax over those logits and one extra zero logit (the sink); `out = sum p_j V_j` |
+| `moe_route` | `const float* logits, const float* bias, u32 nExpert, u32 k, u32* ids, float* weights, f32 normEps, f32 weightScale` | `[1]` | `p = sigmoid(logits)`; top `k` by `p + bias` (bias may be null; ties: lower index); `weights[i] = p[ids[i]]`; `weights /= (sum + normEps)`; `weights *= weightScale` |
+| `situ` | `const float* gateUp, float* out, u32 nUsed, u32 nFf, f32 beta, f32 lb` | `[nUsed * nFf]` | per slot i, element j: `g = gateUp[i*2*nFf + j]`, `u = gateUp[i*2*nFf + nFf + j]`; `out[i*nFf+j] = beta*tanh(g/beta)*sigmoid(g) * (lb>0 ? lb*tanh(u/lb) : u)` |
+| `control_mix` | `const float* cur, const float* message, const float* gain, const float* forget, float* out, u32 n` | `[n]` | `out = cur - tanh(forget)*cur + tanh(gain)*message` (gain/forget are the pre-tanh vectors) |
+| `copy_at` | `const float* src, float* dst, u32 n` | `[n]` | like `copy_f32`; ops uses pointer offsets to concatenate (`dst` offset into a larger buffer) |
+| `tanh_inplace`, `rmsnorm`-on-a-slice | covered by `softcap` with `cap`=1 and `rmsnorm` with pointer offsets | | |
+`matvec_<t>_indexed` with `rows = 2*nFf` is the fused gate/up expert projection (`ffn_gate_up_exps`); `rows = n_embd, cols = nFf` the down projection.
+Per-token scalars (`tau`, positions, windows) are computed on the host and passed as kernel parameters.
+Order for Inkling after the Llama set: `rmsnorm` weightless, `l2clip`, `conv_step`, `depth_mix`, `rel_table`, `attention_decode_rel`, `sigmoid_mul`, `scale_f32`,
+`moe_route`, `situ`, `matvec_nvfp4_indexed` (already first in line), `control_mix`.

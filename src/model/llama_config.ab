@@ -1,0 +1,63 @@
+// Hyper-parameters of a llama-family GGUF (arch "llama"), read from its metadata. The small proof model (Llama-3.2-1B-Instruct) is one.
+import "abla/float"
+import "../gguf/reader.ab"
+
+class LlamaConfig(
+    val nLayer: int,
+    val nEmbd: int,
+    val nFf: int,
+    val nHead: int,
+    val nHeadKv: int,
+    val headDim: int,
+    val ropeDim: int,
+    val ropeBase: f32,
+    val rmsEps: f32,
+    val nVocab: int,
+    val nCtxTrain: int
+)
+
+private var llamaConfigError = ""
+
+fun llamaConfigLastError(): string = llamaConfigError
+
+private fun llamaConfigMissing(key: string): LlamaConfig? {
+    llamaConfigError = "GGUF metadata key $key is missing or has the wrong type"
+    null
+}
+
+fun llamaConfigFrom(file: GgufFile): LlamaConfig? {
+    llamaConfigError = ""
+    val architecture = file.getString("general.architecture")
+    if (architecture == null || architecture != "llama") {
+        llamaConfigError = "general.architecture is not llama"
+        return null
+    }
+    val nLayer = file.getInt("llama.block_count")
+    if (nLayer == null) return llamaConfigMissing("llama.block_count")
+    val nEmbd = file.getInt("llama.embedding_length")
+    if (nEmbd == null) return llamaConfigMissing("llama.embedding_length")
+    val nFf = file.getInt("llama.feed_forward_length")
+    if (nFf == null) return llamaConfigMissing("llama.feed_forward_length")
+    val nHead = file.getInt("llama.attention.head_count")
+    if (nHead == null) return llamaConfigMissing("llama.attention.head_count")
+    val nHeadKv = file.getInt("llama.attention.head_count_kv") ?? nHead
+    val headDim = file.getInt("llama.attention.key_length") ?? (nEmbd / nHead)
+    val ropeDim = file.getInt("llama.rope.dimension_count") ?? headDim
+    val ropeBase = file.getFloat("llama.rope.freq_base") ?? 10000.0
+    val eps = file.getFloat("llama.attention.layer_norm_rms_epsilon") ?? 0.00001
+    val nCtx = file.getInt("llama.context_length") ?? 2048
+    val embedding = file.tensor("token_embd.weight")
+    if (embedding == null || embedding.dims.size != 2) {
+        llamaConfigError = "token_embd.weight is missing or not a matrix"
+        return null
+    }
+    if (embedding.dims[0] != nEmbd) {
+        llamaConfigError = "token_embd.weight rows are not llama.embedding_length wide"
+        return null
+    }
+    if (nHead % nHeadKv != 0 || headDim * nHead <= 0) {
+        llamaConfigError = "head counts do not divide"
+        return null
+    }
+    LlamaConfig(nLayer, nEmbd, nFf, nHead, nHeadKv, headDim, ropeDim, f64ToF32(ropeBase), f64ToF32(eps), embedding.dims[1], nCtx)
+}
