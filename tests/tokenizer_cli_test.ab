@@ -1,0 +1,8 @@
+import "../src/cli/tokenize.ab"
+import "abla/process"
+
+fun main: int {
+    val args: array<string> = []
+    for (i in 0 until processArgumentCount()) args.append(processArgument(i))
+    cmdTokenize(args)
+}

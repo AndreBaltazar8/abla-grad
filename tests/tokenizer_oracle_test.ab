@@ -1,0 +1,90 @@
+// Compare token IDs and byte pieces to the pinned llama.cpp tokenizer.
+// Input fixtures: tests/prompts/{inkling,llama}.tsv from tools/oracle.
+// Inkling tokenizer.json from thinkingmachines/Inkling-2-Mini at
+// c9d028302cd0f035fdf8e7e91f089a4ce94d2195, SHA-256
+// 7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6.
+import "../src/gguf/reader.ab"
+import "../src/tokenizer/tokenizer.ab"
+import "abla/bytes"
+import "abla/fs"
+import "abla/io"
+import "abla/process"
+import "abla/text"
+
+private fun oracleTokenizer(filePath: string): Tokenizer? {
+    if (filePath.endsWith(".json")) return tokenizerFromJson(filePath)
+    val file = ggufOpen(filePath)
+    if (file == null) {
+        println(ggufLastError())
+        return null
+    }
+    val tokenizer = tokenizerFromGguf(file)
+    file.close()
+    tokenizer
+}
+
+private fun hexDigit(digit: int): int {
+    if (digit >= 48 && digit <= 57) return digit - 48
+    if (digit >= 97 && digit <= 102) return digit - 87
+    -1
+}
+
+private fun hexBytes(source: string): string? {
+    if (source.size % 2 != 0) return null
+    val out = byteBuffer()
+    var at = 0
+    while (at < source.size) {
+        val a = hexDigit(source[at])
+        val b = hexDigit(source[at + 1])
+        if (a < 0 || b < 0) return null
+        out.appendByteValue(a * 16 + b)
+        at += 2
+    }
+    out.toText()
+}
+
+private fun idsText(ids: array<int>): string {
+    val out = byteBuffer()
+    for (i in 0 until ids.size) {
+        if (i != 0) out.appendText(",")
+        out.appendInt(ids[i])
+    }
+    out.toText()
+}
+
+fun main: int {
+    if (processArgumentCount() != 2) {
+        println("usage: tokenizer_oracle_test <tokenizer.json|model.gguf> <oracle.tsv>")
+        return 2
+    }
+    val tokenizer = oracleTokenizer(processArgument(0))
+    if (tokenizer == null) {
+        println(tokenizerLastError())
+        return 2
+    }
+    val test = path(processArgument(1)).readTextResult()
+    if (!test.succeeded) return 2
+    val lines = test.text.split("\n")
+    if (lines.size == 0 || lines[0] != "case\tadd_special\tparse_special\tinput_hex\ttoken_ids\tpieces_hex")
+        return 2
+    var checks = 0
+    var failures = 0
+    for (index in 1 until lines.size) {
+        if (lines[index] == "" && index == lines.size - 1) continue
+        val row = lines[index].split("\t")
+        if (row.size != 6 || (row[1] != "0" && row[1] != "1") || (row[2] != "0" && row[2] != "1")) return 2
+        val input = hexBytes(row[3])
+        if (input == null) return 2
+        val gotIds = tokenizer.encode(input, row[1] == "1", row[2] == "1")
+        val got = idsText(gotIds)
+        val expectedText = hexBytes(row[5].replace(",", ""))
+        if (expectedText == null) return 2
+        if (got != row[4] || tokenizer.decode(gotIds) != expectedText) {
+            println("${row[0]} add=${row[1]} parse=${row[2]}: expected ${row[4]}, got $got")
+            failures += 1
+        }
+        checks += 1
+    }
+    println("tokenizer oracle: ${checks - failures} passed, $failures failed")
+    if (failures == 0 && checks > 0) 0 else 1
+}

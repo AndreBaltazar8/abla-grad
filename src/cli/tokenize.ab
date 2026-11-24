@@ -1,0 +1,48 @@
+import "../gguf/reader.ab"
+import "../tokenizer/tokenizer.ab"
+import "abla/fs"
+import "abla/io"
+import "abla/text"
+
+private fun tokenizerForCommand(input: string): Tokenizer? {
+    if (input.endsWith(".json")) return tokenizerFromJson(input)
+    val file = ggufOpen(input)
+    if (file == null) {
+        println(ggufLastError())
+        return null
+    }
+    val tokenizer = tokenizerFromGguf(file)
+    file.close()
+    tokenizer
+}
+
+// Prints one token id per line for the prompt file's exact bytes.
+fun cmdTokenize(args: array<string>): int {
+    if (args.size < 2 || args.size > 4) {
+        println("usage: abla-grad tokenize <model.gguf|tokenizer.json> <prompt-file> [--add-special] [--parse-special]")
+        return 2
+    }
+    var addSpecial = false
+    var parseSpecial = false
+    for (i in 2 until args.size) {
+        if (args[i] == "--add-special" && !addSpecial) addSpecial = true
+        else if (args[i] == "--parse-special" && !parseSpecial) parseSpecial = true
+        else {
+            println("unknown or repeated tokenize flag: ${args[i]}")
+            return 2
+        }
+    }
+    val prompt = path(args[1]).readTextResult()
+    if (!prompt.succeeded) {
+        println("could not read prompt (errno ${prompt.errorCode})")
+        return 1
+    }
+    val tokenizer = tokenizerForCommand(args[0])
+    if (tokenizer == null) {
+        val message = tokenizerLastError()
+        if (message != "") println(message)
+        return 1
+    }
+    for (id in tokenizer.encode(prompt.text, addSpecial, parseSpecial)) println("$id")
+    0
+}

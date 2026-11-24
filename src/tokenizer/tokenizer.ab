@@ -1,0 +1,402 @@
+import "../gguf/reader.ab"
+import "pretokenize.ab"
+import "abla/bytes"
+import "abla/fs"
+import "abla/json"
+import "abla/text"
+
+private var tokenizerError = ""
+
+// Returns the diagnostic from the last tokenizer loader.
+fun tokenizerLastError(): string = tokenizerError
+
+private fun tokenizerFail(message: string): Tokenizer? {
+    tokenizerError = message
+    null
+}
+
+private fun bpeByteAlphabet(): array<int> {
+    // GPT-2's reversible byte alphabet. Printable Latin-1 bytes keep
+    // their scalar; remaining bytes get successive scalars from U+0100.
+    val alphabet: array<int> = []
+    var next = 256
+    for (byte in 0 until 256) {
+        if ((byte >= 33 && byte <= 126) || (byte >= 161 && byte <= 172) || byte >= 174) {
+            alphabet.append(byte)
+        } else {
+            alphabet.append(next)
+            next += 1
+        }
+    }
+    val inverse: array<int> = []
+    for (i in 0 until next) inverse.append(-1)
+    for (byte in 0 until alphabet.size) inverse[alphabet[byte]] = byte
+    inverse
+}
+
+private val bpeInverseAlphabet = bpeByteAlphabet()
+
+private fun bpeDecodeAlphabet(encoded: string): string {
+    val output = byteBuffer()
+    var at = 0
+    while (at < encoded.size) {
+        val scalar = utf8DecodeAt(encoded, at)
+        if (scalar < 0 || scalar >= bpeInverseAlphabet.size) return ""
+        val byte = bpeInverseAlphabet[scalar]
+        if (byte < 0) return ""
+        output.appendByteValue(byte)
+        at += utf8SequenceLength(encoded[at])
+    }
+    output.toText()
+}
+
+private fun bpePair(left: int, right: int): int = (left << 32) | right
+
+private class TokenizerSpecial(val id: int, val text: string, val alwaysParse: bool)
+
+private class TokenizerVocabulary(
+    val pieces: array<string>, val ids: Map<string, int>,
+    val byteIds: array<int>, val special: array<TokenizerSpecial>, val heads: Map<int, bool>
+)
+
+private fun bpeVocabulary(encoded: array<string>, types: array<int>): TokenizerVocabulary? {
+    if (encoded.size != types.size || encoded.size == 0 || encoded.size > 1048576) return null
+    val pieces: array<string> = []
+    val ids: Map<string, int> = Map()
+    val special: array<TokenizerSpecial> = []
+    val heads: Map<int, bool> = Map()
+    for (i in 0 until encoded.size) {
+        val spelling = encoded[i]
+        val kind = types[i]
+        if (kind == 2 || kind == 3 || kind == 4) {
+            if (spelling == "") return null
+            special.append(TokenizerSpecial(i, spelling, kind == 4))
+            heads.set(spelling[0], true)
+            pieces.append(spelling)
+        } else if (kind == 5) {
+            pieces.append(spelling)
+        } else {
+            val raw = bpeDecodeAlphabet(spelling)
+            if (raw == "" || ids.has(raw)) return null
+            ids.set(raw, i)
+            pieces.append(raw)
+        }
+    }
+    val byteIds: array<int> = []
+    for (byte in 0 until 256) {
+        val id = ids.get(byteEncode(byte))
+        if (id == null) return null
+        byteIds.append(id)
+    }
+    TokenizerVocabulary(pieces, ids, byteIds, special, heads)
+}
+
+private class TokenizerMerges(val ranks: Map<int, int>, val results: array<int>)
+
+private fun TokenizerMerges.addRule(vocab: TokenizerVocabulary, left: string, right: string): bool {
+    val l = bpeDecodeAlphabet(left)
+    val r = bpeDecodeAlphabet(right)
+    val a = vocab.ids.get(l)
+    val b = vocab.ids.get(r)
+    val merged = vocab.ids.get(l + r)
+    if (a == null || b == null || merged == null) return false
+    val pair = bpePair(a, b)
+    if (this.ranks.has(pair)) return false
+    this.ranks.set(pair, this.results.size)
+    this.results.append(merged)
+    true
+}
+
+private class BpeCandidate(val rank: int, val at: int)
+
+private fun bpeBefore(a: BpeCandidate, b: BpeCandidate): bool =
+    a.rank < b.rank || (a.rank == b.rank && a.at < b.at)
+
+private class BpeWork(
+    val from: array<int>, val next: array<int>, val ids: array<int>, val heap: array<BpeCandidate>
+) {
+    fun enqueue(merges: TokenizerMerges, at: int): void {
+        if (at < 0) return
+        val right = this.next[at]
+        if (right < 0) return
+        val rank = merges.ranks.get(bpePair(this.ids[at], this.ids[right]))
+        if (rank == null) return
+        val item = BpeCandidate(rank, at)
+        var i = this.heap.size
+        this.heap.append(item)
+        while (i > 0) {
+            val parent = (i - 1) / 2
+            if (!bpeBefore(item, this.heap[parent])) break
+            this.heap[i] = this.heap[parent]
+            i = parent
+        }
+        this.heap[i] = item
+    }
+
+    fun mergeAll(merges: TokenizerMerges): void {
+        while (this.heap.size > 0) {
+            val item = this.heap[0]
+            val rank = item.rank
+            val at = item.at
+            val last = this.heap.takeAt(this.heap.size - 1)
+            if (this.heap.size > 0) {
+                var i = 0
+                var child = 1
+                while (child < this.heap.size) {
+                    if (child + 1 < this.heap.size && bpeBefore(this.heap[child + 1], this.heap[child]))
+                        child += 1
+                    if (!bpeBefore(this.heap[child], last)) break
+                    this.heap[i] = this.heap[child]
+                    i = child
+                    child = i * 2 + 1
+                }
+                this.heap[i] = last
+            }
+            val right = this.next[at]
+            if (right < 0 || merges.ranks.get(bpePair(this.ids[at], this.ids[right])) != rank) continue
+            val after = this.next[right]
+            this.ids[at] = merges.results[rank]
+            this.next[at] = after
+            this.next[right] = -1
+            if (after >= 0) this.from[after] = at
+            this.enqueue(merges, this.from[at])
+            this.enqueue(merges, at)
+        }
+    }
+}
+
+// Byte-level BPE encoder and decoder for the supported model profiles.
+class Tokenizer(
+    val vocab: TokenizerVocabulary, val merges: TokenizerMerges, val pre: int,
+    val ignoreMerges: bool, val bos: int?, val eos: int?,
+    val addsBos: bool, val addsEos: bool
+) {
+    // Returns the model's vocabulary size, including special tokens.
+    fun vocabSize(): int = this.vocab.pieces.size
+
+    // Returns the BOS token id if configured.
+    fun bosId(): int? = this.bos
+
+    // Returns the EOS token id if configured.
+    fun eosId(): int? = this.eos
+
+    // Encodes raw bytes. addSpecial applies model BOS/EOS defaults.
+    // parseSpecial explicitly recognizes literal control-token spellings.
+    fun encode(text: string, addSpecial: bool, parseSpecial: bool = false): array<int> {
+        val ids: array<int> = []
+        val bos = this.bos
+        if (addSpecial && this.addsBos && bos != null) ids.append(bos)
+        var start = 0
+        var at = 0
+        while (at < text.size) {
+            if (this.vocab.heads.has(text[at])) {
+                val special = this.matchSpecial(text, at, parseSpecial)
+                if (special >= 0) {
+                    this.encodeSegment(text, start, at, ids)
+                    ids.append(special)
+                    at += this.vocab.pieces[special].size
+                    start = at
+                    continue
+                }
+            }
+            at += 1
+        }
+        this.encodeSegment(text, start, text.size, ids)
+        val eos = this.eos
+        if (addSpecial && this.addsEos && eos != null) ids.append(eos)
+        ids
+    }
+
+    // Decodes token ids to original bytes, including special spellings.
+    // Invalid ids produce an empty result.
+    fun decode(ids: array<int>): string {
+        val out = byteBuffer()
+        for (id in ids) {
+            if (id < 0 || id >= this.vocab.pieces.size) return ""
+            out.appendText(this.vocab.pieces[id])
+        }
+        out.toText()
+    }
+}
+
+private fun Tokenizer.matchSpecial(text: string, at: int, parse: bool): int {
+    var id = -1
+    var longest = 0
+    for (item in this.vocab.special) {
+        if (!parse && !item.alwaysParse) continue
+        val size = item.text.size
+        if (size <= longest || size > text.size - at || item.text[0] != text[at]) continue
+        if (text.slice(at, at + size) == item.text) {
+            id = item.id
+            longest = size
+        }
+    }
+    id
+}
+
+private fun Tokenizer.encodeSegment(text: string, begin: int, end: int, var output: array<int>): void {
+    if (begin == end) return
+    val runes = bpeRunes(text, begin, end)
+    var at = 0
+    while (at < runes.scalars.size) {
+        val next = runes.pieceEnd(at, this.pre)
+        this.encodePiece(text, runes.offsets[at], runes.offsets[next], output)
+        at = next
+    }
+}
+
+private fun Tokenizer.encodePiece(text: string, begin: int, end: int, var output: array<int>): void {
+    if (this.ignoreMerges) {
+        val exact = this.vocab.ids.get(text.slice(begin, end))
+        if (exact != null) {
+            output.append(exact)
+            return
+        }
+    }
+    val length = end - begin
+    if (length == 1) {
+        output.append(this.vocab.byteIds[text[begin]])
+        return
+    }
+    val work = BpeWork([], [], [], [])
+    for (i in 0 until length) {
+        work.from.append(i - 1)
+        work.next.append(if (i + 1 == length) -1 else i + 1)
+        work.ids.append(this.vocab.byteIds[text[begin + i]])
+    }
+    for (i in 0 until length - 1) work.enqueue(this.merges, i)
+    work.mergeAll(this.merges)
+    var at = 0
+    while (at >= 0) {
+        output.append(work.ids[at])
+        at = work.next[at]
+    }
+}
+
+private fun tokenizerCreate(
+    vocab: TokenizerVocabulary, merges: TokenizerMerges, pre: int, ignoreMerges: bool,
+    bos: int?, eos: int?, addBos: bool, addEos: bool
+): Tokenizer? {
+    if ((bos != null && (bos < 0 || bos >= vocab.pieces.size)) ||
+        (eos != null && (eos < 0 || eos >= vocab.pieces.size)) ||
+        (addBos && bos == null) || (addEos && eos == null)) {
+        return tokenizerFail("invalid automatic BOS/EOS in tokenizer")
+    }
+    Tokenizer(vocab, merges, pre, ignoreMerges, bos, eos, addBos, addEos)
+}
+
+// Loads the Llama 3 or Inkling byte-level BPE from GGUF metadata. The result
+// owns its strings and survives closing the file.
+fun tokenizerFromGguf(file: GgufFile): Tokenizer? {
+    tokenizerError = ""
+    if (file.getString("tokenizer.ggml.model") != "gpt2") return tokenizerFail("unsupported GGUF tokenizer model")
+    val name = file.getString("tokenizer.ggml.pre")
+    val pre = if (name == "llama-bpe") BPE_PRE_LLAMA3 else if (name == "inkling2") BPE_PRE_INKLING else 0
+    if (pre == 0) return tokenizerFail("unsupported GGUF pre-tokenizer")
+    val encoded = file.getStringArray("tokenizer.ggml.tokens") ?? return tokenizerFail("missing GGUF vocabulary")
+    val types = file.getIntArray("tokenizer.ggml.token_type") ?? return tokenizerFail("missing GGUF token types")
+    val rules = file.getStringArray("tokenizer.ggml.merges") ?? return tokenizerFail("missing GGUF merge rules")
+    val vocab = bpeVocabulary(encoded, types)
+    if (vocab == null) return tokenizerFail("invalid GGUF token vocabulary")
+    val merges = TokenizerMerges(Map(), [])
+    for (i in 0 until rules.size) {
+        val rule = rules[i]
+        val space = textFindByte(rule, 32)
+        if (space <= 0 || space + 1 >= rule.size ||
+            !merges.addRule(vocab, rule.slice(0, space), rule.slice(space + 1, rule.size))) {
+            return tokenizerFail("invalid GGUF merge rule $i")
+        }
+    }
+    tokenizerCreate(vocab, merges, pre, pre == BPE_PRE_INKLING,
+        file.getInt("tokenizer.ggml.bos_token_id"), file.getInt("tokenizer.ggml.eos_token_id"),
+        file.getBool("tokenizer.ggml.add_bos_token") ?? false,
+        file.getBool("tokenizer.ggml.add_eos_token") ?? false)
+}
+
+private val inklingPattern = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+
+private fun tokenizerHasInklingSplit(root: Json): bool {
+    val pre = root.get("pre_tokenizer")
+    val steps = pre.get("pretokenizers")
+    if (pre.getString("type") != "Sequence" || !steps.isArray() || steps.size() != 2) return false
+    val split = steps.at(0)
+    val bytes = steps.at(1)
+    split.getString("type") == "Split" && split.getString("behavior") == "Isolated" &&
+        split.get("invert").isBoolean() && !split.get("invert").asBoolean() &&
+        split.get("pattern").getString("Regex") == inklingPattern &&
+        bytes.getString("type") == "ByteLevel" && bytes.get("add_prefix_space").isBoolean() &&
+        !bytes.get("add_prefix_space").asBoolean() && bytes.get("use_regex").isBoolean() &&
+        !bytes.get("use_regex").asBoolean()
+}
+
+// Loads the Inkling byte-level BPE and its special tokens from tokenizer.json.
+fun tokenizerFromJson(filePath: string): Tokenizer? {
+    tokenizerError = ""
+    val inputPath = path(filePath)
+    val info = inputPath.info()
+    if (!info.isFile() || info.size <= 0 || info.size > 67108864) return tokenizerFail("invalid tokenizer.json file size")
+    val result = inputPath.readTextResult()
+    if (!result.succeeded) return tokenizerFail("could not read tokenizer.json (errno ${result.errorCode})")
+    val parsed = jsonParse(result.text, JsonLimits(67108864, 20, 2500000, 1048576, 1048576, true))
+    if (!parsed.succeeded) return tokenizerFail("tokenizer.json: ${parsed.error.message} at byte ${parsed.error.byteOffset}")
+    val root = parsed.value
+    val model = root.get("model")
+    if (!root.isObject() || !root.get("normalizer").isNull() || !tokenizerHasInklingSplit(root) ||
+        model.getString("type") != "BPE" || !model.get("dropout").isNull() ||
+        !model.get("unk_token").isNull() || !model.get("continuing_subword_prefix").isNull() ||
+        !model.get("end_of_word_suffix").isNull() || model.get("byte_fallback").asBoolean() ||
+        model.get("fuse_unk").asBoolean() || root.get("decoder").getString("type") != "ByteLevel") {
+        return tokenizerFail("unsupported tokenizer.json profile")
+    }
+    val pieces = model.get("vocab")
+    val added = root.get("added_tokens")
+    val rules = model.get("merges")
+    if (!pieces.isObject() || !added.isArray() || !rules.isArray() ||
+        pieces.size() < 256 || pieces.size() + added.size() > 1048576 || rules.size() > 1048576) {
+        return tokenizerFail("invalid tokenizer.json vocabulary or merges")
+    }
+
+    val encoded: array<string> = []
+    val types: array<int> = []
+    for (i in 0 until pieces.size() + added.size()) {
+        encoded.append("")
+        types.append(0)
+    }
+    for (i in 0 until pieces.size()) {
+        val value = pieces.values[i]
+        val id = value.asInt()
+        if (!value.intAvailable() || id < 0 || id >= pieces.size() || types[id] != 0 ||
+            pieces.keys[i] == "") return tokenizerFail("invalid tokenizer.json vocabulary id")
+        encoded[id] = pieces.keys[i]
+        types[id] = 1
+    }
+
+    var eos: int? = null
+    for (i in 0 until added.size()) {
+        val item = added.at(i)
+        val value = item.get("id")
+        val id = value.asInt()
+        val content = item.getString("content")
+        if (!value.intAvailable() || id < pieces.size() || id >= encoded.size || types[id] != 0 ||
+            content == "" || !item.get("special").asBoolean() || item.get("single_word").asBoolean() ||
+            item.get("lstrip").asBoolean() || item.get("rstrip").asBoolean() || item.get("normalized").asBoolean()) {
+            return tokenizerFail("unsupported tokenizer.json added token at index $i")
+        }
+        encoded[id] = content
+        types[id] = 3
+        if (content == "<|content_model_end_sampling|>") eos = id
+    }
+
+    val vocab = bpeVocabulary(encoded, types)
+    if (vocab == null) return tokenizerFail("invalid tokenizer.json byte alphabet")
+    val merges = TokenizerMerges(Map(), [])
+    for (i in 0 until rules.size()) {
+        val rule = rules.at(i)
+        if (!rule.isArray() || rule.size() != 2 ||
+            !merges.addRule(vocab, rule.at(0).asString(), rule.at(1).asString())) {
+            return tokenizerFail("invalid tokenizer.json merge rule $i")
+        }
+    }
+    tokenizerCreate(vocab, merges, BPE_PRE_INKLING, model.get("ignore_merges").asBoolean(),
+        null, eos, false, false)
+}
