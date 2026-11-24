@@ -10,7 +10,7 @@ In the CUDA C below `uchar` = `unsigned char`, `u32` = `unsigned`, `u64` = `unsi
 | kernel | parameters | problem | meaning |
 |---|---|---|---|
 | `matvec_<t>` | `const uchar* w, const float* x, float* y, u32 rows, u32 cols` | `[rows]` | `y[r] = dot(row r of w, x)`; row r starts at `r * rowBytes(t, cols)`; `cols` is a multiple of the type's block |
-| `matvec_<t>_indexed` | `const uchar* w, const float* x, float* y, u32 rows, u32 cols, const u32* ids, u32 nUsed, u64 expertStrideBytes, u32 xStrideElems` | `[rows, nUsed]` | slot i: expert `ids[i]` starts at `ids[i]*expertStrideBytes`; `x` for slot i at `i*xStrideElems` (0 = broadcast); `y[i*rows + r]` |
+| `matvec_<t>_indexed` | `const uchar* w, const float* x, float* y, u32 rows, u32 cols, const u32* ids, u32 nUsed, u64 expertStrideBytes, u32 xStrideElems, const float* expertScales` | `[rows, nUsed]` | slot i: expert `ids[i]` starts at `ids[i]*expertStrideBytes`; `x` for slot i at `i*xStrideElems` (0 = broadcast); `y[i*rows + r]`, multiplied by `expertScales[ids[i]]` when `expertScales` is non-null (Inkling stores a per-expert f32 `ffn_*_exps.scale` tensor next to its NVFP4 weights; llama.cpp applies it to the mul_mat_id result) |
 | `rmsnorm` | `const float* x, const float* w, float* y, u32 n, f32 eps` | `[nVectors]` | per vector (stride n): `y = x * rsqrt(mean(x^2) + eps) * w`; `w` has n values; in place allowed (`x == y`) |
 | `add` | `const float* a, const float* b, float* out, u32 n` | `[n]` | `out = a + b` (`out == a` allowed) |
 | `silu_mul` | `const float* gate, const float* up, float* out, u32 n` | `[n]` | `out = silu(gate) * up` |

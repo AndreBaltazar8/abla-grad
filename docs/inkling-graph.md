@@ -94,3 +94,13 @@ prelude's blocks), then [core_end, n_layer). Block size divides core_start and c
 - Prefill = repeated decode (conv history and KV are sequential anyway).
 - The small proof model (Llama-3.2-1B) exercises only the Llama subset; the Inkling-specific kernels are proven layer by layer against
   `dump-tensors.sh` on Inkling itself.
+
+## What the actual file has (Inkling-2-Mini-UD-Q4_K_M.gguf, 744 tensors, read with our reader)
+Metadata: arch `inkling2_loop`, 24 layers (block size 6), n_embd 2304, 24 heads x 128 head dim, 8 kv heads, 128 experts (8 used, n_ff_exp 1152), vocab 201024 padded /
+200058 real, loop start 6 / end 18 / count 3 / gate rank 64, n_conv 4, n_swa 1024, relative length 16 / extent 1024 / clip 8, qk_clip 22.627, log scale floor 8192 /
+alpha 0.1, situ beta 4 / linear beta 25, expert weights scale 8, final logit softcap 30, rms eps 1e-6. Visits: layers 0-5, three passes over 6-17, then 18-23 = 48 visits.
+Full-attention layers are 5, 11, 17, 23 (they carry attn_q/k/v_inp_norm and attn_k/v_conv_proj, BF16 {2304, 32}).
+Types: token_embd and output Q8_0; attn q/k/v/o/gate and attn_rel Q8_0; attn_sink_proj and the conv_proj tensors BF16; routers, norms, conv weights, clips, rel bias, loop controllers,
+expert bias `exp_probs_b.bias` and the per-expert `ffn_*_exps.scale` ({128}) F32; experts: gate_up NVFP4 (layers 0-19) / Q5_K (20-23), down NVFP4 (0-19) / Q8_0 (20-23).
+The `.scale` tensors multiply the mul_mat_id result per selected expert. So the indexed kernels needed: nvfp4, q5_k, q8_0 (all with `expertScales`).
+Sizes: weights 16.6 GB; the embedding and output are 492 MB each.
