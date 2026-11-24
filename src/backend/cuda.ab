@@ -6,6 +6,7 @@ import "../kernels/step.ab"
 import "../kernels/attention_split.ab"
 import "../kernels/matvec_k.ab"
 import "../kernels/matvec_nvfp4.ab"
+import "../kernels/fused_gate_up_situ.ab"
 import "../kernels/matvec_q8_0.ab"
 import "../kernels/matvec_bf16.ab"
 import "abla/crypto"
@@ -387,6 +388,9 @@ private fun cudaAttentionSplitShape(args: KernelArgs, problem: array<int>): bool
         args.words[13] > 0 && args.words[13] <= 64 && problem[0] == args.words[6] * args.words[13] && args.words[11] > 0
 private fun cudaAttentionMergeShape(args: KernelArgs, problem: array<int>): bool =
     args.words[2] == problem[0] && args.words[3] > 0 && args.words[3] <= 256 && args.words[4] > 0 && args.words[4] <= 64
+ 
+private fun cudaInklingGateUpSituShape(args: KernelArgs, problem: array<int>): bool =
+    problem[0] == inklingGateUpSitu.geometry.problem[0] && problem[1] == inklingGateUpSitu.geometry.problem[1]
 
 private val cudaKernels = [
     CudaKernelSpec("matvec_f32", kernelMatvecF32, 4, 128, cudaMatvecArguments, cudaF32Shape),
@@ -443,7 +447,11 @@ private val cudaKernels = [
     CudaKernelSpec("step_advance", kernelStepAdvance, 1, 1, cudaArgsStepAdvance, cudaStepAdvanceShape),
     CudaKernelSpec("step_record", kernelStepRecord, 1, 1, cudaArgsStepRecord, cudaStepAdvanceShape),
     CudaKernelSpec("attention_rel_split_step", kernelAttentionSplit, 1, 256, cudaArgsAttentionSplit, cudaAttentionSplitShape),
-    CudaKernelSpec("attention_rel_merge", kernelAttentionSplit, 1, 256, cudaArgsAttentionMerge, cudaAttentionMergeShape)
+    CudaKernelSpec("attention_rel_merge", kernelAttentionSplit, 1, 256, cudaArgsAttentionMerge, cudaAttentionMergeShape),
+ 
+    CudaKernelSpec(inklingGateUpSitu.name, inklingGateUpSitu.source, inklingGateUpSitu.geometry.itemsPerBlock,
+        inklingGateUpSitu.geometry.blockX, inklingGateUpSitu.argKinds, cudaInklingGateUpSituShape,
+        2, inklingGateUpSitu.geometry.nullablePointer)
 ]
 
 // prefill kernels (ablac-4e; docs/prefill.md)

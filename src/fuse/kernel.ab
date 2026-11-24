@@ -1,0 +1,26 @@
+// Runtime description emitted by the compile-time $fuse parser.
+class FusedGeometry(
+    val blockX: int,
+    val itemsPerBlock: int,
+    val problem: array<int>,
+    val nullablePointer: int = -1
+)
+
+class FusedTensor(val name: string, val kind: string, val shape: array<int>)
+
+class FusedStep(
+    val operation: string,
+    val output: string,
+    val inputs: array<string>,
+    val beta: string = "",
+    val lb: string = ""
+)
+
+class FusedKernel(
+    val name: string,
+    val source: string,
+    val argKinds: array<int>,
+    val geometry: FusedGeometry,
+    val steps: array<FusedStep>,
+    val arguments: array<FusedTensor>
+)

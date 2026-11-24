@@ -1,0 +1,11 @@
+import "../fuse/parser.ab"
+import "../fuse/kernel.ab"
+
+// Inkling 2 Mini uses one activation vector for all selected experts.
+val inklingGateUpSitu: FusedKernel = $fuse inkling_gate_up_situ {
+    dims n = 2304, ff = 1152, experts = 128, used = 8
+    in gateUp: nvfp4[experts, 2*ff, n], x: f32[n], ids: u32[used], scales: f32[experts]
+    out active: f32[used, ff]
+    gu = matvec_indexed(gateUp, x, ids, scales)
+    active = situ(gu, beta = 4.0, lb = 25.0)
+}

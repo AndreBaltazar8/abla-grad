@@ -1,5 +1,24 @@
 # `$fuse`: fused kernels from a chain of ops (design, 2026-11-24; to settle with e7 and e8 once df's profile says which chains first)
 
+## First supported chain
+
+`src/fuse/parser.ab` implements indexed NVFP4 gate/up followed by SiTU.
+Tensor arguments are ordered by their declarations. The generated kernel
+prefixes its CUDA symbol with `abla_fuse_`. It emits the tensor shapes and
+two steps alongside the source for the reference launch path. Dimensions can
+use positive literals, previously declared dimensions and products. SiTU
+accepts a positive decimal `beta` and a nonnegative decimal `lb`.
+
+The Inkling 2 Mini instance uses `[128, 2304, 2304]` packed weights, one
+2,304-element activation vector, eight expert IDs and optional expert scales.
+Each warp computes one gate/up pair with the same device dot function as the
+unfused operation, scales each result, and writes one activation. The down
+projection requires a separate launch so it sees every completed activation.
+
+Run `tools/test-fuse.sh` in the repository Nix shell for generated-source and
+diagnostic checks. `make test-gpu` also runs the fused/unfused comparison with
+null and non-null expert-scale pointers.
+
 Idea (André): a compile-time subparser, as `$json`/`$glsl` are, so fusion is written once, shape-checked against the model's dimensions, and generated as one kernel;
 CUDA C now, `@kernel` Abla (#1233) later behind the same notation. No compiler change: a subparser is a `compile fun` over a `ParserCursor` (docs/subparsers.md in ablac).
 

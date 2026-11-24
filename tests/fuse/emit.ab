@@ -1,0 +1,41 @@
+import "abla/io"
+import "abla/process/arguments"
+import "../../src/fuse/parser.ab"
+import "../../src/fuse/kernel.ab"
+
+val tiny: FusedKernel = $fuse tiny {
+    dims n = 64, ff = 5, ex = 7, used = 3
+    in w: nvfp4[ex, 2*ff, n], x: f32[n], ids: u32[used], s: f32[ex]
+    out y: f32[used, ff]
+    g = matvec_indexed(w, x, ids, s)
+    y = situ(g, beta = 4.0, lb = 25.0)
+}
+
+val reordered: FusedKernel = $fuse reordered {
+    dims n = 128, ff = 9, ex = 2, used = 1
+    in ids: u32[used], s: f32[ex] // actual argument order
+    in x: f32[n], w: nvfp4[ex, 2*ff, n]
+    out y: f32[used, ff]
+    g = matvec_indexed(w, x, ids, s)
+    y = situ(g, beta = 4, lb = 0)
+}
+
+val clipped: FusedKernel = $fuse clipped {
+    in w: nvfp4[16, 16, 256], x: f32[256], ids: u32[4], s: f32[16]
+    out a: f32[4, 8]
+    gu = matvec_indexed(w, x, ids, s)
+    a = situ(gu, beta = 2.5, lb = 7.125)
+}
+
+fun main: int {
+    val which = processArgument(0)
+    val kernel = if (which == "tiny") tiny else if (which == "reordered") reordered else clipped
+    if (kernel.geometry.blockX != 128 || kernel.geometry.itemsPerBlock != 4 ||
+        kernel.geometry.nullablePointer != (if (which == "reordered") 1 else 3) ||
+        kernel.argKinds.size != 5 || kernel.steps.size != 2) return 1
+    if (kernel.arguments.size != 5 || kernel.steps[0].output != kernel.steps[1].inputs[0] ||
+        kernel.steps[1].output != kernel.arguments[4].name) return 1
+    for (kind in kernel.argKinds) if (kind != 0) return 1
+    println(kernel.source)
+    0
+}

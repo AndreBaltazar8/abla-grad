@@ -14,6 +14,7 @@ test-host:
 	tests/compare_cli_test.sh $(COMPILER)
 	$(COMPILER) build tests/gguf_reader_test.ab -o $(BUILD)/gguf_reader_test --fast --no-cache && $(BUILD)/gguf_reader_test $(BUILD)/gguf-fixture.gguf
 	$(COMPILER) build tests/generate_host_test.ab -o $(BUILD)/generate_host_test --fast --no-cache && $(BUILD)/generate_host_test
+	tools/test-fuse.sh $(COMPILER)
 
 # Tests that need the GPU (the CUDA backend and its kernels). Run in `nix-shell shell.nix`.
 .PHONY: test-gpu

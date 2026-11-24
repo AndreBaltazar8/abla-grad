@@ -1,0 +1,31 @@
+import "kernel.ab"
+import "../backend/backend.ab"
+import "../ops.ab"
+import "abla/float"
+import "abla/float/text"
+
+private fun fuseArgument(kernel: FusedKernel, name: string): FusedTensor? {
+    for (tensor in kernel.arguments) if (tensor.name == name) return tensor
+    null
+}
+
+// Replay the two emitted steps with the same activation, expert IDs and scales.
+fun fuseGateUpReference(var backend: Backend, kernel: FusedKernel,
+    w: DeviceBuffer, x: DeviceBuffer, ids: DeviceBuffer, scales: DeviceBuffer, useScales: bool,
+    scratch: DeviceBuffer, output: DeviceBuffer): bool {
+    if (kernel.steps.size != 2 || kernel.steps[0].operation != "matvec_indexed" ||
+        kernel.steps[1].operation != "situ") return false
+    val matvec = kernel.steps[0]
+    val activation = kernel.steps[1]
+    val weights = fuseArgument(kernel, matvec.inputs[0]) ?? return false
+    val selected = fuseArgument(kernel, matvec.inputs[2]) ?? return false
+    val rows = weights.shape[1]
+    val cols = weights.shape[2]
+    val used = selected.shape[0]
+    val stride = cols / 64 * 36 * rows
+    val beta = f64ToF32(f64Parse(activation.beta))
+    val lb = f64ToF32(f64Parse(activation.lb))
+    opMatvecIndexed(backend, weights.kind, w, 0, x, 0, scratch, 0, rows, cols, ids, 0,
+        used, stride, 0, scales, 0, useScales) &&
+        opSitu(backend, scratch, 0, output, 0, used, rows / 2, beta, lb)
+}

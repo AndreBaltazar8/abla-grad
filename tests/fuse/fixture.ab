@@ -1,0 +1,12 @@
+import "../../src/fuse/parser.ab"
+import "../../src/fuse/kernel.ab"
+
+val kernel: FusedKernel = $fuse fail_case {
+    dims n = 64, ff = 8, experts = 8, used = 2
+    in w: nvfp4[experts, 2*ff, n], x: f32[n], ids: u32[used], scales: f32[experts]
+    out a: f32[used, ff]
+    g = matvec_indexed(w, x, ids, scales)
+    a = situ(g, beta = 4.0, lb = 25.0)
+}
+
+fun main: int = if (kernel.geometry.blockX == 128) 0 else 1

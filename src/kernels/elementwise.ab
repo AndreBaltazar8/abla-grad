@@ -48,7 +48,15 @@ extern "C" __global__ void sigmoid_mul(const float *a, const float *g, float *ou
 """
 
 // gateUp slot i holds nFf gate values then nFf up values. out[i*nFf + j] = beta*tanh(g/beta)*sigmoid(g) * (lb > 0 ? lb*tanh(u/lb) : u).
-val kernelSitu = """
+val kernelSituDeviceSource = """
+static __device__ __forceinline__ float grad_situ(float g, float u, float beta, float lb) {
+    float act = beta * tanhf(g / beta) * (1.0f / (1.0f + expf(-g)));
+    float lin = lb > 0.0f ? lb * tanhf(u / lb) : u;
+    return act * lin;
+}
+"""
+
+val kernelSitu = kernelSituDeviceSource + "\n" + """
 extern "C" __global__ void situ(const float *gateUp, float *out, unsigned nUsed, unsigned nFf, float beta, float lb) {
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nUsed * nFf) return;
@@ -56,9 +64,7 @@ extern "C" __global__ void situ(const float *gateUp, float *out, unsigned nUsed,
     unsigned j = i % nFf;
     float g = gateUp[(unsigned long long)slot * 2 * nFf + j];
     float u = gateUp[(unsigned long long)slot * 2 * nFf + nFf + j];
-    float act = beta * tanhf(g / beta) * (1.0f / (1.0f + expf(-g)));
-    float lin = lb > 0.0f ? lb * tanhf(u / lb) : u;
-    out[i] = act * lin;
+    out[i] = grad_situ(g, u, beta, lb);
 }
 """
 

@@ -1,0 +1,264 @@
+import "abla/compiler/parser"
+import "kernel.ab"
+import "emit.ab"
+
+private compile fun fuseSkip(cursor: ParserCursor) {
+    parserRawSkipWhitespace(cursor)
+    while (parserRawConsume(cursor, "//")) {
+        parserRawTakeUntil(cursor, "\n\r")
+        parserRawSkipWhitespace(cursor)
+    }
+}
+
+private compile fun fuseExpect(cursor: ParserCursor, text: string) {
+    fuseSkip(cursor)
+    parserRawExpect(cursor, text)
+}
+
+private compile fun fuseConsume(cursor: ParserCursor, text: string): bool {
+    fuseSkip(cursor)
+    parserRawConsume(cursor, text)
+}
+
+private compile fun fuseKeyword(cursor: ParserCursor, word: string): bool {
+    fuseSkip(cursor)
+    if (!(parserRawAt(cursor, "$word ") || parserRawAt(cursor, "$word\t") ||
+        parserRawAt(cursor, "$word\n") || parserRawAt(cursor, "$word\r"))) return false
+    parserRawConsume(cursor, word)
+}
+
+private compile fun fuseToken(cursor: ParserCursor): string {
+    fuseSkip(cursor)
+    parserRawTakeUntil(cursor, " \t\r\n{}()[]:=,*/")
+}
+
+private fun fuseIdentifier(text: string): bool {
+    if (text.size == 0 || text.size > 80) return false
+    for (i in 0 until text.size) {
+        val c = text[i]
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 ||
+            (i > 0 && c >= 48 && c <= 57)) continue
+        return false
+    }
+    true
+}
+
+private compile fun fuseName(cursor: ParserCursor): string {
+    val text = fuseToken(cursor)
+    if (!fuseIdentifier(text)) parserFail(cursor, "fuse: expected an identifier")
+    text
+}
+
+private compile fun fuseAtom(cursor: ParserCursor, dimensions: Map<string, int>): int {
+    val text = fuseToken(cursor)
+    if (fuseIdentifier(text)) {
+        val extent = dimensions.get(text)
+        if (extent == null) {
+            parserFail(cursor, "fuse: unknown dimension '$text'")
+            return 1
+        }
+        return extent
+    }
+    var value = 0
+    for (digit in text) {
+        if (digit < 48 || digit > 57 || value > (2147483647 - (digit - 48)) / 10) {
+            parserFail(cursor, "fuse: expected a positive integer dimension")
+            return 1
+        }
+        value = value * 10 + digit - 48
+    }
+    if (value == 0) {
+        parserFail(cursor, "fuse: expected a positive integer dimension")
+        return 1
+    }
+    value
+}
+
+private compile fun fuseExtent(cursor: ParserCursor, dimensions: Map<string, int>): int {
+    var extent = fuseAtom(cursor, dimensions)
+    while (fuseConsume(cursor, "*")) {
+        val factor = fuseAtom(cursor, dimensions)
+        if (extent > 2147483647 / factor) {
+            parserFail(cursor, "fuse: dimension product exceeds 2147483647")
+            return 1
+        }
+        extent *= factor
+    }
+    extent
+}
+
+private compile fun fuseDimensions(cursor: ParserCursor, var dimensions: Map<string, int>) {
+    var more = true
+    while (more) {
+        val name = fuseName(cursor)
+        if (dimensions.has(name) || dimensions.size >= 32) {
+            parserFail(cursor, "fuse: duplicate dimension or dimension limit exceeded")
+            return
+        }
+        fuseExpect(cursor, "=")
+        dimensions.set(name, fuseExtent(cursor, dimensions))
+        more = fuseConsume(cursor, ",")
+    }
+}
+
+private compile fun fuseTensors(cursor: ParserCursor, dimensions: Map<string, int>,
+    var tensors: Map<string, FusedTensor>, var out: array<FusedTensor>) {
+    var more = true
+    while (more) {
+        val name = fuseName(cursor)
+        if (tensors.has(name) || tensors.size >= 32) {
+            parserFail(cursor, "fuse: duplicate tensor or tensor limit exceeded")
+            return
+        }
+        fuseExpect(cursor, ":")
+        val kind = fuseName(cursor)
+        if (kind != "f32" && kind != "u32" && kind != "nvfp4") {
+            parserFail(cursor, "fuse: unsupported storage type '$kind'")
+            return
+        }
+        fuseExpect(cursor, "[")
+        val shape: array<int> = []
+        var elements = 1
+        var next = true
+        while (next) {
+            val extent = fuseExtent(cursor, dimensions)
+            if (shape.size >= 3 || elements > 2147483647 / extent) {
+                parserFail(cursor, "fuse: tensor rank or element count exceeds the limit")
+                return
+            }
+            elements *= extent
+            shape.append(extent)
+            next = fuseConsume(cursor, ",")
+        }
+        fuseExpect(cursor, "]")
+        val tensor = FusedTensor(name, kind, shape)
+        tensors.set(name, tensor)
+        out.append(tensor)
+        more = fuseConsume(cursor, ",")
+    }
+}
+
+private compile fun fuseScalar(cursor: ParserCursor, name: string): string {
+    fuseExpect(cursor, name)
+    fuseExpect(cursor, "=")
+    val text = fuseToken(cursor)
+    var digits = 0
+    var dots = 0
+    var nonzero = false
+    for (byte in text) {
+        if (byte == 46) dots += 1
+        else if (byte >= 48 && byte <= 57) {
+            digits += 1
+            if (byte != 48) nonzero = true
+        } else {
+            parserFail(cursor, "fuse: '$name' needs a decimal constant")
+            return "1.0"
+        }
+    }
+    if (digits == 0 || dots > 1 || text.size > 16 || (name == "beta" && !nonzero)) {
+        parserFail(cursor, "fuse: invalid '$name' constant")
+        return "1.0"
+    }
+    if (dots == 0) text + ".0" else text
+}
+
+private compile fun fuseStep(cursor: ParserCursor): FusedStep? {
+    val output = fuseName(cursor)
+    fuseExpect(cursor, "=")
+    val op = fuseName(cursor)
+    if (op != "matvec_indexed" && op != "situ") {
+        parserFail(cursor, "fuse: unknown operation '$op'")
+        return null
+    }
+    fuseExpect(cursor, "(")
+    val inputs: array<string> = []
+    val count = if (op == "matvec_indexed") 4 else 1
+    for (at in 0 until count) {
+        if (at > 0) fuseExpect(cursor, ",")
+        inputs.append(fuseName(cursor))
+    }
+    var beta = ""
+    var lb = ""
+    if (op == "situ") {
+        fuseExpect(cursor, ",")
+        beta = fuseScalar(cursor, "beta")
+        fuseExpect(cursor, ",")
+        lb = fuseScalar(cursor, "lb")
+    }
+    fuseExpect(cursor, ")")
+    FusedStep(op, output, inputs, beta, lb)
+}
+
+private compile fun fuseInput(cursor: ParserCursor, inputs: array<FusedTensor>,
+    name: string, kind: string, rank: int): FusedTensor? {
+    for (input in inputs) {
+        if (input.name != name) continue
+        if (input.kind == kind && input.shape.size == rank) return input
+        parserFail(cursor, "fuse: '$name' needs type '$kind' and rank $rank")
+        return null
+    }
+    parserFail(cursor, "fuse: tensor '$name' used before definition")
+    null
+}
+
+compile fun parseFuse(cursor: ParserCursor): SyntaxExpression {
+    val name = fuseName(cursor)
+    val dimensions: Map<string, int> = Map()
+    val tensors: Map<string, FusedTensor> = Map()
+    val inputs: array<FusedTensor> = []
+    val outputs: array<FusedTensor> = []
+    fuseExpect(cursor, "{")
+    if (fuseKeyword(cursor, "dims")) fuseDimensions(cursor, dimensions)
+    while (fuseKeyword(cursor, "in")) fuseTensors(cursor, dimensions, tensors, inputs)
+    while (fuseKeyword(cursor, "out")) fuseTensors(cursor, dimensions, tensors, outputs)
+    val matvec = fuseStep(cursor) ?? return syntaxNull()
+    val situ = fuseStep(cursor) ?? return syntaxNull()
+    fuseSkip(cursor)
+    if (!parserRawAt(cursor, "}")) {
+        parserFail(cursor, "fuse: launch boundary after gate/up and SiTU")
+        return syntaxNull()
+    }
+    if (matvec.operation != "matvec_indexed" || situ.operation != "situ") {
+        parserFail(cursor, "fuse: expected indexed NVFP4 gate/up followed by SiTU")
+        return syntaxNull()
+    }
+    val weights = fuseInput(cursor, inputs, matvec.inputs[0], "nvfp4", 3) ?? return syntaxNull()
+    val x = fuseInput(cursor, inputs, matvec.inputs[1], "f32", 1) ?? return syntaxNull()
+    val ids = fuseInput(cursor, inputs, matvec.inputs[2], "u32", 1) ?? return syntaxNull()
+    val scales = fuseInput(cursor, inputs, matvec.inputs[3], "f32", 1) ?? return syntaxNull()
+    if (tensors.has(matvec.output) || matvec.output == situ.output) {
+        parserFail(cursor, "fuse: the intermediate name must be fresh")
+        return syntaxNull()
+    }
+    if (situ.inputs[0] != matvec.output) {
+        parserFail(cursor, "fuse: SiTU must consume the defined gate/up intermediate")
+        return syntaxNull()
+    }
+    val experts = weights.shape[0]
+    val rows = weights.shape[1]
+    val cols = weights.shape[2]
+    val used = ids.shape[0]
+    if (cols % 64 != 0 || rows % 2 != 0 || cols != x.shape[0] || experts != scales.shape[0] ||
+        used > experts || used > 65535) {
+        parserFail(cursor, "fuse: indexed gate/up shape mismatch")
+        return syntaxNull()
+    }
+    if (outputs.size != 1 || outputs[0].name != situ.output) {
+        parserFail(cursor, "fuse: every output must be assigned")
+        return syntaxNull()
+    }
+    val out = outputs[0]
+    val ff = rows / 2
+    if (out.kind != "f32" || out.shape.size != 2 || out.shape[0] != used || out.shape[1] != ff) {
+        parserFail(cursor, "fuse: SiTU output shape mismatch")
+        return syntaxNull()
+    }
+    if (inputs.size != 4 || x.name == scales.name) {
+        parserFail(cursor, "fuse: gate/up requires four distinct inputs")
+        return syntaxNull()
+    }
+    parserRawExpect(cursor, "}")
+    fuseEmitGateUp(name, inputs, out, matvec, situ, experts, cols, ff, used)
+}
+
+#compilerRegisterSubparser("fuse", parseFuse)

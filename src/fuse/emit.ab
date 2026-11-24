@@ -1,0 +1,81 @@
+import "abla/compiler/parser"
+import "abla/text"
+import "kernel.ab"
+import "../backend/backend.ab"
+import "../kernels/matvec_nvfp4.ab"
+import "../kernels/elementwise.ab"
+
+private fun fuseParameter(inputs: array<FusedTensor>, name: string): int {
+    for (at in 0 until inputs.size) if (inputs[at].name == name) return at
+    -1
+}
+
+private compile fun fuseTensorSyntax(tensor: FusedTensor): SyntaxExpression {
+    val shape: array<SyntaxExpression> = []
+    for (extent in tensor.shape) shape.append(syntaxInteger(extent))
+    syntaxCall("FusedTensor", [syntaxString(tensor.name), syntaxString(tensor.kind), syntaxArray(shape)])
+}
+
+private compile fun fuseStepSyntax(step: FusedStep): SyntaxExpression {
+    val inputs: array<SyntaxExpression> = []
+    for (name in step.inputs) inputs.append(syntaxString(name))
+    syntaxCall("FusedStep", [syntaxString(step.operation), syntaxString(step.output), syntaxArray(inputs),
+        syntaxString(step.beta), syntaxString(step.lb)])
+}
+
+compile fun fuseEmitGateUp(name: string, inputs: array<FusedTensor>, output: FusedTensor,
+    matvec: FusedStep, situ: FusedStep, experts: int, cols: int, ff: int, used: int): SyntaxExpression {
+    val weights = fuseParameter(inputs, matvec.inputs[0])
+    val x = fuseParameter(inputs, matvec.inputs[1])
+    val ids = fuseParameter(inputs, matvec.inputs[2])
+    val scales = fuseParameter(inputs, matvec.inputs[3])
+    val beta = situ.beta
+    val lb = situ.lb
+    var parameters = ""
+    val kinds: array<SyntaxExpression> = []
+    val tensors: array<SyntaxExpression> = []
+    for (at in 0 until inputs.size) {
+        val tensor = inputs[at]
+        val scalar = if (tensor.kind == "nvfp4") "unsigned char" else if (tensor.kind == "u32") "unsigned" else "float"
+        parameters += "const $scalar *p$at, "
+        kinds.append(syntaxInteger(KERNEL_ARG_POINTER))
+        tensors.append(fuseTensorSyntax(tensor))
+    }
+    kinds.append(syntaxInteger(KERNEL_ARG_POINTER))
+    tensors.append(fuseTensorSyntax(output))
+    val symbol = "abla_fuse_$name"
+    val header = "extern \"C\" __global__ void $symbol(${parameters}float *out) {\n" +
+        "    constexpr unsigned cols = ${cols}u;\n" +
+        "    constexpr unsigned ff = ${ff}u;\n" +
+        "    constexpr unsigned used = ${used}u;\n" +
+        "    constexpr unsigned experts = ${experts}u;\n"
+    val body = """
+    constexpr unsigned long long rowBytes = (cols / 64u) * 36ull;
+    constexpr unsigned long long expertStrideBytes = 2ull * ff * rowBytes;
+    const unsigned row = blockIdx.x * (blockDim.x / 32u) + threadIdx.x / 32u;
+    const unsigned slot = blockIdx.y;
+    if (row >= ff || slot >= used) return;
+
+    const unsigned expertId = @ids@[slot];
+    const unsigned long long output = static_cast<unsigned long long>(slot) * ff + row;
+    if (expertId >= experts) {
+        if ((threadIdx.x & 31u) == 0) out[output] = 0.0f;
+        return;
+    }
+    const unsigned char *expert = @weights@ + expertId * expertStrideBytes;
+    const float gate = nvfp4_dot(expert + row * rowBytes, @x@, cols);
+    const float up = nvfp4_dot(expert + (ff + row) * rowBytes, @x@, cols);
+    if ((threadIdx.x & 31u) == 0) {
+        const float scale = @scales@ ? @scales@[expertId] : 1.0f;
+        out[output] = grad_situ(gate * scale, up * scale, @beta@f, @lb@f);
+    }
+}
+"""
+    val source = kernelNvfp4DotSource + "\n" + kernelSituDeviceSource + "\n" + header +
+        body.replace("@ids@", "p$ids").replace("@weights@", "p$weights").replace("@x@", "p$x")
+            .replace("@scales@", "p$scales").replace("@beta@", beta).replace("@lb@", lb)
+    val geometry = syntaxCall("FusedGeometry", [syntaxInteger(128), syntaxInteger(4),
+        syntaxArray([syntaxInteger(ff), syntaxInteger(used)]), syntaxInteger(scales)])
+    syntaxCall("FusedKernel", [syntaxString(symbol), syntaxString(source), syntaxArray(kinds), geometry,
+        syntaxArray([fuseStepSyntax(matvec), fuseStepSyntax(situ)]), syntaxArray(tensors)])
+}
