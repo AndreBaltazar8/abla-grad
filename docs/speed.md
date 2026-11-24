@@ -9,7 +9,8 @@ Method: ours = `abla-grad decode-bench <gguf> <ids> --n 128 --mode graph` (greed
 | llama.cpp mainline 33aeb17 | 74.43 | 78.10 | 77.50 | 77.29 |
 | Unsloth b12649-mix-c7059d6 | 104.06 | 106.58 | 106.15 | 105.50 |
 | abla-grad a02be45 | 96.5 | 95.7 | 81.5 | 73.8 |
-| abla-grad + split attention (4c1ee1f) | | 98.9 | 96.1 | 93.7 |
+| abla-grad + split attention, 8 blocks/head (4c1ee1f) | | 98.9 | 96.1 | 93.7 |
+| abla-grad, 16 blocks/head (default now) | | 98.7 | | 95.7 |
 
 | Depth 0, tok/s | pp512 | tg1024 |
 |---|---:|---:|
@@ -117,3 +118,4 @@ All 324 gate positions produced byte-identical logits across the two paths.
 
 ## GPU etiquette
 Every model run, gate and benchmark goes through `tools/gpu-lock.sh [-t hold-seconds] -- command...` (flock on /tmp/abla-grad-gpu.lock, waits for 20 GB free, hard hold timeout, one run per hold). Timings taken next to another run are not trustworthy.
+- attention splits 16 (--splits N): d512 93.7 -> 95.7, d15 unchanged; 32 and 64 no better. The context cost is now ~0.3 ms/token between d15 and d512, near Unsloth's 0.1; what remains is kernel time elsewhere (RMSNorm, F32 matvec, depth_mix, copy_f32).
