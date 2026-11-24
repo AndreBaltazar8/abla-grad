@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 binary=${1:-build/abla-grad}
-model=$(ls ~/models/inkling-2-mini/*.gguf)
+model=${GATE_MODEL:-$HOME/models/inkling-2-mini/Inkling-2-Mini-UD-Q4_K_M.gguf}   # not *.gguf: the drafter model lives in the same directory
 oracle=${ORACLE_DIR:-$HOME/src/abla-grad-oracle/artifacts/cuda/inkling-2-mini}
 out=build/gate-inkling
 mkdir -p "$out"

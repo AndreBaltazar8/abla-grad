@@ -329,6 +329,8 @@ private fun cudaPrefillSplitShape(args: KernelArgs, problem: array<int>, blockEl
     args.words[3] == problem[0] && args.words[3] % 2 == 0 && args.words[6] > 0 && args.words[4] % (32 * args.words[6]) == 0 && args.words[5] > 0 &&
         problem[1] == (args.words[5] + 63) / 64 * args.words[6] && args.words[0] % 16 == 0 && args.words[1] % 16 == 0 && args.words[2] % 8 == 0
 private fun cudaPrefillSplitF32Shape(args: KernelArgs, problem: array<int>): bool = cudaPrefillSplitShape(args, problem, 32)
+private fun cudaPrefillExactSplitShape(args: KernelArgs, problem: array<int>): bool =
+    args.words[3] == problem[0] && args.words[6] > 0 && args.words[4] % (32 * args.words[6]) == 0 && args.words[5] > 0 && problem[1] == (args.words[5] + 15) / 16 * args.words[6]
 private fun cudaPrefillSumSlicesShape(args: KernelArgs, problem: array<int>): bool = args.words[1] == problem[0] && args.words[2] > 0
 private val cudaArgsGatherRows = [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU]
 private val cudaArgsCopyRows = [prefillArgP, prefillArgU, prefillArgP, prefillArgU, prefillArgU, prefillArgU]
@@ -478,6 +480,7 @@ private val cudaPrefillKernels = [
     CudaKernelSpec("matmul_f32_split", kernelPrefillMatmul, 128, 256, cudaArgsMatmulSplit, cudaPrefillSplitF32Shape, 2),
     CudaKernelSpec("matmul_bf16_split", kernelPrefillMatmul, 128, 256, cudaArgsMatmulSplit, cudaPrefillSplitF32Shape, 2),
     CudaKernelSpec("sum_slices", kernelPrefillMatmul, 256, 256, cudaArgsSumSlices, cudaPrefillSumSlicesShape),
+    CudaKernelSpec("matmul_f32_exact_split", kernelPrefillMatmulF32ExactSplit, 16, 256, cudaArgsMatmulSplit, cudaPrefillExactSplitShape, 2),
     CudaKernelSpec("matmul_f32_exact", kernelPrefillMatmulF32Exact, 16, 256, cudaArgsPrefillMatmul, cudaPrefillMatmulExactShape, 2),
     CudaKernelSpec("gather_rows_q8_0", kernelPrefillGatherQ8_0, 256, 256, cudaArgsGatherRows, cudaPrefillGatherShape, 2),
     CudaKernelSpec("copy_rows", kernelPrefillCopyRows, 256, 256, cudaArgsCopyRows, cudaPrefillCopyRowsShape, 2),

@@ -103,10 +103,24 @@ static __device__ __forceinline__ void pm_fetch_raw(const unsigned char *w, unsi
     const unsigned char *base = w + static_cast<unsigned long long>(row) * rowBytes;
     if (FORMAT == PM_Q8_0) {
         const unsigned char *block = base + static_cast<unsigned long long>(k0 / 32) * 34;
-        raw[0] = *reinterpret_cast<const unsigned short *>(block);
-        const unsigned short *quants = reinterpret_cast<const unsigned short *>(block + 2 + 16 * half);
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) raw[1 + i] = static_cast<unsigned>(quants[2 * i]) | (static_cast<unsigned>(quants[2 * i + 1]) << 16);
+        if ((rowBytes & 3u) == 0 && ((reinterpret_cast<unsigned long long>(w) & 3u) == 0)) {
+            // 34-byte blocks: even blocks start on a 4-byte boundary (header + 2 quants in the first word), odd blocks have their quants aligned.
+            if (((k0 / 32) & 1u) != 0) {
+                const unsigned *q = reinterpret_cast<const unsigned *>(block + 2 + 16 * half);
+                raw[0] = *reinterpret_cast<const unsigned short *>(block);
+                raw[1] = q[0]; raw[2] = q[1]; raw[3] = q[2]; raw[4] = q[3];
+            } else {
+                const unsigned *q = reinterpret_cast<const unsigned *>(block + 16 * half);
+                const unsigned w0 = q[0], w1 = q[1], w2 = q[2], w3 = q[3], w4 = q[4];
+                raw[0] = half == 0 ? (w0 & 0xffffu) : static_cast<unsigned>(*reinterpret_cast<const unsigned short *>(block));
+                raw[1] = (w0 >> 16) | (w1 << 16); raw[2] = (w1 >> 16) | (w2 << 16); raw[3] = (w2 >> 16) | (w3 << 16); raw[4] = (w3 >> 16) | (w4 << 16);
+            }
+        } else {
+            raw[0] = *reinterpret_cast<const unsigned short *>(block);
+            const unsigned short *quants = reinterpret_cast<const unsigned short *>(block + 2 + 16 * half);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) raw[1 + i] = static_cast<unsigned>(quants[2 * i]) | (static_cast<unsigned>(quants[2 * i + 1]) << 16);
+        }
     } else if (FORMAT == PM_F32) {
         const float4 *values = reinterpret_cast<const float4 *>(base + (static_cast<unsigned long long>(k0) + 16 * half) * 4);
         #pragma unroll
