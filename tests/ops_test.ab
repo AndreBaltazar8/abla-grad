@@ -34,7 +34,7 @@ fun run(var recorder: Recorder): bool {
     val c = recorder.allocate(1 << 20)
     if (a == null || b == null || c == null) return false
     var ok = opMatvec(recorder, "q4_k", a, 0, b, 0, c, 0, 2048, 2048)
-    ok = ok && opMatvecIndexed(recorder, "nvfp4", a, 0, b, 0, c, 0, 512, 2048, c, 0, 8, 4096, 0)
+    ok = ok && opMatvecIndexed(recorder, "nvfp4", a, 0, b, 0, c, 0, 512, 2048, c, 0, 8, 4096, 0, a, 0, true)
     ok = ok && opRmsNorm(recorder, a, 0, b, 0, c, 0, 2048, 0.00001, 1)
     ok = ok && opRope(recorder, a, 0, b, 0, false, 32, 64, 64, 5, 500000.0, 0)
     ok = ok && opAttentionDecode(recorder, a, 0, b, 0, c, 0, a, 0, 32, 8, 64, 0, 5, 4096, 0.125)
@@ -47,7 +47,7 @@ fun main: int {
     val ok = run(recorder)
     val expectedKernels = ["matvec_q4_k", "matvec_nvfp4_indexed", "rmsnorm", "rope", "attention_decode", "silu_mul", "add"]
     // matvec: w x y rows cols; indexed adds ids nUsed expertStride(u64) xStride; rmsnorm: x w y n eps; rope with no factors: x, u64 0, six scalars.
-    val expectedKinds = ["00011", "000110131", "00014", "03111141", "00001111114", "0001", "0001"]
+    val expectedKinds = ["00011", "0001101310", "00014", "03111141", "00001111114", "0001", "0001"]
     if (!ok || recorder.kernels.size != expectedKernels.size) {
         println("ops test FAILED: launched ${recorder.kernels.size} of ${expectedKernels.size}")
         return 1

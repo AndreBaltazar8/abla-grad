@@ -14,17 +14,30 @@ fun opMatvec(
 )
 
 // Experts selected by `ids` (u32 each, on the device). `xStrideElems` 0 broadcasts one x to every expert (gate/up), `cols` gives each
-// expert its own x (down).
+// expert its own x (down). `scales` (one f32 per expert) multiplies each selected expert's result when `useScales` (Inkling's `.scale` tensors).
 fun opMatvecIndexed(
     var backend: Backend, kind: string,
     w: DeviceBuffer, wOffset: int, x: DeviceBuffer, xOffset: int, y: DeviceBuffer, yOffset: int,
-    rows: int, cols: int, ids: DeviceBuffer, idsOffset: int, nUsed: int, expertStrideBytes: int, xStrideElems: int
-): bool = backend.launch(
-    "matvec_${kind}_indexed",
-    kernelArgs().pointer(w, wOffset).pointer(x, xOffset).pointer(y, yOffset).u32(rows).u32(cols)
-        .pointer(ids, idsOffset).u32(nUsed).u64(expertStrideBytes).u32(xStrideElems),
-    [rows, nUsed]
-)
+    rows: int, cols: int, ids: DeviceBuffer, idsOffset: int, nUsed: int, expertStrideBytes: int, xStrideElems: int,
+    scales: DeviceBuffer, scalesOffset: int, useScales: bool
+): bool {
+    val name = "matvec_${kind}_indexed"
+    val problem = [rows, nUsed]
+    if (useScales) {
+        return backend.launch(
+            name,
+            kernelArgs().pointer(w, wOffset).pointer(x, xOffset).pointer(y, yOffset).u32(rows).u32(cols)
+                .pointer(ids, idsOffset).u32(nUsed).u64(expertStrideBytes).u32(xStrideElems).pointer(scales, scalesOffset),
+            problem
+        )
+    }
+    backend.launch(
+        name,
+        kernelArgs().pointer(w, wOffset).pointer(x, xOffset).pointer(y, yOffset).u32(rows).u32(cols)
+            .pointer(ids, idsOffset).u32(nUsed).u64(expertStrideBytes).u32(xStrideElems).u64(0),
+        problem
+    )
+}
 
 fun opRmsNorm(
     var backend: Backend, x: DeviceBuffer, xOffset: int, w: DeviceBuffer, wOffset: int, y: DeviceBuffer, yOffset: int,
