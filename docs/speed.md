@@ -19,7 +19,7 @@ Method: ours = `abla-grad decode-bench <gguf> <ids> --n 128 --mode graph` (greed
 
 ## Log
 - a02be45: graph decode, e7's router/RMSNorm/matvec work. Per-token cost grew with context (one attention block per head walked the context serially).
-- split attention: positions of a head over 8 blocks plus a merge (sink once); d512 73.9 -> 93.7, ids identical, gate passes (324 positions, 0 argmax differences). Fused gate/up -> SiTU (75): flat, ~0%.
+- split attention: positions of a head over 8 blocks plus a merge (sink once); d512 73.9 -> 93.7, ids identical, gate passes (324 positions, 0 argmax differences).
 - Next: F16 K/V and an SWA ring, MTP speculative decoding (acceptance rate first), fusion chains, matvecs to the bandwidth roof.
 
 ## Kernel tuning at a02be45
@@ -49,6 +49,16 @@ passed all 300 positions against llama.cpp with zero argmax differences.
 
 This single A/B held the context capacity at 512. The cached RMSNorm and
 packed loads preserved all 128 generated IDs.
+
+## First generated fusion
+
+Three alternating pairs on the RTX 4090 with the four-token prompt 01,
+context capacity 512 and 128 generated tokens. Values are medians in tok/s.
+All 324 gate positions produced byte-identical logits across the two paths.
+
+| Generated block | Direct, unfused → fused | Graph, unfused → fused |
+|---|---:|---:|
+| Indexed NVFP4 gate/up → SiTU | 84.48 → 84.73 | 98.76 → 98.51 |
 
 ## GPU etiquette
 Every model run, gate and benchmark goes through `tools/gpu-lock.sh [-t hold-seconds] -- command...` (flock on /tmp/abla-grad-gpu.lock, waits for 20 GB free, hard hold timeout, one run per hold). Timings taken next to another run are not trustworthy.
