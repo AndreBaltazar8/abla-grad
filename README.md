@@ -4,7 +4,7 @@ Run large language models entirely in Abla, on the GPU. First target: `thinkingm
 GGUF), text only. Proof model first: a small standard GGUF. llama.cpp is the **oracle** (logits to compare against),
 never a dependency of the program.
 
-Status: planning (2026-11-24); see `docs/plan.md` (stages, kernel list, how we compare) and `docs/interfaces.md` (the
+Status (2026-11-24): the small model (Llama-3.2-1B) runs on the GPU and matches llama.cpp (tools/gate-llama.sh); Inkling is written and waits for its quantized kernels. See `docs/plan.md` (stages, kernel list, how we compare) and `docs/interfaces.md` (the
 contracts between the parts and who owns what). Local repo only until André OKs a GitHub repo. Model files live in
 `~/models`, never in the repo.
 

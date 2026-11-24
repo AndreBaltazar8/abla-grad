@@ -55,3 +55,9 @@ Prefill matmul (S4): matmul_<type> tiled; until then prefill = repeated decode.
 - Inkling's exact attention (relative positions) and the NVFP4 block layout must be read from llama.cpp's source at the
   oracle's pinned commit (the GGUF type id and layout are defined there), not guessed.
 - VRAM: file size of the Inkling GGUF is unknown to me; df reports it. 24 GB may need expert offload or a smaller quant.
+
+## Status (updated as stages finish)
+- S0 contracts, S1a GGUF reader + `info`, S1b tokenizer, S1c oracle (llama.cpp 33aeb17, models pinned, GRDL dumps, tensor dumps, CPU/CUDA noise), S1d CUDA backend + kernel registry: done.
+- S2 small model: done. `tools/gate-llama.sh`: 266 positions over 4 prompts vs llama.cpp CUDA, all inside tests/tolerances.txt (worst KL 0.0047), 1 argmax flip at a near tie.
+- S3 Inkling: model code (src/model/inkling.ab, inkling_config.ab) written to docs/inkling-graph.md; debug dumps with the oracle's names (`abla-grad logits --dump DIR`,
+  `abla-grad compare-tensors ORACLE_DIR DIR`) find the first diverging tensor. Waiting on the quantized kernels (Q8_0, BF16, NVFP4/Q5_K/Q8_0 indexed, gather Q8_0).
