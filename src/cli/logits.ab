@@ -9,6 +9,8 @@ import "../backend/cuda.ab"
 import "../gguf/reader.ab"
 import "../model/llama.ab"
 import "../model/llama_config.ab"
+import "../model/inkling.ab"
+import "../model/inkling_config.ab"
 import "../compare/grdl.ab"
 
 private fun readIds(path: string): array<int>? {
@@ -61,39 +63,72 @@ fun cmdLogits(args: array<string>): int {
         println("logits: ${ggufLastError()}")
         return 2
     }
-    val config = llamaConfigFrom(file)
-    if (config == null) {
-        println("logits: ${llamaConfigLastError()}")
-        return 2
-    }
     var backend = cudaBackend() ?? return noCuda()
     val context = if (maxCtx > 0) maxCtx else ids.size + 8
     if (ids.size > context) {
         println("logits: ${ids.size} tokens do not fit --ctx $context")
         return 2
     }
-    val model = llamaLoad(backend, file, config, context)
-    if (model == null) {
-        println("logits: ${llamaLastError()}")
-        return 1
-    }
+    val architecture = file.getString("general.architecture") ?? ""
     val all: array<f32> = []
-    for (position in 0 until ids.size) {
-        if (!model.forward(backend, ids[position], position)) {
-            println("logits: ${llamaLastError()} (${cudaLastError()})")
+    var vocab = 0
+    if (architecture == "inkling2" || architecture == "inkling2_loop") {
+        val config = inklingConfigFrom(file)
+        if (config == null) {
+            println("logits: ${inklingConfigLastError()}")
+            return 2
+        }
+        val model = inklingLoad(backend, file, config, context)
+        if (model == null) {
+            println("logits: ${inklingLastError()}")
             return 1
         }
-        val row = model.readLogits(backend)
-        if (row == null) {
+        if (!model.reset(backend)) {
+            println("logits: could not clear the convolution state (${cudaLastError()})")
+            return 1
+        }
+        for (position in 0 until ids.size) {
+            if (!model.forward(backend, ids[position], position)) {
+                println("logits: ${inklingLastError()} (${cudaLastError()})")
+                return 1
+            }
+            val row = model.readLogits(backend)
+            if (row == null) {
+                println("logits: ${inklingLastError()}")
+                return 1
+            }
+            for (value in row) all.append(value)
+        }
+        vocab = config.nVocab
+    } else {
+        val config = llamaConfigFrom(file)
+        if (config == null) {
+            println("logits: ${llamaConfigLastError()}")
+            return 2
+        }
+        val model = llamaLoad(backend, file, config, context)
+        if (model == null) {
             println("logits: ${llamaLastError()}")
             return 1
         }
-        for (value in row) all.append(value)
+        for (position in 0 until ids.size) {
+            if (!model.forward(backend, ids[position], position)) {
+                println("logits: ${llamaLastError()} (${cudaLastError()})")
+                return 1
+            }
+            val row = model.readLogits(backend)
+            if (row == null) {
+                println("logits: ${llamaLastError()}")
+                return 1
+            }
+            for (value in row) all.append(value)
+        }
+        vocab = config.nVocab
     }
-    if (!grdlWrite(out, Grdl(config.nVocab, ids, all))) {
+    if (!grdlWrite(out, Grdl(vocab, ids, all))) {
         println("logits: cannot write $out")
         return 1
     }
-    println("logits: ${ids.size} positions x ${config.nVocab} written to $out")
+    println("logits: ${ids.size} positions x $vocab written to $out")
     0
 }
