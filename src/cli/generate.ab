@@ -1,0 +1,183 @@
+import "abla/float/text"
+import "abla/fs"
+import "abla/integer"
+import "abla/io"
+import "abla/math"
+import "abla/process/time"
+import "../backend/backend.ab"
+import "../backend/cuda.ab"
+import "../gguf/reader.ab"
+import "../model/inkling.ab"
+import "../model/inkling_config.ab"
+import "../model/llama.ab"
+import "../model/llama_config.ab"
+import "../tokenizer/tokenizer.ab"
+import "chat.ab"
+import "sampler.ab"
+import "utf8_stream.ab"
+
+private class GenerateArgs(
+    val model: string, var tokenizer: string = "", var prompt: string = "", var mode: string = "",
+    var maxTokens: int = 32, var temperature: f64 = 0.0, var topP: f64 = 1.0, var seed: int = 0, var context: int = 0
+)
+
+private fun generateArgs(args: array<string>): GenerateArgs? {
+    if (args.size < 3 || args.size % 2 == 0) return null
+    val parsed = GenerateArgs(args[0])
+    val seen: Map<string, bool> = Map()
+    var i = 1
+    while (i < args.size) {
+        val flag = args[i]
+        val value = args[i + 1]
+        if (seen.has(flag)) return null
+        seen.set(flag, true)
+        when (flag) {
+            "--prompt", "--prompt-file", "--chat" -> {
+                if (parsed.mode != "") return null
+                parsed.mode = flag
+                parsed.prompt = value
+            }
+            "--max-tokens" -> parsed.maxTokens = value.parseInt() ?? return null
+            "--temp" -> parsed.temperature = f64Parse(value)
+            "--top-p" -> parsed.topP = f64Parse(value)
+            "--seed" -> parsed.seed = value.parseInt() ?? return null
+            "--ctx" -> {
+                parsed.context = value.parseInt() ?? return null
+                if (parsed.context <= 0) return null
+            }
+            "--tokenizer" -> {
+                if (value == "") return null
+                parsed.tokenizer = value
+            }
+            else -> return null
+        }
+        i += 2
+    }
+    if (parsed.mode == "" || parsed.maxTokens < 0 ||
+        !isFinite(parsed.temperature) || parsed.temperature < 0.0 ||
+        !isFinite(parsed.topP) || parsed.topP <= 0.0 || parsed.topP > 1.0) return null
+    parsed
+}
+
+private fun generateError(message: string): int {
+    eprintln("generate: $message")
+    1
+}
+
+private fun generatePrompt(args: GenerateArgs, architecture: string): string? {
+    if (args.mode == "--prompt") return args.prompt
+    if (args.mode == "--chat") return renderChat(architecture, [ChatMessage("user", args.prompt)], utcNow())
+    val prompt = Path(args.prompt).readTextResult()
+    if (!prompt.succeeded) return null
+    prompt.text
+}
+
+// Inkling's <|end_message|> closes one content segment, including thinking.
+// Its EOS/EOT closes the whole assistant turn. Llama's EOT may be spelled
+// only in the vocabulary in older GGUFs. Include the model's end-of-text too.
+fun generationStops(file: GgufFile, tokenizer: Tokenizer, architecture: string): array<int> {
+    val stops: array<int> = []
+    val eos = tokenizer.eosId()
+    if (eos != null) stops.append(eos)
+    for (key in ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"]) {
+        val id = file.getInt(key)
+        if (id != null) stops.append(id)
+    }
+    val markers = if (isInklingChat(architecture))
+        ["<|content_model_end_sampling|>", "<|endoftext|>"]
+    else ["<|eot_id|>", "<|eom_id|>", "<|end_of_text|>"]
+    for (marker in markers) {
+        val ids = tokenizer.encode(marker, false, true)
+        if (ids.size == 1 && tokenizer.decode(ids) == marker) stops.append(ids[0])
+    }
+    stops
+}
+
+private fun forwardGeneration(
+    var backend: Backend, inkling: InklingModel?, llama: LlamaModel?, token: int, position: int
+): bool {
+    if (inkling != null) return inkling.forward(backend, token, position)
+    if (llama != null) return llama.forward(backend, token, position)
+    false
+}
+
+private fun generateLoop(
+    var backend: Backend, inkling: InklingModel?, llama: LlamaModel?, prompt: array<int>,
+    var sampler: TokenSampler, maxTokens: int, stops: array<int>, var emit: FnMut(int) -> void
+): int {
+    for (pos in 0 until prompt.size) {
+        if (!forwardGeneration(backend, inkling, llama, prompt[pos], pos))
+            return generateError("forward failed at prompt token $pos (${cudaLastError()})")
+    }
+
+    for (index in 0 until maxTokens) {
+        val row = if (inkling != null) inkling.readLogits(backend)
+            else if (llama != null) llama.readLogits(backend) else null
+        if (row == null) return generateError("could not download logits (${cudaLastError()})")
+        val token = sampler.choose(row)
+        if (token < 0) return generateError("model returned no usable logits")
+        for (stop in stops) if (stop == token) return 0
+        emit(token)
+        if (index + 1 < maxTokens &&
+            !forwardGeneration(backend, inkling, llama, token, prompt.size + index))
+            return generateError("forward failed at generated token $index (${cudaLastError()})")
+    }
+    0
+}
+
+// Runs a continuation on the selected model. Publishes each nonterminal ID
+// as soon as it is selected, before computing the next position.
+fun generateTokens(
+    file: GgufFile, tokenizer: Tokenizer, prompt: array<int>, context: int,
+    maxTokens: int, var sampler: TokenSampler, var emit: FnMut(int) -> void
+): int {
+    if (prompt.size == 0) return generateError("prompt tokenized to zero tokens")
+    if (context < prompt.size || maxTokens < 0 || maxTokens > context - prompt.size)
+        return generateError("prompt and continuation do not fit --ctx $context")
+    for (id in prompt) {
+        if (id < 0 || id >= tokenizer.vocabSize()) return generateError("prompt has an invalid token ID")
+    }
+    if (maxTokens == 0) return 0
+
+    val architecture = file.getString("general.architecture") ?? ""
+    val stops = generationStops(file, tokenizer, architecture)
+    if (isInklingChat(architecture)) {
+        val config = inklingConfigFrom(file) ?? return generateError(inklingConfigLastError())
+        if (config.nVocab != tokenizer.vocabSize()) return generateError("tokenizer vocabulary size does not match the model")
+        if (context > (file.getInt("$architecture.context_length") ?? context)) return generateError("--ctx exceeds the model context length")
+        var backend = cudaBackend() ?? return generateError(cudaLastError())
+        val model = inklingLoad(backend, file, config, context) ?? return generateError(inklingLastError())
+        if (!model.reset(backend)) return generateError("could not reset Inkling (${cudaLastError()})")
+        return generateLoop(backend, model, null, prompt, sampler, maxTokens, stops, emit)
+    }
+    val config = llamaConfigFrom(file) ?? return generateError(llamaConfigLastError())
+    if (config.nVocab != tokenizer.vocabSize()) return generateError("tokenizer vocabulary size does not match the model")
+    if (context > config.nCtxTrain) return generateError("--ctx exceeds the model context length")
+    var backend = cudaBackend() ?? return generateError(cudaLastError())
+    val model = llamaLoad(backend, file, config, context) ?? return generateError(llamaLastError())
+    generateLoop(backend, null, model, prompt, sampler, maxTokens, stops, emit)
+}
+
+fun cmdGenerate(args: array<string>): int {
+    val options = generateArgs(args)
+    if (options == null) {
+        eprintln("usage: abla-grad generate <model.gguf> [--tokenizer PATH] (--prompt TEXT | --prompt-file F | --chat TEXT) [--max-tokens N] [--temp T] [--top-p P] [--seed S] [--ctx N]")
+        return 2
+    }
+    val file = ggufOpen(options.model) ?? return generateError(ggufLastError())
+    val architecture = file.getString("general.architecture") ?? ""
+    if (architecture != "llama" && !isInklingChat(architecture))
+        return generateError("unsupported model architecture '$architecture'")
+    val tokenizer = (if (options.tokenizer == "") tokenizerFromGguf(file)
+        else tokenizerFromJson(options.tokenizer)) ?? return generateError(tokenizerLastError())
+    val prompt = generatePrompt(options, architecture) ?? return generateError("could not prepare prompt")
+    val ids = tokenizer.encode(prompt, true, options.mode == "--chat")
+    if (options.maxTokens > 9223372036854775807 - ids.size) return generateError("requested context overflows")
+    val context = if (options.context > 0) options.context else ids.size + options.maxTokens
+    val sampler = tokenSampler(options.temperature, options.topP, options.seed)
+    val stream = Utf8TokenStream()
+    val result = generateTokens(file, tokenizer, ids, context, options.maxTokens, sampler,
+        { token -> print(stream.push(tokenizer.decode([token]))) })
+    if (result == 0) print(stream.finish())
+    result
+}

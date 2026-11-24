@@ -1,0 +1,83 @@
+import "../src/cli/chat.ab"
+import "../src/cli/sampler.ab"
+import "../src/cli/utf8_stream.ab"
+import "abla/date"
+import "abla/test"
+
+private fun samplerTest(): bool {
+    var ok = true
+    val logits: array<f32> = [3.0, 2.0, 1.0, 0.0]
+    val tied: array<f32> = [-1.0, 4.0, 4.0]
+    val greedy = tokenSampler(0.0, 1.0, 17)
+    ok = expectEqual(greedy.choose(tied), 1, "greedy picks first maximum") && ok
+    ok = expectEqual(greedy.choose([]), -1, "empty logits") && ok
+    val tiny = tokenSampler(0.6, 0.00001, 18)
+    ok = expectEqual(tiny.choose(logits), 0, "tiny nucleus retains only the maximum") && ok
+    val sampled = tokenSampler(1.0, 0.9, 42)
+    val replay = tokenSampler(1.0, 0.9, 42)
+    // Relative weights: [1, e^-1, e^-2, e^-3]. The p=.9 nucleus is [0, 1, 2].
+    val expected = [0, 0, 1, 0, 0, 0, 0, 0, 0, 2, 1, 0]
+    for (i in 0 until expected.size) {
+        ok = expectEqual(sampled.choose(logits), expected[i], "seed 42 draw $i") && ok
+        ok = expectEqual(replay.choose(logits), expected[i], "seed 42 replay draw $i") && ok
+    }
+    val cold = tokenSampler(0.01, 1.0, 19)
+    ok = expectEqual(cold.choose(logits), 0, "small temperature concentrates the distribution") && ok
+    ok
+}
+
+private fun chatTest(): bool {
+    val date = utcDate(utcMilliseconds(2026, 11, 24))
+    val one = [ChatMessage("user", "What is 2 + 2?")]
+    val two = [ChatMessage("system", "Answer briefly."), ChatMessage("user", "Capital of Portugal?")]
+    val three = [ChatMessage("user", "Olá!"), ChatMessage("assistant", "Olá, tudo bem?"),
+        ChatMessage("user", "Tell me about Lisboa.")]
+    val conversations = [one, two, three]
+
+    // llama.cpp 33aeb17f common_chat_templates_apply, Jinja enabled with
+    // add_generation_prompt. BOS belongs to tokenization in this invocation.
+    val llamaSystem = "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 24 Nov 2026\n\n"
+    val llamaUser = "<|start_header_id|>user<|end_header_id|>\n\n"
+    val llamaAssistant = "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    val endTurn = "<|eot_id|>"
+    val llamaExpected = [
+        "$llamaSystem$endTurn${llamaUser}What is 2 + 2?$endTurn$llamaAssistant",
+        "${llamaSystem}Answer briefly.$endTurn${llamaUser}Capital of Portugal?$endTurn$llamaAssistant",
+        "$llamaSystem$endTurn${llamaUser}Olá!$endTurn${llamaAssistant}Olá, tudo bem?$endTurn${llamaUser}Tell me about Lisboa.$endTurn$llamaAssistant",
+    ]
+    val effort = "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+    val inklingUser = "<|message_user|><|content_text|>"
+    val inklingAssistant = "<|message_model|><|content_text|>"
+    val endSegment = "<|end_message|>"
+    val inklingExpected = [
+        "$effort${inklingUser}What is 2 + 2?$endSegment",
+        "<|message_system|><|content_text|>Answer briefly.$endSegment$effort${inklingUser}Capital of Portugal?$endSegment",
+        "$effort${inklingUser}Olá!$endSegment${inklingAssistant}Olá, tudo bem?$endSegment<|content_model_end_sampling|>${inklingUser}Tell me about Lisboa.$endSegment",
+    ]
+    var ok = true
+    for (i in 0 until conversations.size) {
+        ok = expectEqual(renderChat("llama", conversations[i], date) ?? "", llamaExpected[i], "Llama golden $i") && ok
+        ok = expectEqual(renderChat("inkling2_loop", conversations[i], date) ?? "", inklingExpected[i], "Inkling golden $i") && ok
+    }
+    ok
+}
+
+private fun streamTest(): bool {
+    val stream = Utf8TokenStream()
+    var ok = expectEqual(stream.push("A\xf0\x9f"), "A", "hold a partial scalar")
+    ok = expectEqual(stream.push("\x8c"), "", "hold until all bytes arrive") && ok
+    ok = expectEqual(stream.push("\x8d!"), "🌍!", "emit exactly once when complete") && ok
+    ok = expectEqual(stream.push("\xf0"), "", "hold an incomplete lead") && ok
+    ok = expectEqual(stream.push("B"), "�B", "recover from a malformed trailing scalar") && ok
+    ok = expectEqual(stream.push("\xe2\x82"), "", "hold until end") && ok
+    ok = expectEqual(stream.finish(), "�", "replace a truncated scalar at EOF") && ok
+    ok = expectEqual(stream.finish(), "", "finish twice") && ok
+    ok
+}
+
+fun main: int {
+    val sampler = samplerTest()
+    val chat = chatTest()
+    val stream = streamTest()
+    if (sampler && chat && stream) 0 else 1
+}

@@ -1,0 +1,134 @@
+// Compare the generation loop token-for-token against dump-greedy.sh output.
+import "../src/cli/generate.ab"
+import "../src/cli/sampler.ab"
+import "../src/gguf/reader.ab"
+import "../src/tokenizer/tokenizer.ab"
+import "abla/float"
+import "abla/float/text"
+import "abla/fs"
+import "abla/integer"
+import "abla/io"
+import "abla/process/arguments"
+import "abla/text"
+
+fun main: int {
+    if (processArgumentCount() < 2 || processArgumentCount() > 3) {
+        eprintln("usage: generate_gpu_test MODEL ORACLE_DIR [TOKENIZER_JSON]")
+        return 2
+    }
+    val file = ggufOpen(processArgument(0))
+    if (file == null) {
+        eprintln(ggufLastError())
+        return 2
+    }
+    val tokenizer = if (processArgumentCount() == 3) tokenizerFromJson(processArgument(2))
+        else tokenizerFromGguf(file)
+    if (tokenizer == null) {
+        eprintln(tokenizerLastError())
+        return 2
+    }
+
+    val dir = path(processArgument(1))
+    val prompt = dir.child("prompt.txt").readTextResult()
+    val reference = dir.child("tokens.tsv").readTextResult()
+    val metadata = dir.child("meta.tsv").readTextResult()
+    if (!prompt.succeeded || !reference.succeeded || !metadata.succeeded) return 2
+    val ids = tokenizer.encode(prompt.text, true)
+    val expected: array<int> = []
+    var inputPosition = 0
+    for (line in reference.text.split("\n")) {
+        if (line == "" || line.startsWith("position\t")) continue
+        val fields = line.split("\t")
+        if (fields.size != 4) return 2
+        val id = fields[2].parseInt() ?? return 2
+        if (fields[1] == "generated") expected.append(id)
+        else if (fields[1] == "prompt") {
+            if (inputPosition >= ids.size || id != ids[inputPosition]) {
+                eprintln("prompt differs from oracle at position $inputPosition")
+                return 2
+            }
+            inputPosition += 1
+        } else return 2
+    }
+    if (inputPosition != ids.size) return 2
+    var context = 0
+    var requested = -1
+    var eog = false
+    for (line in metadata.text.split("\n")) {
+        val fields = line.split("\t")
+        if (fields.size != 2) continue
+        if (fields[0] == "context_size") context = fields[1].parseInt() ?? 0
+        if (fields[0] == "requested_tokens") requested = fields[1].parseInt() ?? -1
+        if (fields[0] == "eog") eog = fields[1] == "1"
+    }
+
+    if (requested < 1 || expected.size == 0 || expected.size > requested ||
+        (!eog && expected.size != requested)) return 2
+
+    // The oracle dumps the same F32 rows as GRDL without a header. The
+    // first continuation decision is the row after the last prompt ID.
+    val logits = dir.child("logits.f32le").readTextResult()
+    val stride = tokenizer.vocabSize() * 4
+    if (!logits.succeeded || logits.text.size % stride != 0 ||
+        logits.text.size / stride != ids.size + expected.size - 1) return 2
+    var stable = 0
+    var cutoff = 0.0
+    for (i in 0 until expected.size) {
+        val row = (ids.size - 1 + i) * stride
+        val top = oracleTopTwo(logits.text, row, stride)
+        if (top.id != expected[i]) {
+            eprintln("oracle token disagrees with its logits at continuation index $i")
+            return 2
+        }
+        cutoff = top.margin
+        if (cutoff < 0.25) break
+        stable += 1
+    }
+
+    val terminal = eog && stable == expected.size
+    val expectedOutput = if (terminal) stable - 1 else stable
+    val actual: array<int> = []
+    val status = generateTokens(file, tokenizer, ids, context, stable, tokenSampler(0.0, 1.0, 0),
+        { token -> actual.append(token) })
+    if (status != 0) return status
+    for (i in 0 until expectedOutput) {
+        if (i >= actual.size || actual[i] != expected[i]) {
+            val got = if (i < actual.size) "${actual[i]}" else "EOS"
+            eprintln("oracle ${expected[i]} != generated $got at continuation index $i")
+            return 1
+        }
+    }
+    if (actual.size != expectedOutput) {
+        eprintln("expected $expectedOutput emitted tokens, got ${actual.size}")
+        return 1
+    }
+    if (stable < expected.size) {
+        println("greedy: $stable tokens match llama.cpp; cutoff at continuation index $stable (oracle margin $cutoff)")
+    } else {
+        println("greedy: $expectedOutput tokens match llama.cpp, EOS=${if (terminal) "yes" else "no"}")
+    }
+    0
+}
+
+private class OracleTopTwo(val id: int, val margin: f64)
+
+private fun oracleTopTwo(logits: string, row: int, stride: int): OracleTopTwo {
+    var bestId = -1
+    var best = -1.0 / 0.0
+    var runnerUp = best
+    var at = row
+    while (at < row + stride) {
+        val bits = logits[at] | (logits[at + 1] << 8) |
+            (logits[at + 2] << 16) | (logits[at + 3] << 24)
+        val value = f32ToF64(f32FromBits(u32(bits)))
+        if (value > best) {
+            runnerUp = best
+            best = value
+            bestId = (at - row) / 4
+        } else if (value > runnerUp) {
+            runnerUp = value
+        }
+        at += 4
+    }
+    OracleTopTwo(bestId, best - runnerUp)
+}

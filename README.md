@@ -31,8 +31,15 @@ implement the same `Backend` interface and the same kernel names; the model code
 nix-shell shell.nix --run 'make test'
 abla-grad info    ~/models/<model>.gguf              # header, metadata, tensor type census
 abla-grad logits  ~/models/<model>.gguf prompt.ids -o out.grdl
+abla-grad generate ~/models/<model>.gguf --chat "What is 2 + 2?" --max-tokens 32
 abla-grad compare out.grdl oracle.grdl               # per-token argmax / top-5 / max abs diff / KL
 ```
+
+`generate` accepts one of `--prompt TEXT`, `--prompt-file PATH`, or `--chat TEXT`. The chat option renders a single
+user message with the model’s text chat template. The embedded GGUF tokenizer is used by default. For Inkling,
+`--tokenizer PATH` selects its separate `tokenizer.json`. Generation is greedy by default. Use `--temp T` with
+`--top-p P` and `--seed S` for reproducible sampling. `--ctx N` sets the total prompt and continuation budget.
+Output streams to stdout as complete UTF-8 and ends at the model’s end-of-turn token or the token limit.
 
 ## Rules
 

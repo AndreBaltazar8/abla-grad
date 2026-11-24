@@ -1,0 +1,100 @@
+import "abla/float"
+import "abla/math"
+
+// The generator is Park–Miller with multiplier 48271 and a 31-bit modulus.
+// Multiplication fits in int. A normalized seed always has nonzero state.
+class TokenSampler(val temperature: f64, val topP: f64, var state: int) {
+    fun uniform(): f64 {
+        this.state = (this.state * 48271) % 2147483647
+        f64FromInt(this.state) / 2147483647.0
+    }
+
+    // Returns a vocabulary index, or -1 if there is no usable logit.
+    // Greedy and equal-weight nucleus ties are ordered by token ID.
+    fun choose(logits: array<f32>): int {
+        var best = -1
+        var maximum = -1.0 / 0.0
+        for (id in 0 until logits.size) {
+            val value = f32ToF64(logits[id])
+            if (value > maximum) {
+                maximum = value
+                best = id
+            }
+        }
+        if (best < 0 || this.temperature == 0.0) return best
+
+        val weights: array<f64> = []
+        val candidates: array<int> = []
+        var total = 0.0
+        for (id in 0 until logits.size) {
+            val value = f32ToF64(logits[id])
+            var weight = 0.0
+            if (value == maximum) weight = 1.0
+            else if (isFinite(maximum) && isFinite(value)) weight = exp((value - maximum) / this.temperature)
+            weights.append(weight)
+            if (weight > 0.0) {
+                total += weight
+                candidates.append(id)
+            }
+        }
+
+        // At p=1 the whole distribution is retained, so order is immaterial.
+        if (this.topP < 1.0) {
+            val sorted: array<int> = []
+            var index = candidates.size / 2
+            while (index > 0) {
+                index -= 1
+                sampleSift(candidates, weights, index)
+            }
+            val limit = total * this.topP
+            total = 0.0
+            while (candidates.size > 0 && total < limit) {
+                val id = candidates[0]
+                val tail = candidates[candidates.size - 1]
+                candidates.truncate(candidates.size - 1)
+                if (candidates.size > 0) {
+                    candidates[0] = tail
+                    sampleSift(candidates, weights, 0)
+                }
+                sorted.append(id)
+                total += weights[id]
+            }
+            return this.draw(sorted, weights, total)
+        }
+        this.draw(candidates, weights, total)
+    }
+
+    fun draw(ids: array<int>, weights: array<f64>, total: f64): int {
+        if (ids.size == 0) return -1
+        if (ids.size == 1) return ids[0]
+        var draw = this.uniform() * total
+        for (id in ids) {
+            draw -= weights[id]
+            if (draw < 0.0) return id
+        }
+        // Rounding near the end of the distribution.
+        ids[ids.size - 1]
+    }
+}
+
+fun tokenSampler(temperature: f64, topP: f64, seed: int): TokenSampler {
+    val period = 2147483646
+    val normalized = ((seed % period) + period) % period + 1
+    TokenSampler(temperature, topP, normalized)
+}
+
+private fun sampleBefore(a: int, b: int, weights: array<f64>): bool =
+    weights[a] > weights[b] || (weights[a] == weights[b] && a < b)
+
+private fun sampleSift(var ids: array<int>, weights: array<f64>, start: int): void {
+    var i = start
+    val id = ids[i]
+    while (i < ids.size / 2) {
+        var child = i * 2 + 1
+        if (child + 1 < ids.size && sampleBefore(ids[child + 1], ids[child], weights)) child += 1
+        if (!sampleBefore(ids[child], id, weights)) break
+        ids[i] = ids[child]
+        i = child
+    }
+    ids[i] = id
+}

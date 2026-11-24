@@ -1,0 +1,49 @@
+import "abla/bytes"
+import "abla/text"
+
+// Holds only a partial trailing scalar between successive token pieces.
+class Utf8TokenStream(var pending: string = "") {
+    fun push(piece: string): string {
+        val bytes = this.pending + piece
+        this.pending = ""
+        val out = byteBuffer()
+        var at = 0
+        var start = 0
+        while (at < bytes.size) {
+            val width = utf8SequenceLength(bytes[at])
+            if (width > bytes.size - at && possibleUtf8Prefix(bytes, at)) {
+                this.pending = bytes.slice(at, bytes.size)
+                break
+            }
+            if (width == 0 || !utf8SequenceValid(bytes, at, width)) {
+                out.appendText(bytes.slice(start, at))
+                out.appendText("�")
+                at += 1
+                start = at
+            } else {
+                at += width
+            }
+        }
+        out.appendText(bytes.slice(start, at))
+        out.toText()
+    }
+
+    // An incomplete scalar at end of stream is replaced as one invalid unit.
+    fun finish(): string {
+        if (this.pending == "") return ""
+        this.pending = ""
+        "�"
+    }
+}
+
+private fun possibleUtf8Prefix(bytes: string, start: int): bool {
+    if (start + 1 == bytes.size) return true
+    val lead = bytes[start]
+    val second = bytes[start + 1]
+    if ((lead == 224 && second < 160) || (lead == 237 && second > 159) ||
+        (lead == 240 && second < 144) || (lead == 244 && second > 143)) return false
+    for (i in start + 1 until bytes.size) {
+        if (bytes[i] < 128 || bytes[i] > 191) return false
+    }
+    true
+}

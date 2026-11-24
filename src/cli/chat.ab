@@ -1,0 +1,68 @@
+import "abla/bytes"
+import "abla/date"
+import "abla/text"
+
+class ChatMessage(val role: string, val content: string)
+
+private val inklingThinkingEffort = "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+
+fun isInklingChat(architecture: string): bool =
+    architecture == "inkling2" || architecture == "inkling2_loop"
+
+// Text-only form of the pinned model templates. The caller's tokenizer adds
+// BOS. Inkling emits its default thinking-effort message once, before the
+// first non-system turn, and its sampling terminator after assistant history.
+fun renderChat(architecture: string, messages: array<ChatMessage>, date: UtcDate): string? {
+    if (isInklingChat(architecture)) return renderInklingChat(messages)
+    if (architecture == "llama") return renderLlamaChat(messages, date)
+    null
+}
+
+private fun renderInklingChat(messages: array<ChatMessage>): string? {
+    val prompt = byteBuffer()
+    var effortEmitted = false
+    for (message in messages) {
+        val marker = when (message.role) {
+            "system" -> "<|message_system|>"
+            "user" -> "<|message_user|>"
+            "assistant" -> "<|message_model|>"
+            else -> return null
+        }
+        if (!effortEmitted && message.role != "system") {
+            prompt.appendText(inklingThinkingEffort)
+            effortEmitted = true
+        }
+        prompt.appendText(marker)
+        prompt.appendText("<|content_text|>")
+        prompt.appendText(message.content)
+        prompt.appendText("<|end_message|>")
+        if (message.role == "assistant") prompt.appendText("<|content_model_end_sampling|>")
+    }
+    if (!effortEmitted) prompt.appendText(inklingThinkingEffort)
+    prompt.toText()
+}
+
+private fun llamaHeader(role: string): string = "<|start_header_id|>${role}<|end_header_id|>\n\n"
+
+private fun renderLlamaChat(messages: array<ChatMessage>, date: UtcDate): string? {
+    val prompt = byteBuffer()
+    val day = if (date.day < 10) "0${date.day}" else "${date.day}"
+    val month = dateMonthName(date.month)
+    prompt.appendText(llamaHeader("system"))
+    prompt.appendText("Cutting Knowledge Date: December 2023\nToday Date: $day $month ${date.year}\n\n")
+    var firstTurn = 0
+    if (messages.size > 0 && messages[0].role == "system") {
+        prompt.appendText(messages[0].content.trim())
+        firstTurn = 1
+    }
+    prompt.appendText("<|eot_id|>")
+    for (i in firstTurn until messages.size) {
+        val message = messages[i]
+        if (message.role != "user" && message.role != "assistant" && message.role != "system") return null
+        prompt.appendText(llamaHeader(message.role))
+        prompt.appendText(message.content.trim())
+        prompt.appendText("<|eot_id|>")
+    }
+    prompt.appendText(llamaHeader("assistant"))
+    prompt.toText()
+}
