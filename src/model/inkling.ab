@@ -116,6 +116,8 @@ resource class InklingModel(
     var useStep: bool = false,
     // Split-position decode attention in step mode (--no-split restores the one-block-per-head kernel for A/B runs).
     var splitAttention: bool = true,
+    // Use the generated fused gate/up + SiTU kernel for the experts when the shapes match (--no-fuse turns it off for A/B runs).
+    var fused: bool = true,
     // When not empty, `forward` at position 0 writes named intermediate vectors (the oracle's names) into this directory.
     var dumpDir: string = ""
 )
@@ -389,9 +391,16 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     val guRowBytes = ggmlRowBytes(guRef.type, guRef.cols)
     val downRowBytes = ggmlRowBytes(downRef.type, downRef.cols)
     val nFf = c.nFfExp
-    ok = ok && opMatvecIndexed(backend, guKind, this.arena, guRef.offset, this.scratch, x, this.scratch, this.so("gu"), 2 * nFf, n,
-        this.scratch, ids, c.nExpertUsed, guRowBytes * 2 * nFf, 0, this.arena, guScales.offset, this.has("blk.$ip.ffn_gate_up_exps.scale"))
-    ok = ok && opSitu(backend, this.scratch, this.so("gu"), this.scratch, this.so("act"), c.nExpertUsed, nFf, c.situBeta, c.situLinear)
+    val fusable = this.fused && guKind == "nvfp4" && n == 2304 && nFf == 1152 && c.nExpert == 128 && c.nExpertUsed == 8 &&
+        c.situBeta == 4.0 && c.situLinear == 25.0
+    if (fusable) {
+        ok = ok && opGateUpSitu(backend, this.arena, guRef.offset, this.scratch, x, this.scratch, ids, this.arena, guScales.offset,
+            this.has("blk.$ip.ffn_gate_up_exps.scale"), this.scratch, this.so("act"), nFf, c.nExpertUsed)
+    } else {
+        ok = ok && opMatvecIndexed(backend, guKind, this.arena, guRef.offset, this.scratch, x, this.scratch, this.so("gu"), 2 * nFf, n,
+            this.scratch, ids, c.nExpertUsed, guRowBytes * 2 * nFf, 0, this.arena, guScales.offset, this.has("blk.$ip.ffn_gate_up_exps.scale"))
+        ok = ok && opSitu(backend, this.scratch, this.so("gu"), this.scratch, this.so("act"), c.nExpertUsed, nFf, c.situBeta, c.situLinear)
+    }
     this.dump(backend, pos, "ffn_moe_situ-$slot", this.so("act"), c.nExpertUsed * nFf)
     ok = ok && opMatvecIndexed(backend, downKind, this.arena, downRef.offset, this.scratch, this.so("act"), this.scratch, this.so("down"), n, nFf,
         this.scratch, ids, c.nExpertUsed, downRowBytes * n, nFf, this.arena, downScales.offset, this.has("blk.$ip.ffn_down_exps.scale"))

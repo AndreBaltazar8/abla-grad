@@ -2,6 +2,7 @@
 // each builds the KernelArgs in the kernel's parameter order and launches it by name. Buffers are passed with a byte offset.
 // `kind` is the weight storage type's kernel suffix: "f32", "bf16", "q8_0", "q4_k", "q5_k", "q6_k", "nvfp4".
 import "backend/backend.ab"
+import "kernels/fused_gate_up_situ.ab"
 
 fun opMatvec(
     var backend: Backend, kind: string,
@@ -313,4 +314,14 @@ fun opAttentionRelSplitStep(
     ok && backend.launch(
         "attention_rel_merge", kernelArgs().pointer(part, partOffset).pointer(out, outOffset).u32(nHead).u32(headDim).u32(nSplit), [nHead]
     )
+}
+
+// The generated gate/up -> SiTU kernel (src/kernels/fused_gate_up_situ.ab): one launch for opMatvecIndexed("nvfp4") + opSitu on the Inkling 2 Mini shapes.
+fun opGateUpSitu(
+    var backend: Backend, gateUp: DeviceBuffer, gateUpOffset: int, x: DeviceBuffer, xOffset: int, ids: DeviceBuffer, idsOffset: int,
+    scales: DeviceBuffer, scalesOffset: int, useScales: bool, out: DeviceBuffer, outOffset: int, nFf: int, nUsed: int
+): bool {
+    val args = kernelArgs().pointer(gateUp, gateUpOffset).pointer(x, xOffset).pointer(ids, idsOffset)
+    if (useScales) args.pointer(scales, scalesOffset) else args.u64(0)
+    backend.launch(inklingGateUpSitu.name, args.pointer(out, outOffset), [nFf, nUsed])
 }
