@@ -68,9 +68,9 @@ fun prefillWorkspace(var backend: Backend, c: InklingConfig, chunk: int, allLogi
     at = wsAdd(offsets, "k", chunk * kvDim, at)
     at = wsAdd(offsets, "v", chunk * kvDim, at)
     at = wsAdd(offsets, "r", chunk * c.nRel * c.nHead, at)
-    at = wsAdd(offsets, "kDyn", chunk * c.nConv * c.nHeadKv, at)
-    at = wsAdd(offsets, "vDyn", chunk * c.nConv * c.nHeadKv, at)
-    at = wsAdd(offsets, "sinks", chunk * c.nHead, at)
+    at = wsAdd(offsets, "kDyn", 8 * chunk * c.nConv * c.nHeadKv, at)
+    at = wsAdd(offsets, "vDyn", 8 * chunk * c.nConv * c.nHeadKv, at)
+    at = wsAdd(offsets, "sinks", 8 * chunk * c.nHead, at)
     at = wsAdd(offsets, "table", chunk * c.nHead * (c.extent + 1), at)
     at = wsAdd(offsets, "att", chunk * qDim, at)
     at = wsAdd(offsets, "gate", chunk * qDim, at)
@@ -89,7 +89,7 @@ fun prefillWorkspace(var backend: Backend, c: InklingConfig, chunk: int, allLogi
     at = wsAdd(offsets, "moe", chunk * n, at)
     at = wsAdd(offsets, "msgs", chunk * 4 * n, at)
     at = wsAdd(offsets, "ctrlIn", chunk * 2 * n, at)
-    at = wsAdd(offsets, "ctrlGate", chunk * c.gateRank, at)
+    at = wsAdd(offsets, "ctrlGate", 8 * chunk * c.gateRank, at)
     at = wsAdd(offsets, "ctrlGain", chunk * n, at)
     at = wsAdd(offsets, "ctrlForget", chunk * n, at)
     at = wsAdd(offsets, "ctrlOut", chunk * n, at)
@@ -138,6 +138,16 @@ private fun InklingModel.dense(var backend: Backend, ws: PrefillWorkspace, name:
     if (exact && kind == "f32") {
         kernel = "matmul_f32_exact"
         problem = [ref.rows, (tokens + 15) / 16]
+    } else if ((kind == "f32" || kind == "bf16") && ref.rows <= 128 && ref.cols >= 1024 && tokens >= 64) {
+        // few rows, long k: split k over blocks so the whole GPU works, then add the slices
+        var split = 8
+        while (split > 1 && ref.cols / 32 % split != 0) split = split / 2
+        val tiles = (tokens + 63) / 64
+        val launched = backend.launch("matmul_${kind}_split", kernelArgs().pointer(this.arena, ref.offset).pointer(ws.buffer, xOffset).pointer(ws.buffer, yOffset)
+            .u32(ref.rows).u32(ref.cols).u32(tokens).u32(split), [ref.rows, tiles * split])
+        if (!launched) return false
+        if (split == 1) return true
+        return backend.launch("sum_slices", kernelArgs().pointer(ws.buffer, yOffset).u32(tokens * ref.rows).u32(split), [tokens * ref.rows])
     } else if (kind == "q8_0" || kind == "nvfp4" || kind == "bf16" || kind == "f32") {
         kernel = "matmul_$kind"
         problem = [ref.rows, (tokens + 63) / 64]
