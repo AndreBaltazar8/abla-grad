@@ -3,6 +3,9 @@ import "../gguf_quant_oracle.ab"
 import "device_test_support.ab"
 import "packed_matvec_test_support.ab"
 
-fun verify(backend: Backend): bool = testPackedMatvec(backend, "q8_0", 32, 34, oracleQ8_0, true)
+fun verify(backend: Backend): bool =
+    testPackedMatvec(backend, "q8_0", 32, 34, oracleQ8_0, true) &&
+    testPackedMatvec(backend, "q8_0", 32, 34, oracleQ8_0, true, inputOffset = 4) &&
+    testPackedMatvec(backend, "q8_0", 32, 34, oracleQ8_0, true, weightOffset = 1)
 
 fun main: int = runCudaKernelTest("matvec_q8_0 (plain, indexed, gather)", verify)

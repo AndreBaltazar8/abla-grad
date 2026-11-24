@@ -7,7 +7,8 @@ import "abla/unsafe/memory/raw"
 // All fixtures contain three blocks per row so Q8_0 and Q6_K also
 // exercise alternating row alignment. The gather fetches an interior row.
 trusted fun testPackedMatvec(backend: Backend, kind: string, elements: int, blockBytes: int,
-    decode: (string) -> array<f32>, gather: bool = false, indexed: bool = true): bool {
+    decode: (string) -> array<f32>, gather: bool = false, indexed: bool = true,
+    weightOffset: int = 0, inputOffset: int = 0): bool {
     val rows = 7
     val blocks = if (elements == 1) 97 else 3
     val cols = blocks * elements
@@ -33,20 +34,20 @@ trusted fun testPackedMatvec(backend: Backend, kind: string, elements: int, bloc
         }
     }
     for (col in 0 until cols) testStoreFloat(xa, col, f32FromInt((col * 17 + col / 7) % 37 - 18) / 32.0)
-    val dw = backend.allocate(weights.capacity)
-    val dx = backend.allocate(x.capacity)
+    val dw = backend.allocate(weights.capacity + weightOffset)
+    val dx = backend.allocate(x.capacity + inputOffset)
     val dy = backend.allocate(y.capacity)
     if (dw == null || dx == null || dy == null) return false
-    if (!backend.upload(dw, 0, wa, weights.capacity) ||
-        !backend.upload(dx, 0, xa, x.capacity) ||
-        !backend.launch("matvec_${kind}", kernelArgs().pointer(dw).pointer(dx).pointer(dy).u32(rows).u32(cols), [rows]) ||
+    if (!backend.upload(dw, weightOffset, wa, weights.capacity) ||
+        !backend.upload(dx, inputOffset, xa, x.capacity) ||
+        !backend.launch("matvec_${kind}", kernelArgs().pointer(dw, weightOffset).pointer(dx, inputOffset).pointer(dy).u32(rows).u32(cols), [rows]) ||
         !backend.download(dy, 0, ya, y.capacity)) return false
 
     val token = 5
     if (gather) {
         val dg = backend.allocate(gathered.capacity)
         if (dg == null || !backend.launch("gather_row_${kind}",
-            kernelArgs().pointer(dw).u32(token).pointer(dg).u32(cols), [cols]) ||
+            kernelArgs().pointer(dw, weightOffset).u32(token).pointer(dg).u32(cols), [cols]) ||
             !backend.download(dg, 0, ga, gathered.capacity)) return false
     }
     for (row in 0 until rows) {
@@ -80,7 +81,7 @@ trusted fun testPackedMatvec(backend: Backend, kind: string, elements: int, bloc
     if (!backend.upload(deviceKeys, 0, keys, hostKeys.capacity) ||
         !backend.upload(deviceScales, 0, nativePointerAddress(hostScales.address), hostScales.capacity) ||
         !backend.launch("matvec_${kind}_indexed",
-            kernelArgs().pointer(dw).pointer(dx).pointer(dy).u32(expertRows).u32(cols)
+            kernelArgs().pointer(dw, weightOffset).pointer(dx, inputOffset).pointer(dy).u32(expertRows).u32(cols)
                 .pointer(deviceKeys).u32(slots).u64(expertRows * rowBytes).u32(0).pointer(deviceScales),
             [expertRows, slots]) ||
         !backend.download(dy, 0, ya, y.capacity)) return false

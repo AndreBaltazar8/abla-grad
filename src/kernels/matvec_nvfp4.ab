@@ -17,7 +17,8 @@ static __device__ __forceinline__ float nvfp4_double_value(unsigned code) {
     return __uint_as_float(__float_as_uint(magnitude) | ((code & 8u) << 28));
 }
 
-static __device__ __forceinline__ float nvfp4_dot(const unsigned char *row,
+template <bool Aligned>
+static __device__ __forceinline__ float nvfp4_dot_impl(const unsigned char *row,
                                                   const float *x,
                                                   unsigned cols) {
     unsigned lane = threadIdx.x & 31u;
@@ -31,12 +32,23 @@ static __device__ __forceinline__ float nvfp4_dot(const unsigned char *row,
         float scale = nvfp4_half_scale((packed[0] >> (group * 8u)) & 255u);
         unsigned quants = packed[1 + part];
         const float *values = x + block * 64u + start;
+        float4 lo;
+        float4 hi;
+        if (Aligned) {
+            lo = *reinterpret_cast<const float4 *>(values);
+            hi = *reinterpret_cast<const float4 *>(values + 8);
+        } else {
+            lo = make_float4(values[0], values[1], values[2], values[3]);
+            hi = make_float4(values[8], values[9], values[10], values[11]);
+        }
+        const float activationLow[4] = {lo.x, lo.y, lo.z, lo.w};
+        const float activationHigh[4] = {hi.x, hi.y, hi.z, hi.w};
         float sub = 0.0f;
         #pragma unroll
         for (unsigned i = 0; i < 4; ++i) {
             unsigned byte = (quants >> (i * 8u)) & 255u;
-            sub = fmaf(nvfp4_double_value(byte), values[i], sub);
-            sub = fmaf(nvfp4_double_value(byte >> 4), values[i + 8], sub);
+            sub = fmaf(nvfp4_double_value(byte), activationLow[i], sub);
+            sub = fmaf(nvfp4_double_value(byte >> 4), activationHigh[i], sub);
         }
         sum = fmaf(scale, sub, sum);
     }
@@ -45,6 +57,12 @@ static __device__ __forceinline__ float nvfp4_dot(const unsigned char *row,
     }
     return sum;
 }
+static __device__ __forceinline__ float nvfp4_dot(const unsigned char *row, const float *x, unsigned cols) {
+    if (reinterpret_cast<unsigned long long>(x) & 15u) return nvfp4_dot_impl<false>(row, x, cols);
+    return nvfp4_dot_impl<true>(row, x, cols);
+}
+
+
 """
 
 val kernelMatvecNvfp4 = kernelNvfp4DotSource + "\n\n" + """

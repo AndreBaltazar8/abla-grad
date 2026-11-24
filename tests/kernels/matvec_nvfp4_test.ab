@@ -120,7 +120,7 @@ trusted fun nvfp4TestLaunch(backend: Backend, rows: int, cols: int, experts: int
 fun verifyFromArgs(backend: Backend): bool {
     var passed = nvfp4TestLaunch(backend, 7, 64, 1, [], 0) &&
         nvfp4TestLaunch(backend, 7, 320, 5, [4, 1, 4], 0) &&
-        nvfp4TestLaunch(backend, 11, 1152, 5, [3, 0, 2, 3], 1168, withScales = true)
+        nvfp4TestLaunch(backend, 11, 1152, 5, [3, 0, 2, 3], 1161, withScales = true)
     if (passed && processArgumentCount() == 1) {
         val packed = path(processArgument(0)).readText()
         if (packed.size != 1296) {
