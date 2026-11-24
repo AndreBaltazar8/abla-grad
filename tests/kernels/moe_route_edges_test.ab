@@ -1,0 +1,61 @@
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "device_test_support.ab"
+import "support.ab"
+import "abla/float"
+import "abla/io"
+
+fun testUniformRoute(var backend: Backend, experts: int, k: int, nanBias: bool = false): bool {
+    val logits: array<f32> = []
+    val bias: array<f32> = []
+    for (i in 0 until experts) {
+        logits.append(0.0)
+        val score = if (nanBias && i == 0) f32FromBits(u32(0x7fc00000))
+            else if (experts == 256 && (i == 224 || i == 255)) f32(0.75)
+            else f32(0.0)
+        bias.append(score)
+    }
+    val idSeed: array<int> = []
+    val weightSeed: array<f32> = []
+    for (i in 0 until k) {
+        idSeed.append(-1)
+        weightSeed.append(-1.0)
+    }
+    val dl = uploadFloats(backend, logits)
+    val db = uploadFloats(backend, bias)
+    val di = uploadWords(backend, idSeed)
+    val dw = uploadFloats(backend, weightSeed)
+    if (dl == null || db == null || di == null || dw == null ||
+        !backend.launch("moe_route",
+            kernelArgs().pointer(dl).pointer(db).u32(experts).u32(k)
+                .pointer(di).pointer(dw).f32(0.0).f32(f32FromInt(k)), [1])) return false
+    val ids = downloadWords(backend, di, k) ?? return false
+    val weights = downloadFloats(backend, dw, k) ?? return false
+    for (rank in 0 until k) {
+        val expected = if (experts < 256) rank
+            else if (nanBias) {
+                if (rank == 0) 0 else if (rank == 1) 224 else if (rank == 2) 255 else rank - 2
+            } else {
+                if (rank == 0) 224 else if (rank == 1) 255 else rank - 2
+            }
+        if (ids[rank] != expected || !testNear("router weight", rank, weights[rank], 1.0, 0.0, 0.000001)) {
+            eprintln("moe_route at rank ${rank} picked ${ids[rank]}, expected ${expected}")
+            return false
+        }
+    }
+    true
+}
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    val ok = testUniformRoute(backend, 35, 35) &&
+        testUniformRoute(backend, 256, 64) &&
+        testUniformRoute(backend, 256, 64, true)
+    val closed = backend.close()
+    if (!ok || !closed) {
+        eprintln(cudaLastError())
+        return 1
+    }
+    println("moe_route preserves ties across lanes and the serial NaN case")
+    0
+}

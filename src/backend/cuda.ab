@@ -337,7 +337,7 @@ private val cudaKernels = [
     CudaKernelSpec("argmax", kernelArgmax, 1, 1024, cudaArgsArgmax, cudaArgmaxShape),
     // Inkling small kernels (60-2)
     CudaKernelSpec("moe_combine", kernelMoeCombine, 256, 256, cudaArgsMoeCombine, cudaMoeCombineShape),
-    CudaKernelSpec("moe_route", kernelMoeRoute, 1, 1, cudaArgsMoeRoute, cudaMoeRouteShape, 1, 1),
+    CudaKernelSpec("moe_route", kernelMoeRoute, 1, 32, cudaArgsMoeRoute, cudaMoeRouteShape, 1, 1),
     CudaKernelSpec("rel_table", kernelRelTable, 256, 256, cudaArgsRelTable, cudaRelTableShape),
     CudaKernelSpec("conv_step", kernelConvStep, 256, 256, cudaArgsConvStep, cudaConvStepShape, 1, 3),
     CudaKernelSpec("depth_mix", kernelDepthMix, 1, 256, cudaArgsDepthMix, cudaDepthMixShape),

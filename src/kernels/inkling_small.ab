@@ -1,5 +1,5 @@
 // Inkling's small non-quantized kernels (docs/kernels.md "Inkling additions", docs/inkling-graph.md): moe_combine, moe_route, rel_table, conv_step,
-// depth_mix. One CUDA C source string each. Geometry: moe_combine/rel_table/conv_step 256 threads, 256 items per block; moe_route one thread;
+// depth_mix. One CUDA C source string each. Geometry: moe_combine/rel_table/conv_step 256 threads, 256 items per block; moe_route one warp;
 // depth_mix one block of 256 threads per query.
 
 val kernelMoeCombine = """
@@ -13,11 +13,10 @@ extern "C" __global__ void moe_combine(const float *expertOut, const float *weig
 """
 
 // The router: p = sigmoid(logits); the k largest of p + bias (the lowest index wins ties) are chosen; weights = p[chosen] / (sum + normEps) * weightScale.
-// One thread; nExpert <= 256.
+// One warp; nExpert <= 256.
 val kernelMoeRoute = """
-extern "C" __global__ void moe_route(const float *logits, const float *bias, unsigned nExpert, unsigned k, unsigned *ids,
+static __device__ __noinline__ void moe_route_serial_nan(const float *logits, const float *bias, unsigned nExpert, unsigned k, unsigned *ids,
                                      float *weights, float normEps, float weightScale) {
-    if (threadIdx.x != 0 || blockIdx.x != 0 || nExpert > 256) return;
     float prob[256];
     float sel[256];
     bool used[256];
@@ -40,6 +39,82 @@ extern "C" __global__ void moe_route(const float *logits, const float *bias, uns
         sum += prob[best];
     }
     for (unsigned t = 0; t < count; ++t) weights[t] = chosen[t] / (sum + normEps) * weightScale;
+}
+
+template <unsigned Candidates>
+static __device__ __forceinline__ void moe_route_warp(
+    const float *logits, const float *bias, unsigned nExpert, unsigned k,
+    unsigned *ids, float *weights, float normEps, float weightScale) {
+    const unsigned lane = threadIdx.x;
+    const unsigned warp = 0xffffffffu;
+    const unsigned absent = 0xffffffffu;
+    const float negativeInfinity = -__int_as_float(0x7f800000);
+    unsigned live = 0;
+    float selection[Candidates];
+    bool hasNan = false;
+    #pragma unroll
+    for (unsigned item = 0; item < Candidates; ++item) {
+        const unsigned expert = lane + 32 * item;
+        if (expert < nExpert) {
+            live |= 1u << item;
+            float p = 1.0f / (1.0f + expf(-logits[expert]));
+            selection[item] = p + (bias ? bias[expert] : 0.0f);
+            hasNan |= isnan(selection[item]);
+        } else {
+            selection[item] = negativeInfinity;
+        }
+    }
+    // The serial scan treats a leading NaN as its initial best. Retain that
+    // behavior for non-finite inputs without adding another fast-path reduction.
+    if (__any_sync(warp, hasNan)) {
+        if (lane == 0) moe_route_serial_nan(logits, bias, nExpert, k, ids, weights, normEps, weightScale);
+        return;
+    }
+    float sum = 0.0f;
+    for (unsigned rank = 0; rank < k; ++rank) {
+        float bestScore = negativeInfinity;
+        unsigned bestId = absent;
+        #pragma unroll
+        for (unsigned item = 0; item < Candidates; ++item) {
+            const unsigned expert = lane + 32 * item;
+            float score = selection[item];
+            if ((live & (1u << item)) &&
+                (score > bestScore || (score == bestScore && expert < bestId))) {
+                bestScore = score;
+                bestId = expert;
+            }
+        }
+        for (unsigned distance = 16; distance; distance /= 2) {
+            float score = __shfl_xor_sync(warp, bestScore, distance);
+            unsigned expert = __shfl_xor_sync(warp, bestId, distance);
+            if (score > bestScore || (score == bestScore && expert < bestId)) {
+                bestScore = score;
+                bestId = expert;
+            }
+        }
+        if ((bestId & 31u) == lane) live &= ~(1u << (bestId / 32));
+        // Accumulate un-biased probabilities in the same selected order.
+        if (lane == 0) {
+            float p = 1.0f / (1.0f + expf(-logits[bestId]));
+            ids[rank] = bestId;
+            weights[rank] = p;
+            sum += p;
+        }
+    }
+    if (lane == 0) {
+        float divisor = sum + normEps;
+        for (unsigned rank = 0; rank < k; ++rank) {
+            weights[rank] = weights[rank] / divisor * weightScale;
+        }
+    }
+}
+
+extern "C" __global__ void moe_route(const float *logits, const float *bias, unsigned nExpert, unsigned k,
+    unsigned *ids, float *weights, float normEps, float weightScale) {
+    if (nExpert <= 128)
+        moe_route_warp<4>(logits, bias, nExpert, k, ids, weights, normEps, weightScale);
+    else
+        moe_route_warp<8>(logits, bias, nExpert, k, ids, weights, normEps, weightScale);
 }
 """
 
