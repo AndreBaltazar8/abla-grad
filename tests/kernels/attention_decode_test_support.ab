@@ -1,0 +1,91 @@
+import "../../src/backend/backend.ab"
+import "device_test_support.ab"
+import "abla/float"
+import "abla/math"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+trusted fun testAttention(backend: Backend, relative: bool, first: int, last: int): bool {
+    val heads = 6
+    val kvHeads = 2
+    val dim = 65
+    val context = 17
+    val extent = 3
+    val pos = last
+    val scale = f32(0.125)
+    val q: array<f32> = []
+    val k: array<f32> = []
+    val v: array<f32> = []
+    val table: array<f32> = []
+    for (i in 0 until heads * dim) q.append(f32FromInt((i * 7 + i / 7) % 43 - 21) / 4.0)
+    for (i in 0 until kvHeads * context * dim) {
+        k.append(f32FromInt((i * 11 + i / 13) % 59 - 29) / 4.0)
+        v.append(f32FromInt((i * 13 + i / 23) % 71 - 35) / 16.0)
+    }
+    for (i in 0 until heads * (extent + 1)) table.append(f32FromInt((i * 17) % 23 - 13) / 2.0)
+    val hq = testFloatBuffer(q)
+    val hk = testFloatBuffer(k)
+    val hv = testFloatBuffer(v)
+    val ht = testFloatBuffer(table)
+    val out = nativeByteBuffer(heads * dim * 4)
+    val dq = backend.allocate(hq.capacity)
+    val dk = backend.allocate(hk.capacity)
+    val dv = backend.allocate(hv.capacity)
+    val dt = backend.allocate(ht.capacity)
+    val dy = backend.allocate(out.capacity)
+    if (dq == null || dk == null || dv == null || dt == null || dy == null) return false
+    if (!backend.upload(dq, 0, nativePointerAddress(hq.address), hq.capacity) ||
+        !backend.upload(dk, 0, nativePointerAddress(hk.address), hk.capacity) ||
+        !backend.upload(dv, 0, nativePointerAddress(hv.address), hv.capacity) ||
+        !backend.upload(dt, 0, nativePointerAddress(ht.address), ht.capacity)) return false
+    val name = if (relative) "attention_decode_rel" else "attention_decode"
+    var args = kernelArgs().pointer(dq).pointer(dk).pointer(dv)
+    if (relative) args.pointer(dt)
+    args.pointer(dy)
+    args.u32(heads)
+    args.u32(kvHeads)
+    args.u32(dim)
+    args.u32(first)
+    args.u32(last)
+    if (relative) {
+        args.u32(pos)
+        args.u32(extent)
+    }
+    args.u32(context)
+    args.f32(scale)
+    val ya = nativePointerAddress(out.address)
+    if (!backend.launch(name, args, [heads]) || !backend.download(dy, 0, ya, out.capacity)) return false
+    for (head in 0 until heads) {
+        val kvHead = head / (heads / kvHeads)
+        val scores: array<f64> = []
+        for (j in first until last + 1) {
+            var dot = 0.0
+            for (i in 0 until dim) {
+                dot += f32ToF64(q[head * dim + i]) * f32ToF64(k[(kvHead * context + j) * dim + i])
+            }
+            var score = dot * f32ToF64(scale)
+            if (relative) {
+                val d = if (pos - j < extent) pos - j else extent
+                score += f32ToF64(table[head * (extent + 1) + d])
+            }
+            scores.append(score)
+        }
+        var largest = if (relative) 0.0 else scores[0]
+        for (score in scores) if (score > largest) largest = score
+        var denominator = if (relative) exp(-largest) else 0.0
+        val probabilities: array<f64> = []
+        for (score in scores) {
+            val mass = exp(score - largest)
+            probabilities.append(mass)
+            denominator += mass
+        }
+        for (i in 0 until dim) {
+            var result = 0.0
+            for (j in first until last + 1) {
+                result += probabilities[j - first] * f32ToF64(v[(kvHead * context + j) * dim + i])
+            }
+            if (!testNear(name, head * dim + i, testLoadFloat(ya, head * dim + i), result / denominator)) return false
+        }
+    }
+    true
+}

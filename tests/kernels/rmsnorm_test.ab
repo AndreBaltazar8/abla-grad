@@ -1,0 +1,48 @@
+import "../../src/backend/backend.ab"
+import "device_test_support.ab"
+import "abla/float"
+import "abla/math"
+import "abla/unsafe/memory/raw"
+
+trusted fun testRmsnorm(backend: Backend, weighted: bool): bool {
+    val vectors = 3
+    val n = 259
+    val eps = f32(0.00001)
+    val inputs: array<f32> = []
+    val weights: array<f32> = []
+    for (i in 0 until n * vectors) inputs.append(if (i < n) 0.0 else f32FromInt((i * 13) % 41 - 20) / 16.0)
+    for (i in 0 until n) weights.append(f32FromInt(i % 19 - 9) / 16.0)
+    val host = testFloatBuffer(inputs)
+    val weight = testFloatBuffer(weights)
+    val device = backend.allocate(host.capacity)
+    val deviceWeight = backend.allocate(weight.capacity)
+    if (device == null || deviceWeight == null) return false
+    val address = nativePointerAddress(host.address)
+    if (!backend.upload(device, 0, address, host.capacity) ||
+        !backend.upload(deviceWeight, 0, nativePointerAddress(weight.address), weight.capacity)) return false
+    var args = kernelArgs().pointer(device)
+    if (weighted) args.pointer(deviceWeight)
+    else args.u64(0)
+    args.pointer(device)
+    args.u32(n)
+    args.f32(eps)
+    if (!backend.launch("rmsnorm", args, [vectors]) || !backend.download(device, 0, address, host.capacity)) return false
+    for (row in 0 until vectors) {
+        var sum = 0.0
+        for (col in 0 until n) {
+            val value = f32ToF64(inputs[row * n + col])
+            sum += value * value
+        }
+        val rms = sqrt(sum / f64FromInt(n) + f32ToF64(eps))
+        for (col in 0 until n) {
+            val index = row * n + col
+            val weightValue = if (weighted) f32ToF64(weights[col]) else 1.0
+            if (!testNear("rmsnorm", index, testLoadFloat(address, index),
+                f32ToF64(inputs[index]) * weightValue / rms, 0.000003, 0.000001)) return false
+        }
+    }
+    true
+}
+
+fun verify(backend: Backend): bool = testRmsnorm(backend, true) && testRmsnorm(backend, false)
+fun main: int = runCudaKernelTest("rmsnorm (weighted and weightless, in place)", verify)

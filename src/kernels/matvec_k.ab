@@ -1,0 +1,96 @@
+// One warp per row of GGML Q4_K, Q5_K or Q6_K. A lane decodes one
+// weight per group in the 256-column block. Gather shares the decoding.
+val kernelMatvecK = """
+static __device__ __forceinline__ float k_half(const unsigned char *bytes) {
+    unsigned short bits = static_cast<unsigned short>(bytes[0] | (bytes[1] << 8));
+    float value;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(value) : "h"(bits));
+    return value;
+}
+
+template <int Bits>
+static __device__ __forceinline__ unsigned k_block_bytes() {
+    return Bits == 4 ? 144 : Bits == 5 ? 176 : 210;
+}
+
+template <int Bits>
+static __device__ __forceinline__ float k_weight(const unsigned char *block,
+                                                   unsigned group, unsigned lane) {
+    if (Bits == 6) {
+        unsigned half = group / 4;
+        unsigned quarter = group % 4;
+        unsigned low = block[half * 64 + (quarter % 2) * 32 + lane];
+        unsigned high = block[128 + half * 32 + lane];
+        int q = int(((low >> ((quarter / 2) * 4)) & 15u) |
+                    (((high >> (quarter * 2)) & 3u) << 4)) - 32;
+        int scale = static_cast<signed char>(block[192 + group * 2 + lane / 16]);
+        return k_half(block + 208) * float(scale * q);
+    }
+    unsigned scale, minimum;
+    if (group < 4) {
+        scale = block[4 + group] & 63u;
+        minimum = block[8 + group] & 63u;
+    } else {
+        unsigned both = block[8 + group];
+        scale = (both & 15u) | ((block[group] >> 6) << 4);
+        minimum = (both >> 4) | ((block[4 + group] >> 6) << 4);
+    }
+    unsigned nibble = block[(Bits == 4 ? 16 : 48) + (group / 2) * 32 + lane];
+    unsigned q = (nibble >> ((group % 2) * 4)) & 15u;
+    if (Bits == 5) q |= ((block[16 + lane] >> group) & 1u) << 4;
+    return k_half(block) * float(scale * q) - k_half(block + 2) * float(minimum);
+}
+
+template <int Bits>
+static __device__ __forceinline__ void k_matvec(const unsigned char *w,
+    const float *x, float *y, unsigned rows, unsigned cols) {
+    unsigned lane = threadIdx.x & 31u;
+    unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= rows) return;
+    unsigned long long rowBytes = static_cast<unsigned long long>(cols / 256) * k_block_bytes<Bits>();
+    const unsigned char *weights = w + row * rowBytes;
+    float sum = 0.0f;
+    for (unsigned block = 0; block < cols / 256; ++block) {
+        const unsigned char *packed = weights + static_cast<unsigned long long>(block) * k_block_bytes<Bits>();
+        #pragma unroll
+        for (unsigned group = 0; group < 8; ++group) {
+            unsigned col = block * 256 + group * 32 + lane;
+            sum = fmaf(k_weight<Bits>(packed, group, lane), x[col], sum);
+        }
+    }
+    for (unsigned width = 16; width; width /= 2) {
+        sum += __shfl_down_sync(0xffffffffu, sum, width);
+    }
+    if (lane == 0) y[row] = sum;
+}
+
+template <int Bits>
+static __device__ __forceinline__ void k_gather(const unsigned char *table,
+    unsigned token, float *out, unsigned cols) {
+    unsigned col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= cols) return;
+    unsigned long long block = static_cast<unsigned long long>(token) * (cols / 256) + col / 256;
+    out[col] = k_weight<Bits>(table + block * k_block_bytes<Bits>(), (col % 256) / 32, col % 32);
+}
+
+extern "C" __global__ void matvec_q4_k(const unsigned char *w, const float *x,
+                                       float *y, unsigned rows, unsigned cols) {
+    k_matvec<4>(w, x, y, rows, cols);
+}
+extern "C" __global__ void matvec_q5_k(const unsigned char *w, const float *x,
+                                       float *y, unsigned rows, unsigned cols) {
+    k_matvec<5>(w, x, y, rows, cols);
+}
+extern "C" __global__ void matvec_q6_k(const unsigned char *w, const float *x,
+                                       float *y, unsigned rows, unsigned cols) {
+    k_matvec<6>(w, x, y, rows, cols);
+}
+extern "C" __global__ void gather_row_q4_k(const unsigned char *w, unsigned token,
+                                            float *out, unsigned cols) {
+    k_gather<4>(w, token, out, cols);
+}
+extern "C" __global__ void gather_row_q6_k(const unsigned char *w, unsigned token,
+                                            float *out, unsigned cols) {
+    k_gather<6>(w, token, out, cols);
+}
+"""

@@ -1,0 +1,21 @@
+val kernelRope = """
+extern "C" __global__ void rope(float *x, const float *freqFactors, unsigned nHeads,
+    unsigned headDim, unsigned ropeDim, unsigned pos, float freqBase, unsigned mode) {
+    unsigned long long item = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    unsigned pairs = ropeDim / 2;
+    if (item >= static_cast<unsigned long long>(nHeads) * pairs) return;
+    unsigned head = item / pairs;
+    unsigned pair = item % pairs;
+    unsigned first = mode == 0 ? pair * 2 : pair;
+    unsigned second = mode == 0 ? first + 1 : pair + pairs;
+    float *row = x + static_cast<unsigned long long>(head) * headDim;
+    float factor = freqFactors ? freqFactors[pair] : 1.0f;
+    float theta = float(pos) / (factor * powf(freqBase, float(pair) / float(pairs)));
+    float s, c;
+    sincosf(theta, &s, &c);
+    float a = row[first];
+    float b = row[second];
+    row[first] = a * c - b * s;
+    row[second] = a * s + b * c;
+}
+"""

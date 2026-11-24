@@ -1,0 +1,51 @@
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "abla/float"
+import "abla/float/text"
+import "abla/io"
+import "abla/math"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+trusted fun testStoreFloat(address: int, index: int, value: f32): void =
+    ablaUnsafeStoreU32(nativePointerFromAddress(address + index * 4), int(f32ToBits(value)))
+
+trusted fun testLoadFloat(address: int, index: int): f32 =
+    f32FromBits(u32(ablaUnsafeLoadU32(nativePointerFromAddress(address + index * 4))))
+
+trusted fun testFloatBuffer(values: array<f32>): NativeByteBuffer {
+    val buffer = nativeByteBuffer(values.size * 4)
+    val address = nativePointerAddress(buffer.address)
+    for (i in 0 until values.size) testStoreFloat(address, i, values[i])
+    buffer
+}
+
+trusted fun testBlockBytes(address: int, count: int): string {
+    val block = nativeByteBuffer(count + 1)
+    ablaUnsafeCopyMemory(nativePointerAddress(block.address), address, count)
+    block.store(count, 0)
+    block.adoptString(count)
+}
+
+fun testNear(label: string, index: int, actual: f32, expected: f64,
+    relative: f64 = 0.0001, absolute: f64 = 0.00001): bool {
+    if (fabs(f32ToF64(actual) - expected) <= absolute + relative * fabs(expected)) return true
+    eprintln("${label} value ${index}: expected ${expected}, got ${actual}")
+    false
+}
+
+fun runCudaKernelTest(name: string, body: (Backend) -> bool): int {
+    val backend = cudaBackend()
+    if (backend == null) {
+        eprintln(cudaLastError())
+        return 1
+    }
+    val passed = body(backend)
+    val closed = backend.close()
+    if (!passed || !closed) {
+        eprintln("${name} failed ${cudaLastError()}")
+        return 1
+    }
+    println("${name} matches the CPU reference")
+    0
+}

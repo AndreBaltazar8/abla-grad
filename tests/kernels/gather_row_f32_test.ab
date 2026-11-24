@@ -1,0 +1,26 @@
+import "../../src/backend/backend.ab"
+import "device_test_support.ab"
+import "abla/float"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+trusted fun verify(backend: Backend): bool {
+    val rows = 3
+    val cols = 131
+    val token = 2
+    val values: array<f32> = []
+    for (i in 0 until rows * cols) values.append(f32FromInt(i % 251 - 105) / 16.0)
+    val weights = testFloatBuffer(values)
+    val out = nativeByteBuffer(cols * 4)
+    val w = backend.allocate(weights.capacity)
+    val y = backend.allocate(out.capacity)
+    if (w == null || y == null) return false
+    val ya = nativePointerAddress(out.address)
+    if (!backend.upload(w, 0, nativePointerAddress(weights.address), weights.capacity) ||
+        !backend.launch("gather_row_f32", kernelArgs().pointer(w).u32(token).pointer(y).u32(cols), [cols]) ||
+        !backend.download(y, 0, ya, out.capacity)) return false
+    for (col in 0 until cols) if (testLoadFloat(ya, col) != values[token * cols + col]) return false
+    true
+}
+
+fun main: int = runCudaKernelTest("gather_row_f32", verify)

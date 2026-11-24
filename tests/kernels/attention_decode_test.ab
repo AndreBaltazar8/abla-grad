@@ -1,0 +1,7 @@
+import "../../src/backend/backend.ab"
+import "device_test_support.ab"
+import "attention_decode_test_support.ab"
+
+fun verify(backend: Backend): bool = testAttention(backend, false, 3, 13) && testAttention(backend, false, 2, 4)
+
+fun main: int = runCudaKernelTest("attention_decode (GQA, long and short windows)", verify)

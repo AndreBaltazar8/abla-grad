@@ -1,0 +1,24 @@
+val kernelRmsnorm = """
+extern "C" __global__ void rmsnorm(const float *x, const float *w, float *y,
+                                    unsigned n, float eps) {
+    __shared__ float sums[128];
+    unsigned lane = threadIdx.x;
+    unsigned long long base = static_cast<unsigned long long>(blockIdx.x) * n;
+    float sum = 0.0f;
+    for (unsigned long long i = lane; i < n; i += blockDim.x) {
+        float v = x[base + i];
+        sum = fmaf(v, v, sum);
+    }
+    sums[lane] = sum;
+    __syncthreads();
+    for (unsigned width = blockDim.x / 2; width; width /= 2) {
+        if (lane < width) sums[lane] += sums[lane + width];
+        __syncthreads();
+    }
+    float factor = rsqrtf(sums[0] / float(n) + eps);
+    for (unsigned long long i = lane; i < n; i += blockDim.x) {
+        float value = x[base + i] * factor;
+        y[base + i] = w ? value * w[i] : value;
+    }
+}
+"""

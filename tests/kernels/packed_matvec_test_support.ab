@@ -1,0 +1,69 @@
+import "../../src/backend/backend.ab"
+import "device_test_support.ab"
+import "abla/float"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+// All fixtures contain three blocks per row so Q8_0 and Q6_K also
+// exercise alternating row alignment. The gather fetches an interior row.
+trusted fun testPackedMatvec(backend: Backend, kind: string, elements: int, blockBytes: int,
+    decode: (string) -> array<f32>, gather: bool = false): bool {
+    val rows = 7
+    val blocks = 3
+    val cols = blocks * elements
+    val rowBytes = blockBytes * blocks
+    val weights = nativeByteBuffer(rows * rowBytes)
+    val x = nativeByteBuffer(cols * 4)
+    val y = nativeByteBuffer(rows * 4)
+    val gathered = nativeByteBuffer(cols * 4)
+    val wa = nativePointerAddress(weights.address)
+    val xa = nativePointerAddress(x.address)
+    val ya = nativePointerAddress(y.address)
+    val ga = nativePointerAddress(gathered.address)
+    for (byte in 0 until weights.capacity) weights.store(byte, (byte * 29 + byte / 17 * 11) & 255)
+    for (block in 0 until rows * blocks) {
+        val p = block * blockBytes
+        // Finite, signed binary16 factors for every packed format.
+        val delta = if (kind == "q6_k") p + 208 else p
+        weights.store(delta, (block * 17) & 255)
+        weights.store(delta + 1, if (block % 3 == 0) 0xb4 else 0x34)
+        if (kind == "q4_k" || kind == "q5_k") {
+            weights.store(p + 2, (block * 9) & 255)
+            weights.store(p + 3, 0x28)
+        }
+    }
+    for (col in 0 until cols) testStoreFloat(xa, col, f32FromInt((col * 17 + col / 7) % 37 - 18) / 32.0)
+    val dw = backend.allocate(weights.capacity)
+    val dx = backend.allocate(x.capacity)
+    val dy = backend.allocate(y.capacity)
+    if (dw == null || dx == null || dy == null) return false
+    if (!backend.upload(dw, 0, wa, weights.capacity) ||
+        !backend.upload(dx, 0, xa, x.capacity) ||
+        !backend.launch("matvec_${kind}", kernelArgs().pointer(dw).pointer(dx).pointer(dy).u32(rows).u32(cols), [rows]) ||
+        !backend.download(dy, 0, ya, y.capacity)) return false
+
+    val token = 5
+    if (gather) {
+        val dg = backend.allocate(gathered.capacity)
+        if (dg == null || !backend.launch("gather_row_${kind}",
+            kernelArgs().pointer(dw).u32(token).pointer(dg).u32(cols), [cols]) ||
+            !backend.download(dg, 0, ga, gathered.capacity)) return false
+    }
+    for (row in 0 until rows) {
+        var expected = 0.0
+        for (block in 0 until blocks) {
+            val values = decode(testBlockBytes(wa + row * rowBytes + block * blockBytes, blockBytes))
+            if (values.size != elements) return false
+            for (element in 0 until elements) {
+                val col = block * elements + element
+                val weighted = f32ToF64(values[element])
+                expected += weighted * f32ToF64(testLoadFloat(xa, col))
+                if (gather && row == token &&
+                    !testNear("gather_row_${kind}", col, testLoadFloat(ga, col), weighted, 0.000001, 0.000001))
+                    return false
+            }
+        }
+        if (!testNear("matvec_${kind}", row, testLoadFloat(ya, row), expected)) return false
+    }
+    true
+}

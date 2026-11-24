@@ -1,19 +1,25 @@
 // One warp per output row. Inputs and output are contiguous FP32 vectors.
 val kernelMatvecF32 = """
-extern "C" __global__ void matvec_f32(const float *weights, const float *input,
+extern "C" __global__ void matvec_f32(const unsigned char *weights, const float *input,
                                        float *output, unsigned rows, unsigned cols) {
     unsigned lane = threadIdx.x % 32;
     unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     if (row >= rows) return;
 
-    const float *values = weights + static_cast<unsigned long long>(row) * cols;
+    const float *values = reinterpret_cast<const float *>(weights) + static_cast<unsigned long long>(row) * cols;
     float sum = 0;
-    for (unsigned col = lane; col < cols; col += 32) {
+    for (unsigned long long col = lane; col < cols; col += 32) {
         sum = fmaf(values[col], input[col], sum);
     }
     for (unsigned width = 16; width; width /= 2) {
         sum += __shfl_down_sync(0xffffffffu, sum, width);
     }
     if (lane == 0) output[row] = sum;
+}
+extern "C" __global__ void gather_row_f32(const unsigned char *table, unsigned token,
+                                           float *out, unsigned cols) {
+    unsigned long long col = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (col < cols) out[col] = reinterpret_cast<const float *>(table)[
+        static_cast<unsigned long long>(token) * cols + col];
 }
 """

@@ -1,0 +1,54 @@
+import "../../src/backend/backend.ab"
+import "device_test_support.ab"
+import "abla/float"
+import "abla/math"
+import "abla/unsafe/memory/raw"
+
+trusted fun testRope(backend: Backend, mode: int, explicitFactors: bool): bool {
+    val heads = 3
+    val dim = 17
+    val ropeDim = 12
+    val pairs = ropeDim / 2
+    val pos = 35
+    val freq = f32(500000.0)
+    val inputs: array<f32> = []
+    val factors: array<f32> = []
+    for (i in 0 until dim * heads) inputs.append(f32FromInt((i * 11) % 29 - 14) / 16.0)
+    for (i in 0 until pairs) factors.append(f32FromInt(i % 5 + 1) / 2.0)
+    val host = testFloatBuffer(inputs)
+    val factorHost = testFloatBuffer(factors)
+    val device = backend.allocate(host.capacity)
+    val deviceFactors = backend.allocate(factorHost.capacity)
+    if (device == null || deviceFactors == null) return false
+    val address = nativePointerAddress(host.address)
+    if (!backend.upload(device, 0, address, host.capacity) ||
+        !backend.upload(deviceFactors, 0, nativePointerAddress(factorHost.address), factorHost.capacity)) return false
+    var args = kernelArgs().pointer(device)
+    if (explicitFactors) args.pointer(deviceFactors)
+    else args.u64(0)
+    args.u32(heads)
+    args.u32(dim)
+    args.u32(ropeDim)
+    args.u32(pos)
+    args.f32(freq)
+    args.u32(mode)
+    if (!backend.launch("rope", args, [heads * pairs]) || !backend.download(device, 0, address, host.capacity)) return false
+    for (head in 0 until heads) {
+        val offset = head * dim
+        for (i in 0 until pairs) {
+            val first = offset + (if (mode == 0) i * 2 else i)
+            val second = if (mode == 0) first + 1 else first + pairs
+            val factor = if (explicitFactors) f32ToF64(factors[i]) else 1.0
+            val theta = f64FromInt(pos) / (factor * pow(f32ToF64(freq), f64FromInt(i) / f64FromInt(pairs)))
+            val a = f32ToF64(inputs[first])
+            val b = f32ToF64(inputs[second])
+            if (!testNear("rope", first, testLoadFloat(address, first), a * cos(theta) - b * sin(theta), 0.000003, 0.000002) ||
+                !testNear("rope", second, testLoadFloat(address, second), a * sin(theta) + b * cos(theta), 0.000003, 0.000002)) return false
+        }
+        for (i in ropeDim until dim) if (testLoadFloat(address, offset + i) != inputs[offset + i]) return false
+    }
+    true
+}
+
+fun verify(backend: Backend): bool = testRope(backend, 0, true) && testRope(backend, 1, false)
+fun main: int = runCudaKernelTest("rope (adjacent pairs, split halves, partial heads)", verify)

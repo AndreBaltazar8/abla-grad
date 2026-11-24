@@ -1,0 +1,94 @@
+// One block per query head. Eight warps accumulate disjoint position
+// sequences with online softmax; shared memory merges their partials.
+val kernelAttentionDecode = """
+template <bool Relative>
+static __device__ __forceinline__ void attention(
+    const float *q, const float *k, const float *v, const float *table,
+    float *out, unsigned nHead, unsigned nKvHead, unsigned dim, unsigned first,
+    unsigned last, unsigned pos, unsigned extent, unsigned maxCtx, float scale) {
+    const unsigned head = blockIdx.x;
+    const unsigned warp = threadIdx.x / 32;
+    const unsigned lane = threadIdx.x % 32;
+    const unsigned kvHead = head / (nHead / nKvHead);
+    const unsigned long long cacheBase = static_cast<unsigned long long>(kvHead) * maxCtx * dim;
+    const unsigned long long headBase = static_cast<unsigned long long>(head) * dim;
+    const float *query = q + headBase;
+    __shared__ float warpMax[8];
+    __shared__ float warpSum[8];
+    __shared__ float partials[8][256];
+    __shared__ float weights[8];
+    __shared__ float denominator;
+
+    float accumulated[8] = {};
+    float m = -__int_as_float(0x7f800000);
+    float total = 0.0f;
+    for (unsigned long long j = static_cast<unsigned long long>(first) + warp; j <= last; j += 8) {
+        unsigned long long base = cacheBase + j * dim;
+        float score = 0.0f;
+        #pragma unroll
+        for (unsigned i = 0; i < 8; ++i) {
+            unsigned index = lane + i * 32;
+            if (index < dim) score = fmaf(query[index], k[base + index], score);
+        }
+        for (unsigned width = 16; width; width /= 2) {
+            score += __shfl_down_sync(0xffffffffu, score, width);
+        }
+        score = __shfl_sync(0xffffffffu, score, 0) * scale;
+        if (Relative) {
+            unsigned d = pos - static_cast<unsigned>(j);
+            score += table[static_cast<unsigned long long>(head) * (extent + 1ull) +
+                           (d < extent ? d : extent)];
+        }
+        float next = fmaxf(m, score);
+        float history = total == 0.0f ? 0.0f : expf(m - next);
+        float current = expf(score - next);
+        total = total * history + current;
+        m = next;
+        #pragma unroll
+        for (unsigned i = 0; i < 8; ++i) {
+            unsigned index = lane + i * 32;
+            if (index < dim) accumulated[i] = fmaf(current, v[base + index], accumulated[i] * history);
+        }
+    }
+    if (lane == 0) {
+        warpSum[warp] = total;
+        warpMax[warp] = m;
+    }
+    #pragma unroll
+    for (unsigned i = 0; i < 8; ++i) {
+        unsigned index = lane + i * 32;
+        if (index < dim) partials[warp][index] = accumulated[i];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float largest = Relative ? 0.0f : warpMax[0];
+        for (unsigned i = 0; i < 8; ++i) largest = fmaxf(largest, warpMax[i]);
+        float sum = Relative ? expf(-largest) : 0.0f;
+        for (unsigned i = 0; i < 8; ++i) {
+            float weight = warpSum[i] == 0.0f ? 0.0f : expf(warpMax[i] - largest);
+            weights[i] = weight;
+            sum = fmaf(weight, warpSum[i], sum);
+        }
+        denominator = sum;
+    }
+    __syncthreads();
+    if (threadIdx.x < dim) {
+        float weighted = 0.0f;
+        for (unsigned i = 0; i < 8; ++i) weighted = fmaf(weights[i], partials[i][threadIdx.x], weighted);
+        out[headBase + threadIdx.x] = weighted / denominator;
+    }
+}
+
+extern "C" __global__ void attention_decode(
+    const float *q, const float *k, const float *v, float *out, unsigned nHead,
+    unsigned nKvHead, unsigned dim, unsigned first, unsigned last, unsigned maxCtx, float scale) {
+    attention<false>(q, k, v, nullptr, out, nHead, nKvHead, dim, first, last, 0, 0, maxCtx, scale);
+}
+
+extern "C" __global__ void attention_decode_rel(
+    const float *q, const float *k, const float *v, const float *table, float *out,
+    unsigned nHead, unsigned nKvHead, unsigned dim, unsigned first, unsigned last,
+    unsigned pos, unsigned extent, unsigned maxCtx, float scale) {
+    attention<true>(q, k, v, table, out, nHead, nKvHead, dim, first, last, pos, extent, maxCtx, scale);
+}
+"""

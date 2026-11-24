@@ -1,0 +1,8 @@
+import "../../src/backend/backend.ab"
+import "../gguf_quant_oracle.ab"
+import "device_test_support.ab"
+import "packed_matvec_test_support.ab"
+
+fun verify(backend: Backend): bool = testPackedMatvec(backend, "q4_k", 256, 144, oracleQ4K, true)
+
+fun main: int = runCudaKernelTest("matvec_q4_k", verify)
