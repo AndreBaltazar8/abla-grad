@@ -102,6 +102,9 @@ private trusted noescape extern:"c" fun cuStreamDestroy_v2(stream: i64*): i32
 private trusted noescape extern:"c" fun cuStreamSynchronize(stream: i64*): i32
 private trusted noescape extern:"c" fun cuStreamBeginCapture_v2(stream: i64*, mode: i32): i32
 private trusted noescape extern:"c" fun cuStreamEndCapture(stream: i64*, graph: i64*): i32
+private trusted noescape extern:"c" fun cuEventCreate(event: i64*, flags: u32): i32
+private trusted noescape extern:"c" fun cuEventRecord(event: i64*, stream: i64*): i32
+private trusted noescape extern:"c" fun cuStreamWaitEvent(stream: i64*, event: i64*, flags: u32): i32
 private trusted noescape extern:"c" fun cuGraphInstantiateWithFlags(exec: i64*, graph: i64*, flags: u64): i32
 private trusted noescape extern:"c" fun cuGraphLaunch(exec: i64*, stream: i64*): i32
 private trusted noescape extern:"c" fun cuGraphExecDestroy(exec: i64*): i32
@@ -530,7 +533,14 @@ class CudaBackend(
     // The stream every launch runs on (created at first use) and the recording state (docs: Backend.beginRecording).
     var stream: int = 0,
     var recording: bool = false,
-    var recordedLaunches: int = 0
+    var recordedLaunches: int = 0,
+    // Parallel branches of a recording: side streams and their events (created at first fork), the event the main line records at a fork, the number of
+    // branches of the open fork, and the stream the next launch goes to (0 = main).
+    val sideStreams: array<int> = [],
+    val sideEvents: array<int> = [],
+    var forkEvent: int = 0,
+    var forked: int = 0,
+    var currentBranch: int = 0
 ) : Backend {
     fun name(): string = "cuda"
 
@@ -559,6 +569,78 @@ class CudaBackend(
         true
     }
 
+    trusted fun newEvent(): int {
+        val handle = nativePointerCell(nativeNullPointer())
+        if (!cudaStatus(cuEventCreate(handle.address, 2), "cuEventCreate")) return 0
+        nativePointerAddress(handle.load())
+    }
+
+    trusted fun newSideStream(): int {
+        val handle = nativePointerCell(nativeNullPointer())
+        if (!cudaStatus(cuStreamCreate(handle.address, 0), "cuStreamCreate")) return 0
+        nativePointerAddress(handle.load())
+    }
+
+    trusted fun fork(count: int): bool {
+        if (!this.recording) return true
+        if (this.forked > 0 || count < 1) {
+            cudaError = "fork: a fork is already open or the count is empty"
+            return false
+        }
+        if (!this.pushContext()) return false
+        var ok = true
+        if (this.forkEvent == 0) {
+            this.forkEvent = this.newEvent()
+            ok = this.forkEvent != 0
+        }
+        while (ok && this.sideStreams.size < count) {
+            val s = this.newSideStream()
+            val e = this.newEvent()
+            ok = s != 0 && e != 0
+            if (ok) {
+                this.sideStreams.append(s)
+                this.sideEvents.append(e)
+            }
+        }
+        ok = ok && cudaStatus(cuEventRecord(nativePointerFromAddress(this.forkEvent), nativePointerFromAddress(this.stream)), "cuEventRecord")
+        for (index in 0 until count) {
+            ok = ok && cudaStatus(cuStreamWaitEvent(nativePointerFromAddress(this.sideStreams[index]), nativePointerFromAddress(this.forkEvent), 0),
+                "cuStreamWaitEvent")
+        }
+        this.popContext()
+        if (ok) {
+            this.forked = count
+            this.currentBranch = 0
+        }
+        ok
+    }
+
+    fun branch(index: int): bool {
+        if (!this.recording) return true
+        if (index < 0 || index > this.forked) {
+            cudaError = "branch: no such branch"
+            return false
+        }
+        this.currentBranch = index
+        true
+    }
+
+    trusted fun join(): bool {
+        if (!this.recording || this.forked == 0) return true
+        if (!this.pushContext()) return false
+        var ok = true
+        for (index in 0 until this.forked) {
+            ok = ok && cudaStatus(cuEventRecord(nativePointerFromAddress(this.sideEvents[index]), nativePointerFromAddress(this.sideStreams[index])),
+                "cuEventRecord")
+            ok = ok && cudaStatus(cuStreamWaitEvent(nativePointerFromAddress(this.stream), nativePointerFromAddress(this.sideEvents[index]), 0),
+                "cuStreamWaitEvent")
+        }
+        this.popContext()
+        this.forked = 0
+        this.currentBranch = 0
+        ok
+    }
+
     trusted fun beginRecording(): bool {
         if (this.recording) {
             cudaError = "a recording is already in progress"
@@ -581,6 +663,7 @@ class CudaBackend(
             cudaError = "no recording in progress"
             return null
         }
+        this.join()
         this.recording = false
         if (!this.pushContext()) return null
         val graph = nativePointerCell(nativeNullPointer())
@@ -738,7 +821,8 @@ class CudaBackend(
             val gridX = u32((problem[0] + spec.itemsPerBlock - 1) / spec.itemsPerBlock)
             val gridY = u32(if (spec.problemDimensions == 2) problem[1] else 1)
             ok = cudaStatus(cuLaunchKernel(nativePointerFromAddress(function.handle),
-                gridX, gridY, 1, u32(spec.blockX), 1, 1, 0, nativePointerFromAddress(this.stream),
+                gridX, gridY, 1, u32(spec.blockX), 1, 1, 0,
+                nativePointerFromAddress(if (this.currentBranch == 0) this.stream else this.sideStreams[this.currentBranch - 1]),
                 pointers.address, nativeNullPointer()), "cuLaunchKernel")
         }
         if (ok && this.recording) this.recordedLaunches += 1

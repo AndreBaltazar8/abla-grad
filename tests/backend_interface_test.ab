@@ -20,6 +20,9 @@ class RecordingBackend(var launchedWords: int, var live: int, var lastKernel: st
     fun beginRecording(): bool = false
     fun endRecording(): Recording? = null
     fun replay(recording: Recording): bool = false
+    fun fork(count: int): bool = true
+    fun branch(index: int): bool = true
+    fun join(): bool = true
     fun releaseRecording(handle: int): void {
     }
     fun freeMemory(): int = 0

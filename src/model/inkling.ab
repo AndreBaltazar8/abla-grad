@@ -18,6 +18,9 @@ private var inklingError = ""
 // Blocks per head in the split decode attention (position-parallel; the recorded graph keeps this fixed).
 val ATTENTION_SPLITS_MAX = 64
 
+// Controller scratch lanes: the q, k and v controllers of a layer run as parallel branches, each in its own lane (the ffn controller uses lane 0).
+val CONTROL_LANES = 3
+
 fun inklingLastError(): string = inklingError
 
 // ---- scratch layout: named f32 vectors inside one device buffer (byte offsets) ----
@@ -62,10 +65,10 @@ fun inklingScratch(c: InklingConfig): ScratchMap {
     at = scratchAdd(offsets, "down", c.nExpertUsed * n, at)
     at = scratchAdd(offsets, "moe", n, at)
     at = scratchAdd(offsets, "msgs", 4 * n, at)
-    at = scratchAdd(offsets, "ctrlIn", 2 * n, at)
-    at = scratchAdd(offsets, "ctrlGate", c.gateRank, at)
-    at = scratchAdd(offsets, "ctrlGain", n, at)
-    at = scratchAdd(offsets, "ctrlForget", n, at)
+    at = scratchAdd(offsets, "ctrlIn", 2 * n * CONTROL_LANES, at)
+    at = scratchAdd(offsets, "ctrlGate", c.gateRank * CONTROL_LANES, at)
+    at = scratchAdd(offsets, "ctrlGain", n * CONTROL_LANES, at)
+    at = scratchAdd(offsets, "ctrlForget", n * CONTROL_LANES, at)
     at = scratchAdd(offsets, "ctrlOut", n, at)
     at = scratchAdd(offsets, "preludeOut", n, at)
     at = scratchAdd(offsets, "bankOut", n, at)
@@ -198,18 +201,23 @@ private fun InklingModel.mix(var backend: Backend, nBlocks: int, curOffset: int,
 }
 
 // control(cur, message): cur - tanh(forget)*cur + tanh(gain)*message, gates from the controller tensors of physical layer `ip`.
-private fun InklingModel.control(var backend: Backend, ip: int, which: string, curOffset: int, messageOffset: int, output: int): bool {
+private fun InklingModel.control(var backend: Backend, ip: int, which: string, curOffset: int, messageOffset: int, output: int, lane: int): bool {
     val n = this.config.nEmbd
     val down = this.w("blk.$ip.loop_${which}_ctrl_down.weight")
     val gain = this.w("blk.$ip.loop_${which}_ctrl_gain.weight")
     val forget = this.w("blk.$ip.loop_${which}_ctrl_forget.weight")
-    var ok = opRmsNormPlain(backend, this.scratch, curOffset, this.scratch, this.so("ctrlIn"), n, 0.000001, 1)
-    ok = ok && opRmsNormPlain(backend, this.scratch, messageOffset, this.scratch, this.so("ctrlIn") + n * 4, n, 0.000001, 1)
-    ok = ok && opMatvec(backend, "f32", this.arena, down.offset, this.scratch, this.so("ctrlIn"), this.scratch, this.so("ctrlGate"), down.rows, down.cols)
-    ok = ok && opMatvec(backend, "f32", this.arena, gain.offset, this.scratch, this.so("ctrlGate"), this.scratch, this.so("ctrlGain"), gain.rows, gain.cols)
-    ok = ok && opMatvec(backend, "f32", this.arena, forget.offset, this.scratch, this.so("ctrlGate"), this.scratch, this.so("ctrlForget"), forget.rows, forget.cols)
-    ok && opControlMix(backend, this.scratch, curOffset, this.scratch, messageOffset, this.scratch, this.so("ctrlGain"),
-        this.scratch, this.so("ctrlForget"), this.scratch, output, n)
+    // each lane has its own scratch so controllers of different lanes can run as parallel branches
+    val ctrlIn = this.so("ctrlIn") + lane * 2 * n * 4
+    val ctrlGate = this.so("ctrlGate") + lane * this.config.gateRank * 4
+    val ctrlGain = this.so("ctrlGain") + lane * n * 4
+    val ctrlForget = this.so("ctrlForget") + lane * n * 4
+    var ok = opRmsNormPlain(backend, this.scratch, curOffset, this.scratch, ctrlIn, n, 0.000001, 1)
+    ok = ok && opRmsNormPlain(backend, this.scratch, messageOffset, this.scratch, ctrlIn + n * 4, n, 0.000001, 1)
+    ok = ok && opMatvec(backend, "f32", this.arena, down.offset, this.scratch, ctrlIn, this.scratch, ctrlGate, down.rows, down.cols)
+    ok = ok && opMatvec(backend, "f32", this.arena, gain.offset, this.scratch, ctrlGate, this.scratch, ctrlGain, gain.rows, gain.cols)
+    ok = ok && opMatvec(backend, "f32", this.arena, forget.offset, this.scratch, ctrlGate, this.scratch, ctrlForget, forget.rows, forget.cols)
+    ok && opControlMix(backend, this.scratch, curOffset, this.scratch, messageOffset, this.scratch, ctrlGain,
+        this.scratch, ctrlForget, this.scratch, output, n)
 }
 
 // ---- one layer visit ----
@@ -246,12 +254,15 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     }
     if (loopPass > 0) {
         val messages = this.so("msgs")
+        ok = ok && backend.fork(2)
         var j = 0
         for (which in ["q", "k", "v"]) {
-            ok = ok && this.control(backend, ip, which, source[j], messages + j * nb, inputs + j * nb)
+            ok = ok && backend.branch(j)
+            ok = ok && this.control(backend, ip, which, source[j], messages + j * nb, inputs + j * nb, j)
             source[j] = inputs + j * nb
             j = j + 1
         }
+        ok = ok && backend.join()
     }
     if (isSwa) {
         for (j in 0 until 3) ok = ok && this.norm(backend, "blk.$ip.attn_norm.weight", source[j], normed + j * nb)
@@ -369,7 +380,7 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     ok = ok && this.mix(backend, blocks, x, "blk.$ip.ffn_res_query.weight", 1, x)
     if (loopPass > 0) {
         // control_mix is elementwise, so it can overwrite its own `cur`
-        ok = ok && this.control(backend, ip, "ffn", x, this.so("msgs") + 3 * nb, x)
+        ok = ok && this.control(backend, ip, "ffn", x, this.so("msgs") + 3 * nb, x, 0)
     }
     ok = ok && this.norm(backend, "blk.$ip.ffn_norm.weight", x, x)
     if (!ok) return -1

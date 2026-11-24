@@ -79,6 +79,12 @@ interface Backend {
     fun endRecording(): Recording?
     // Queue the whole recorded sequence (asynchronous, ordered with launches).
     fun replay(recording: Recording): bool
+    // Parallel branches inside a recording (they only matter while recording; otherwise all three do nothing and succeed): `fork(count)` starts `count`
+    // branches that wait for everything launched so far, `branch(i)` sends the following launches to branch i (0 = the main line), `join()` makes the main
+    // line wait for every branch. Launches of different branches may overlap on the device, so they must not touch the same buffers.
+    fun fork(count: int): bool
+    fun branch(index: int): bool
+    fun join(): bool
     // Called by Recording.drop only.
     fun releaseRecording(handle: int): void
     // Called by DeviceBuffer.drop only.
