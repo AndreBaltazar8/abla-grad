@@ -18,5 +18,7 @@ test-host:
 .PHONY: test-gpu
 test-gpu:
 	mkdir -p $(BUILD)
-	$(COMPILER) build tests/kernels/matvec_f32_test.ab -o $(BUILD)/matvec_f32_test --fast --no-cache && $(BUILD)/matvec_f32_test
-	$(COMPILER) build tests/kernels/elementwise_test.ab -o $(BUILD)/elementwise_test --fast --no-cache && $(BUILD)/elementwise_test
+	for test in tests/kernels/*_test.ab; do \
+		name=$$(basename $$test .ab); \
+		$(COMPILER) build $$test -o $(BUILD)/$$name --fast --no-cache && $(BUILD)/$$name || exit 1; \
+	done

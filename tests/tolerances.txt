@@ -1,0 +1,7 @@
+# Per-position limits for `abla-grad compare` against llama.cpp (33aeb17) logits. Calibrated from tests/oracle-noise.txt: llama.cpp's own CPU vs CUDA
+# builds differ by up to max |dlogit| 1.13 / max KL 0.018 (Llama) and 9.9 / 0.017 (Inkling; the big absolute gap is a near-zero-probability token), with
+# 2 of 266 / 1 of 324 argmax differences at near ties. We hold ourselves to about twice that on KL and mean difference, and do not require equal argmax
+# (a near tie can flip); `abla-grad compare` reports argmax differences, and the gate script fails when they exceed 1% of positions.
+maxAbs 4
+meanAbs 0.2
+kl 0.04
