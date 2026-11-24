@@ -212,26 +212,20 @@ compile fun parseFuse(cursor: ParserCursor): SyntaxExpression {
     while (fuseKeyword(cursor, "in")) fuseTensors(cursor, dimensions, tensors, inputs)
     while (fuseKeyword(cursor, "out")) fuseTensors(cursor, dimensions, tensors, outputs)
     val matvec = fuseStep(cursor) ?? return syntaxNull()
-    val situ = fuseStep(cursor) ?? return syntaxNull()
-    fuseSkip(cursor)
-    if (!parserRawAt(cursor, "}")) {
-        parserFail(cursor, "fuse: launch boundary after gate/up and SiTU")
-        return syntaxNull()
-    }
-    if (matvec.operation != "matvec_indexed" || situ.operation != "situ") {
-        parserFail(cursor, "fuse: expected indexed NVFP4 gate/up followed by SiTU")
+    if (matvec.operation != "matvec_indexed") {
+        parserFail(cursor, "fuse: the first step must be indexed NVFP4 gate/up")
         return syntaxNull()
     }
     val weights = fuseInput(cursor, inputs, matvec.inputs[0], "nvfp4", 3) ?? return syntaxNull()
     val x = fuseInput(cursor, inputs, matvec.inputs[1], "f32", 1) ?? return syntaxNull()
     val ids = fuseInput(cursor, inputs, matvec.inputs[2], "u32", 1) ?? return syntaxNull()
     val scales = fuseInput(cursor, inputs, matvec.inputs[3], "f32", 1) ?? return syntaxNull()
-    if (tensors.has(matvec.output) || matvec.output == situ.output) {
+    if (tensors.has(matvec.output)) {
         parserFail(cursor, "fuse: the intermediate name must be fresh")
         return syntaxNull()
     }
-    if (situ.inputs[0] != matvec.output) {
-        parserFail(cursor, "fuse: SiTU must consume the defined gate/up intermediate")
+    if (inputs.size != 4 || x.name == scales.name) {
+        parserFail(cursor, "fuse: gate/up requires four distinct inputs")
         return syntaxNull()
     }
     val experts = weights.shape[0]
@@ -241,6 +235,11 @@ compile fun parseFuse(cursor: ParserCursor): SyntaxExpression {
     if (cols % 64 != 0 || rows % 2 != 0 || cols != x.shape[0] || experts != scales.shape[0] ||
         used > experts || used > 65535) {
         parserFail(cursor, "fuse: indexed gate/up shape mismatch")
+        return syntaxNull()
+    }
+    val situ = fuseStep(cursor) ?? return syntaxNull()
+    if (situ.operation != "situ" || situ.inputs[0] != matvec.output) {
+        parserFail(cursor, "fuse: SiTU must consume the defined gate/up intermediate")
         return syntaxNull()
     }
     if (outputs.size != 1 || outputs[0].name != situ.output) {
@@ -253,8 +252,9 @@ compile fun parseFuse(cursor: ParserCursor): SyntaxExpression {
         parserFail(cursor, "fuse: SiTU output shape mismatch")
         return syntaxNull()
     }
-    if (inputs.size != 4 || x.name == scales.name) {
-        parserFail(cursor, "fuse: gate/up requires four distinct inputs")
+    fuseSkip(cursor)
+    if (!parserRawAt(cursor, "}")) {
+        parserFail(cursor, "fuse: launch boundary after gate/up and SiTU")
         return syntaxNull()
     }
     parserRawExpect(cursor, "}")

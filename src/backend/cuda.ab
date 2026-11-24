@@ -388,7 +388,7 @@ private fun cudaAttentionSplitShape(args: KernelArgs, problem: array<int>): bool
         args.words[13] > 0 && args.words[13] <= 64 && problem[0] == args.words[6] * args.words[13] && args.words[11] > 0
 private fun cudaAttentionMergeShape(args: KernelArgs, problem: array<int>): bool =
     args.words[2] == problem[0] && args.words[3] > 0 && args.words[3] <= 256 && args.words[4] > 0 && args.words[4] <= 64
- 
+
 private fun cudaInklingGateUpSituShape(args: KernelArgs, problem: array<int>): bool =
     problem[0] == inklingGateUpSitu.geometry.problem[0] && problem[1] == inklingGateUpSitu.geometry.problem[1]
 
@@ -448,7 +448,7 @@ private val cudaKernels = [
     CudaKernelSpec("step_record", kernelStepRecord, 1, 1, cudaArgsStepRecord, cudaStepAdvanceShape),
     CudaKernelSpec("attention_rel_split_step", kernelAttentionSplit, 1, 256, cudaArgsAttentionSplit, cudaAttentionSplitShape),
     CudaKernelSpec("attention_rel_merge", kernelAttentionSplit, 1, 256, cudaArgsAttentionMerge, cudaAttentionMergeShape),
- 
+
     CudaKernelSpec(inklingGateUpSitu.name, inklingGateUpSitu.source, inklingGateUpSitu.geometry.itemsPerBlock,
         inklingGateUpSitu.geometry.blockX, inklingGateUpSitu.argKinds, cudaInklingGateUpSituShape,
         2, inklingGateUpSitu.geometry.nullablePointer)
