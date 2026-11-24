@@ -1,0 +1,244 @@
+// moe_combine, moe_route, rel_table, conv_step and depth_mix against CPU references computed here (f64). Tolerance 2e-5 relative + 1e-5 absolute (f32 sums,
+// expf in the kernels); routing compares ids exactly.
+import "abla/io"
+import "abla/float"
+import "abla/float/text"
+import "abla/math"
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "support.ab"
+
+fun near(name: string, got: array<f32>, expected: array<f64>): bool {
+    if (got.size < expected.size) {
+        println("$name: ${got.size} values, expected ${expected.size}")
+        return false
+    }
+    for (index in 0 until expected.size) {
+        val actual = f32ToF64(got[index])
+        if (!(fabs(actual - expected[index]) <= 0.00001 + fabs(expected[index]) * 0.00002)) {
+            println("$name[$index]: expected ${expected[index]}, got $actual")
+            return false
+        }
+    }
+    true
+}
+
+fun f(values: array<f32>, index: int): f64 = f32ToF64(values[index])
+
+fun testMoeCombine(var backend: Backend): bool {
+    val rows = 70
+    val nUsed = 5
+    val out = testSignal(rows * nUsed, 21)
+    val w = testSignal(nUsed, 22)
+    val dout = uploadFloats(backend, out)
+    val dw = uploadFloats(backend, w)
+    val dres = uploadFloats(backend, testSignal(rows, 23))
+    if (dout == null || dw == null || dres == null) return false
+    if (!backend.launch("moe_combine", kernelArgs().pointer(dout).pointer(dw).pointer(dres).u32(rows).u32(nUsed), [rows])) return false
+    val expected: array<f64> = []
+    for (r in 0 until rows) {
+        var sum = 0.0
+        for (i in 0 until nUsed) sum = sum + f(w, i) * f(out, i * rows + r)
+        expected.append(sum)
+    }
+    near("moe_combine", downloadFloats(backend, dres, rows) ?? [], expected)
+}
+
+fun testMoeRoute(var backend: Backend): bool {
+    val nExpert = 128
+    val k = 8
+    val logits = testSignal(nExpert, 24)
+    val bias = testSignal(nExpert, 25)
+    for (i in 0 until nExpert) bias[i] = bias[i] * 0.05
+    // a tie: two experts with the same selection score; the lower index must win
+    logits[40] = 1.25
+    logits[41] = 1.25
+    bias[40] = 0.5
+    bias[41] = 0.5
+    val dl = uploadFloats(backend, logits)
+    val db = uploadFloats(backend, bias)
+    val dids = uploadWords(backend, [0, 0, 0, 0, 0, 0, 0, 0])
+    val dw = uploadFloats(backend, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    if (dl == null || db == null || dids == null || dw == null) return false
+    var ok = true
+    for (useBias in [true, false]) {
+        val launched = if (useBias)
+            backend.launch("moe_route", kernelArgs().pointer(dl).pointer(db).u32(nExpert).u32(k).pointer(dids).pointer(dw).f32(0.00000000000000000001).f32(8.0), [1])
+        else
+            backend.launch("moe_route", kernelArgs().pointer(dl).u64(0).u32(nExpert).u32(k).pointer(dids).pointer(dw).f32(0.00000000000000000001).f32(8.0), [1])
+        if (!launched) return false
+        val prob: array<f64> = []
+        val sel: array<f64> = []
+        for (i in 0 until nExpert) {
+            val p = 1.0 / (1.0 + exp(-f(logits, i)))
+            prob.append(p)
+            sel.append(p + (if (useBias) f(bias, i) else 0.0))
+        }
+        val chosen: array<int> = []
+        val used: array<bool> = []
+        for (i in 0 until nExpert) used.append(false)
+        var sum = 0.0
+        for (t in 0 until k) {
+            var best = -1
+            for (i in 0 until nExpert) if (!used[i] && (best < 0 || sel[i] > sel[best])) best = i
+            used[best] = true
+            chosen.append(best)
+            sum = sum + prob[best]
+        }
+        val ids = downloadWords(backend, dids, k) ?? []
+        val weights = downloadFloats(backend, dw, k) ?? []
+        for (t in 0 until k) {
+            if (ids[t] != chosen[t]) {
+                println("moe_route bias=$useBias: id $t is ${ids[t]}, expected ${chosen[t]}")
+                ok = false
+            }
+        }
+        val expected: array<f64> = []
+        for (t in 0 until k) expected.append(prob[chosen[t]] / (sum + 0.00000000000000000001) * 8.0)
+        ok = ok && near("moe_route weights bias=$useBias", weights, expected)
+    }
+    ok
+}
+
+fun testRelTable(var backend: Backend): bool {
+    val nRel = 16
+    val extent = 37
+    val nHead = 5
+    val bias = testSignal(nRel * extent, 26)
+    val r = testSignal(nHead * nRel, 27)
+    val sinks = testSignal(nHead, 28)
+    val dbias = uploadFloats(backend, bias)
+    val dr = uploadFloats(backend, r)
+    val dsinks = uploadFloats(backend, sinks)
+    val total = nHead * (extent + 1)
+    val dtable = uploadFloats(backend, testSignal(total, 29))
+    if (dbias == null || dr == null || dsinks == null || dtable == null) return false
+    if (!backend.launch("rel_table", kernelArgs().pointer(dbias).pointer(dr).pointer(dsinks).pointer(dtable).u32(nRel).u32(extent).u32(nHead), [total])) return false
+    val expected: array<f64> = []
+    for (h in 0 until nHead) {
+        for (d in 0 until extent + 1) {
+            var sum = 0.0
+            if (d < extent) for (k in 0 until nRel) sum = sum + f(bias, d * nRel + k) * f(r, h * nRel + k)
+            expected.append(sum - f(sinks, h))
+        }
+    }
+    near("rel_table", downloadFloats(backend, dtable, total) ?? [], expected)
+}
+
+fun testConvStep(var backend: Backend): bool {
+    val channels = 24
+    val nConv = 4
+    val heads = 3
+    var ok = true
+    for (useDyn in [false, true]) {
+        val w = testSignal(channels * nConv, 30)
+        val dyn = testSignal(heads * nConv, 31)
+        val dw = uploadFloats(backend, w)
+        val ddyn = uploadFloats(backend, dyn)
+        val zeros: array<f32> = []
+        for (i in 0 until (nConv - 1) * channels) zeros.append(0.0)
+        val dhistory = uploadFloats(backend, zeros)
+        val dx = uploadFloats(backend, testSignal(channels, 32))
+        val dout = uploadFloats(backend, testSignal(channels, 33))
+        if (dw == null || ddyn == null || dhistory == null || dx == null || dout == null) return false
+        // CPU model of the same recurrence: history[k][c]
+        val history: array<f64> = []
+        for (i in 0 until (nConv - 1) * channels) history.append(0.0)
+        val outScale = 1.0 / sqrt(f64FromInt((if (useDyn) 2 else 1) * nConv + 1))
+        for (step in 0 until 5) {
+            val x = testSignal(channels, 40 + step)
+            val xBuffer = uploadFloats(backend, x)
+            if (xBuffer == null) return false
+            val launched = if (useDyn)
+                backend.launch("conv_step", kernelArgs().pointer(xBuffer).pointer(dhistory).pointer(dw).pointer(ddyn).pointer(dout).u32(channels).u32(nConv).u32(heads).f32(f64ToF32(outScale)), [channels])
+            else
+                backend.launch("conv_step", kernelArgs().pointer(xBuffer).pointer(dhistory).pointer(dw).u64(0).pointer(dout).u32(channels).u32(nConv).u32(heads).f32(f64ToF32(outScale)), [channels])
+            if (!launched) return false
+            val expected: array<f64> = []
+            for (c in 0 until channels) {
+                val window: array<f64> = []
+                for (k in 0 until nConv - 1) window.append(history[k * channels + c])
+                window.append(f(x, c))
+                var sum = f(x, c)
+                for (k in 0 until nConv) sum = sum + f(w, c * nConv + k) * window[k]
+                if (useDyn) {
+                    val head = c / (channels / heads)
+                    for (lag in 0 until nConv) sum = sum + f(dyn, head * nConv + lag) * window[nConv - 1 - lag]
+                }
+                expected.append(sum * outScale)
+                for (k in 0 until nConv - 2) history[k * channels + c] = window[k + 1]
+                history[(nConv - 2) * channels + c] = f(x, c)
+            }
+            ok = ok && near("conv_step dyn=$useDyn step $step", downloadFloats(backend, dout, channels) ?? [], expected)
+        }
+        val gpuHistory = downloadFloats(backend, dhistory, (nConv - 1) * channels) ?? []
+        ok = ok && near("conv_step history dyn=$useDyn", gpuHistory, history)
+    }
+    ok
+}
+
+fun testDepthMix(var backend: Backend): bool {
+    val n = 300
+    val nQuery = 3
+    var ok = true
+    for (nBank in [0, 1, 4]) {
+        val bank = testSignal(n * (nBank + 1), 50)
+        val cur = testSignal(n, 51)
+        val queries = testSignal(nQuery * n, 52)
+        val dbank = uploadFloats(backend, bank)
+        val dcur = uploadFloats(backend, cur)
+        val dq = uploadFloats(backend, queries)
+        val dout = uploadFloats(backend, testSignal(nQuery * n, 53))
+        if (dbank == null || dcur == null || dq == null || dout == null) return false
+        if (!backend.launch("depth_mix", kernelArgs().pointer(dbank).u32(nBank).pointer(dcur).pointer(dq).u32(nQuery).pointer(dout).u32(n).f32(0.000001), [nQuery])) return false
+        val expected: array<f64> = []
+        for (q in 0 until nQuery) {
+            val states: array<array<f64>> = []
+            for (s in 0 until nBank + 1) {
+                val state: array<f64> = []
+                var sumSquares = 0.0
+                for (j in 0 until n) {
+                    val value = if (s < nBank) f(bank, s * n + j) else f(cur, j)
+                    state.append(value)
+                    sumSquares = sumSquares + value * value
+                }
+                val inverse = 1.0 / sqrt(sumSquares / f64FromInt(n) + 0.000001)
+                val normalized: array<f64> = []
+                for (j in 0 until n) normalized.append(state[j] * inverse)
+                states.append(normalized)
+            }
+            val scores: array<f64> = []
+            var maximum = -1.0e30
+            for (s in 0 until nBank + 1) {
+                var dot = 0.0
+                for (j in 0 until n) dot = dot + states[s][j] * f(queries, q * n + j)
+                val score = dot / sqrt(f64FromInt(n))
+                scores.append(score)
+                if (score > maximum) maximum = score
+            }
+            var total = 0.0
+            for (s in 0 until nBank + 1) {
+                scores[s] = exp(scores[s] - maximum)
+                total = total + scores[s]
+            }
+            for (j in 0 until n) {
+                var sum = 0.0
+                for (s in 0 until nBank + 1) sum = sum + scores[s] / total * states[s][j]
+                expected.append(sum)
+            }
+        }
+        ok = ok && near("depth_mix nBank=$nBank", downloadFloats(backend, dout, nQuery * n) ?? [], expected)
+    }
+    ok
+}
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    val ok = testMoeCombine(backend) && testMoeRoute(backend) && testRelTable(backend) && testConvStep(backend) && testDepthMix(backend)
+    if (!ok) {
+        println("inkling small kernel test FAILED (${cudaLastError()})")
+        return 1
+    }
+    println("inkling small kernel test passed")
+    0
+}

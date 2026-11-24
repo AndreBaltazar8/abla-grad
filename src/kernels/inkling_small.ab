@@ -1,0 +1,145 @@
+// Inkling's small non-quantized kernels (docs/kernels.md "Inkling additions", docs/inkling-graph.md): moe_combine, moe_route, rel_table, conv_step,
+// depth_mix. One CUDA C source string each. Geometry: moe_combine/rel_table/conv_step 256 threads, 256 items per block; moe_route one thread;
+// depth_mix one block of 256 threads per query.
+
+val kernelMoeCombine = """
+extern "C" __global__ void moe_combine(const float *expertOut, const float *weights, float *out, unsigned rows, unsigned nUsed) {
+    unsigned r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    float sum = 0.0f;
+    for (unsigned i = 0; i < nUsed; ++i) sum += weights[i] * expertOut[(unsigned long long)i * rows + r];
+    out[r] = sum;
+}
+"""
+
+// The router: p = sigmoid(logits); the k largest of p + bias (the lowest index wins ties) are chosen; weights = p[chosen] / (sum + normEps) * weightScale.
+// One thread; nExpert <= 256.
+val kernelMoeRoute = """
+extern "C" __global__ void moe_route(const float *logits, const float *bias, unsigned nExpert, unsigned k, unsigned *ids,
+                                     float *weights, float normEps, float weightScale) {
+    if (threadIdx.x != 0 || blockIdx.x != 0 || nExpert > 256) return;
+    float prob[256];
+    float sel[256];
+    bool used[256];
+    for (unsigned i = 0; i < nExpert; ++i) {
+        prob[i] = 1.0f / (1.0f + expf(-logits[i]));
+        sel[i] = prob[i] + (bias ? bias[i] : 0.0f);
+        used[i] = false;
+    }
+    float chosen[64];
+    unsigned count = k < 64 ? k : 64;
+    float sum = 0.0f;
+    for (unsigned t = 0; t < count; ++t) {
+        int best = -1;
+        for (unsigned i = 0; i < nExpert; ++i) {
+            if (!used[i] && (best < 0 || sel[i] > sel[best])) best = (int)i;
+        }
+        used[best] = true;
+        ids[t] = (unsigned)best;
+        chosen[t] = prob[best];
+        sum += prob[best];
+    }
+    for (unsigned t = 0; t < count; ++t) weights[t] = chosen[t] / (sum + normEps) * weightScale;
+}
+"""
+
+// table[h*(extent+1) + d] = sum_k relBias[d*nRel + k] * r[h*nRel + k] - sinks[h] for d < extent; the pad entry d == extent is 0 - sinks[h].
+val kernelRelTable = """
+extern "C" __global__ void rel_table(const float *relBias, const float *r, const float *sinks, float *table,
+                                     unsigned nRel, unsigned extent, unsigned nHead) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned stride = extent + 1;
+    if (i >= nHead * stride) return;
+    unsigned h = i / stride;
+    unsigned d = i % stride;
+    float sum = 0.0f;
+    if (d < extent) {
+        for (unsigned k = 0; k < nRel; ++k) sum += relBias[(unsigned long long)d * nRel + k] * r[h * nRel + k];
+    }
+    table[i] = sum - sinks[h];
+}
+"""
+
+// The short causal depthwise convolution with a residual (docs/inkling-graph.md "convolve"). Per channel c: the window is history[0..nConv-1)
+// (oldest first) then x[c]; out = (x + sum_k w[c*nConv + k] * window[k] + sum_lag dyn[head*nConv + lag] * window[nConv-1-lag]) * outScale; then the history
+// shifts by one and takes x[c]. history is [nConv-1][channels]; dyn may be null; x == out allowed.
+val kernelConvStep = """
+extern "C" __global__ void conv_step(const float *x, float *history, const float *w, const float *dyn, float *out,
+                                     unsigned channels, unsigned nConv, unsigned heads, float outScale) {
+    unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels || nConv > 64) return;
+    float window[64];
+    for (unsigned k = 0; k + 1 < nConv; ++k) window[k] = history[(unsigned long long)k * channels + c];
+    float current = x[c];
+    window[nConv - 1] = current;
+    float sum = current;
+    for (unsigned k = 0; k < nConv; ++k) sum += w[(unsigned long long)c * nConv + k] * window[k];
+    if (dyn) {
+        unsigned head = c / (channels / heads);
+        for (unsigned lag = 0; lag < nConv; ++lag) sum += dyn[head * nConv + lag] * window[nConv - 1 - lag];
+    }
+    for (unsigned k = 0; k + 1 < nConv; ++k) history[(unsigned long long)k * channels + c] = window[k + 1];
+    out[c] = sum * outScale;
+}
+"""
+
+// depth mixing. states = bank[0..nBank) (n floats each) then cur. Per query q (one block): each state is weightless-rmsnormed; s_i = (state_i . query_q) / sqrt(n);
+// softmax over the nBank+1 scores; out[q*n ..] = sum_i p_i * normalized state_i. nBank + 1 <= 64.
+val kernelDepthMix = """
+extern "C" __global__ void depth_mix(const float *bank, unsigned nBank, const float *cur, const float *queries, unsigned nQuery,
+                                     float *out, unsigned n, float eps) {
+    unsigned q = blockIdx.x;
+    if (q >= nQuery || nBank + 1 > 64) return;
+    __shared__ float partialA[256];
+    __shared__ float partialB[256];
+    __shared__ float scores[64];
+    __shared__ float inverse[64];
+    unsigned states = nBank + 1;
+    const float *query = queries + (unsigned long long)q * n;
+    for (unsigned s = 0; s < states; ++s) {
+        const float *state = s < nBank ? bank + (unsigned long long)s * n : cur;
+        float sumSquares = 0.0f;
+        float dot = 0.0f;
+        for (unsigned j = threadIdx.x; j < n; j += blockDim.x) {
+            float v = state[j];
+            sumSquares += v * v;
+            dot += v * query[j];
+        }
+        partialA[threadIdx.x] = sumSquares;
+        partialB[threadIdx.x] = dot;
+        __syncthreads();
+        for (unsigned width = blockDim.x / 2; width; width /= 2) {
+            if (threadIdx.x < width) {
+                partialA[threadIdx.x] += partialA[threadIdx.x + width];
+                partialB[threadIdx.x] += partialB[threadIdx.x + width];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            float inv = rsqrtf(partialA[0] / (float)n + eps);
+            inverse[s] = inv;
+            scores[s] = partialB[0] * inv / sqrtf((float)n);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float maximum = scores[0];
+        for (unsigned s = 1; s < states; ++s) maximum = fmaxf(maximum, scores[s]);
+        float total = 0.0f;
+        for (unsigned s = 0; s < states; ++s) {
+            scores[s] = expf(scores[s] - maximum);
+            total += scores[s];
+        }
+        for (unsigned s = 0; s < states; ++s) scores[s] = scores[s] / total * inverse[s];
+    }
+    __syncthreads();
+    for (unsigned j = threadIdx.x; j < n; j += blockDim.x) {
+        float sum = 0.0f;
+        for (unsigned s = 0; s < states; ++s) {
+            const float *state = s < nBank ? bank + (unsigned long long)s * n : cur;
+            sum += scores[s] * state[j];
+        }
+        out[(unsigned long long)q * n + j] = sum;
+    }
+}
+"""
