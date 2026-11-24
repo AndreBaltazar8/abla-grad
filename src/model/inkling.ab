@@ -207,6 +207,8 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     val qDim = c.nHead * c.headDim
     val kvDim = c.nHeadKv * c.headDim
     val isSwa = !this.has("blk.$ip.attn_q_inp_norm.weight")
+    // llama.cpp numbers the later passes of the looped core after the physical layers (its cache slots): the oracle's tensor names use that number.
+    val slot = if (loopPass > 0) c.nLayer + (loopPass - 1) * (c.loopEnd - c.loopStart) + (ip - c.loopStart) else ip
     val extent = if (isSwa) c.nSwa else c.extent
     val x = this.so("x")
     val inpSA = this.so("inpSA")
@@ -290,9 +292,9 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     }
     if (!ok) return -1
 
-    this.dump(backend, pos, "Qcur-$visit", q, qDim)
-    this.dump(backend, pos, "Kcur-$visit", k, kvDim)
-    this.dump(backend, pos, "Vcur-$visit", v, kvDim)
+    this.dump(backend, pos, "Qcur-$slot", q, qDim)
+    this.dump(backend, pos, "Kcur-$slot", k, kvDim)
+    this.dump(backend, pos, "Vcur-$slot", v, kvDim)
     // relative-position bias table with the sinks folded in, then attention
     val sinks = this.so("sinks")
     val table = this.so("table")
@@ -325,7 +327,7 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     }
     val ffnInp = this.so("ffnInp")
     ok = ok && this.copy(backend, x, ffnInp, n)
-    this.dump(backend, pos, "ffn_inp-$visit", ffnInp, n)
+    this.dump(backend, pos, "ffn_inp-$slot", ffnInp, n)
 
     // MoE
     ok = ok && this.mix(backend, blocks, x, "blk.$ip.ffn_res_query.weight", 1, x)
@@ -342,6 +344,8 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     ok = this.matvec(backend, "blk.$ip.ffn_gate_inp.weight", x, routerLogits)
     ok = ok && opMoeRoute(backend, this.scratch, routerLogits, this.arena, bias.offset, true, c.nExpert, c.nExpertUsed, this.scratch, ids,
         this.scratch, weights, 0.00000000000000000001, c.expertScale)
+    this.dump(backend, pos, "ffn_moe_logits-$slot", routerLogits, c.nExpert)
+    this.dump(backend, pos, "ffn_moe_weights-$slot", weights, c.nExpertUsed)
     val guRef = this.w("blk.$ip.ffn_gate_up_exps.weight")
     val downRef = this.w("blk.$ip.ffn_down_exps.weight")
     val guKind = weightKind(guRef.type)
@@ -358,16 +362,16 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     ok = ok && opMatvecIndexed(backend, guKind, this.arena, guRef.offset, this.scratch, x, this.scratch, this.so("gu"), 2 * nFf, n,
         this.scratch, ids, c.nExpertUsed, guRowBytes * 2 * nFf, 0, this.arena, guScales.offset, this.has("blk.$ip.ffn_gate_up_exps.scale"))
     ok = ok && opSitu(backend, this.scratch, this.so("gu"), this.scratch, this.so("act"), c.nExpertUsed, nFf, c.situBeta, c.situLinear)
-    this.dump(backend, pos, "ffn_moe_situ-$visit", this.so("act"), c.nExpertUsed * nFf)
+    this.dump(backend, pos, "ffn_moe_situ-$slot", this.so("act"), c.nExpertUsed * nFf)
     ok = ok && opMatvecIndexed(backend, downKind, this.arena, downRef.offset, this.scratch, this.so("act"), this.scratch, this.so("down"), n, nFf,
         this.scratch, ids, c.nExpertUsed, downRowBytes * n, nFf, this.arena, downScales.offset, this.has("blk.$ip.ffn_down_exps.scale"))
     ok = ok && opMoeCombine(backend, this.scratch, this.so("down"), this.scratch, weights, this.scratch, this.so("moe"), n, c.nExpertUsed)
     val ffnPost = this.w("blk.$ip.ffn_post_conv.weight")
     ok = ok && opConvStep(backend, this.scratch, this.so("moe"), this.history, fHistory, this.arena, ffnPost.offset, this.scratch, 0, false,
         this.scratch, x, n, c.nConv, 1, plainScale)
-    this.dump(backend, pos, "ffn_out-$visit", x, n)
+    this.dump(backend, pos, "ffn_out-$slot", x, n)
     ok = ok && opAdd(backend, this.scratch, ffnInp, this.scratch, x, this.scratch, x, n)
-    this.dump(backend, pos, "l_out-$visit", x, n)
+    this.dump(backend, pos, "l_out-$slot", x, n)
     if (!ok) {
         inklingError = "a launch failed in layer $ip (visit $visit)"
         return -1

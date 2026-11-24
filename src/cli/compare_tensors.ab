@@ -50,7 +50,7 @@ fun cmdCompareTensors(args: array<string>): int {
     }
     val names: array<string> = []
     for (visit in 0 until visits) {
-        for (kind in ["Qcur", "Kcur", "Vcur", "ffn_inp", "ffn_moe_situ", "ffn_out", "l_out"]) names.append("$kind-$visit")
+        for (kind in ["Qcur", "Kcur", "Vcur", "ffn_inp", "ffn_moe_logits", "ffn_moe_weights", "ffn_moe_situ", "ffn_out", "l_out"]) names.append("$kind-$visit")
     }
     names.append("result_norm")
     names.append("result_output")

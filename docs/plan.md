@@ -59,5 +59,4 @@ Prefill matmul (S4): matmul_<type> tiled; until then prefill = repeated decode.
 ## Status (updated as stages finish)
 - S0 contracts, S1a GGUF reader + `info`, S1b tokenizer, S1c oracle (llama.cpp 33aeb17, models pinned, GRDL dumps, tensor dumps, CPU/CUDA noise), S1d CUDA backend + kernel registry: done.
 - S2 small model: done. `tools/gate-llama.sh`: 266 positions over 4 prompts vs llama.cpp CUDA, all inside tests/tolerances.txt (worst KL 0.0047), 1 argmax flip at a near tie.
-- S3 Inkling: model code (src/model/inkling.ab, inkling_config.ab) written to docs/inkling-graph.md; debug dumps with the oracle's names (`abla-grad logits --dump DIR`,
-  `abla-grad compare-tensors ORACLE_DIR DIR`) find the first diverging tensor. Waiting on the quantized kernels (Q8_0, BF16, NVFP4/Q5_K/Q8_0 indexed, gather Q8_0).
+- S3 Inkling: done. `tools/gate-inkling.sh`: 324 positions over the 4 prompts vs llama.cpp CUDA (inkling2_loop), all inside tests/tolerances-inkling.txt, 0 argmax differences, worst KL 0.0165 (the oracle's own CPU/CUDA gap: 0.017). Layer by layer (compare-tensors): relative L2 about 0.5-1% per tensor over all 48 layer visits; a few MoE tensors (slots 23, 25) differ more where the expert selection flips at a near tie.
