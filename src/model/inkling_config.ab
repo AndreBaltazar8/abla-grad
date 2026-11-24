@@ -1,0 +1,132 @@
+// Hyper-parameters of an Inkling-2 GGUF (arch inkling2 / inkling2_loop), from its metadata (docs/inkling-graph.md lists the keys).
+import "abla/float"
+import "../gguf/reader.ab"
+
+class InklingConfig(
+    val prefix: string,
+    val nLayer: int,
+    val nEmbd: int,
+    val nHead: int,
+    val nHeadKv: int,
+    val headDim: int,
+    val nExpert: int,
+    val nExpertUsed: int,
+    val nFfExp: int,
+    val nVocabPadded: int,
+    val nVocab: int,
+    val blockSize: int,
+    val nConv: int,
+    val nSwa: int,
+    val nRel: int,
+    val extent: int,
+    val relClip: f32,
+    val qkClip: f32,
+    val logFloor: int,
+    val logAlpha: f32,
+    val situBeta: f32,
+    val situLinear: f32,
+    val expertScale: f32,
+    val softcap: f32,
+    val rmsEps: f32,
+    val looped: bool,
+    val loopStart: int,
+    val loopEnd: int,
+    val loopCount: int,
+    val gateRank: int
+)
+
+private var inklingConfigError = ""
+
+fun inklingConfigLastError(): string = inklingConfigError
+
+private fun missing(key: string): InklingConfig? {
+    inklingConfigError = "GGUF metadata key $key is missing or has the wrong type"
+    null
+}
+
+fun inklingConfigFrom(file: GgufFile): InklingConfig? {
+    inklingConfigError = ""
+    val architecture = file.getString("general.architecture")
+    if (architecture == null || (architecture != "inkling2" && architecture != "inkling2_loop")) {
+        inklingConfigError = "general.architecture is not inkling2 or inkling2_loop"
+        return null
+    }
+    val p = architecture
+    val looped = architecture == "inkling2_loop"
+    val nLayer = file.getInt("$p.block_count")
+    if (nLayer == null) return missing("$p.block_count")
+    val nEmbd = file.getInt("$p.embedding_length")
+    if (nEmbd == null) return missing("$p.embedding_length")
+    val heads = file.getIntArray("$p.attention.head_count")
+    if (heads == null || heads.size != nLayer) return missing("$p.attention.head_count")
+    val kvHeads = file.getIntArray("$p.attention.head_count_kv")
+    if (kvHeads == null || kvHeads.size != nLayer) return missing("$p.attention.head_count_kv")
+    for (layer in 1 until nLayer) {
+        if (heads[layer] != heads[0] || kvHeads[layer] != kvHeads[0]) {
+            inklingConfigError = "layers with different head counts are not supported yet"
+            return null
+        }
+    }
+    val headDim = file.getInt("$p.attention.key_length")
+    if (headDim == null) return missing("$p.attention.key_length")
+    val nExpert = file.getInt("$p.expert_count")
+    if (nExpert == null) return missing("$p.expert_count")
+    val nExpertUsed = file.getInt("$p.expert_used_count")
+    if (nExpertUsed == null) return missing("$p.expert_used_count")
+    val nFfExp = file.getInt("$p.expert_feed_forward_length")
+    if (nFfExp == null) return missing("$p.expert_feed_forward_length")
+    val nVocabPadded = file.getInt("$p.vocab_size")
+    if (nVocabPadded == null) return missing("$p.vocab_size")
+    val nVocab = file.getInt("$p.vocab_size_unpadded")
+    if (nVocab == null) return missing("$p.vocab_size_unpadded")
+    val blockSize = file.getInt("$p.attn_res.block_size")
+    if (blockSize == null) return missing("$p.attn_res.block_size")
+    val nConv = file.getInt("$p.shortconv.l_cache")
+    if (nConv == null) return missing("$p.shortconv.l_cache")
+    val nSwa = file.getInt("$p.attention.sliding_window")
+    if (nSwa == null) return missing("$p.attention.sliding_window")
+    val nRel = file.getInt("$p.attention.relative_length")
+    if (nRel == null) return missing("$p.attention.relative_length")
+    val extent = file.getInt("$p.attention.relative_extent")
+    if (extent == null) return missing("$p.attention.relative_extent")
+    val relClip = file.getFloat("$p.attention.relative_clip")
+    if (relClip == null) return missing("$p.attention.relative_clip")
+    val qkClip = file.getFloat("$p.attention.qk_clip")
+    if (qkClip == null) return missing("$p.attention.qk_clip")
+    val logFloor = file.getInt("$p.attention.log_scale_floor")
+    if (logFloor == null) return missing("$p.attention.log_scale_floor")
+    val logAlpha = file.getFloat("$p.attention.log_scale_alpha")
+    if (logAlpha == null) return missing("$p.attention.log_scale_alpha")
+    val situBeta = file.getFloat("$p.activation.situ_beta")
+    if (situBeta == null) return missing("$p.activation.situ_beta")
+    val situLinear = file.getFloat("$p.activation.situ_linear_beta")
+    if (situLinear == null) return missing("$p.activation.situ_linear_beta")
+    val eps = file.getFloat("$p.attention.layer_norm_rms_epsilon")
+    if (eps == null) return missing("$p.attention.layer_norm_rms_epsilon")
+    val expertScale = file.getFloat("$p.expert_weights_scale") ?? 1.0
+    val softcap = file.getFloat("$p.final_logit_softcapping") ?? 0.0
+    var loopStart = 0
+    var loopEnd = 0
+    var loopCount = 1
+    var gateRank = 0
+    if (looped) {
+        val start = file.getInt("$p.loop.start")
+        val end = file.getInt("$p.loop.end")
+        val count = file.getInt("$p.loop.count")
+        val rank = file.getInt("$p.loop.gate_rank")
+        if (start == null || end == null || count == null || rank == null) return missing("$p.loop.*")
+        loopStart = start
+        loopEnd = end
+        loopCount = count
+        gateRank = rank
+    }
+    InklingConfig(
+        p, nLayer, nEmbd, heads[0], kvHeads[0], headDim, nExpert, nExpertUsed, nFfExp, nVocabPadded, nVocab, blockSize, nConv, nSwa, nRel, extent,
+        f64ToF32(relClip), f64ToF32(qkClip), logFloor, f64ToF32(logAlpha), f64ToF32(situBeta), f64ToF32(situLinear), f64ToF32(expertScale),
+        f64ToF32(softcap), f64ToF32(eps), looped, loopStart, loopEnd, loopCount, gateRank
+    )
+}
+
+// How many layer visits one token makes (each with its own KV cache and convolution state).
+fun inklingVisits(config: InklingConfig): int =
+    if (config.looped) config.nLayer + (config.loopCount - 1) * (config.loopEnd - config.loopStart) else config.nLayer

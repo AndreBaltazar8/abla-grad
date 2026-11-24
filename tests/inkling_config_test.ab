@@ -1,0 +1,27 @@
+// The real Inkling-2-Mini GGUF (in ~/models) gives the numbers docs/inkling-graph.md records.
+import "abla/io"
+import "abla/process/arguments"
+import "../src/gguf/reader.ab"
+import "../src/model/inkling_config.ab"
+
+fun main: int {
+    val file = ggufOpen(processArgument(0))
+    if (file == null) {
+        println("inkling config test: cannot open the model: ${ggufLastError()}")
+        return 1
+    }
+    val c = inklingConfigFrom(file)
+    if (c == null) {
+        println("inkling config test FAILED: ${inklingConfigLastError()}")
+        return 1
+    }
+    if (c.nLayer != 24 || c.nEmbd != 2304 || c.nHead != 24 || c.nHeadKv != 8 || c.headDim != 128 || c.nExpert != 128 || c.nExpertUsed != 8 ||
+        c.nFfExp != 1152 || c.nVocabPadded != 201024 || c.nVocab != 200058 || c.blockSize != 6 || c.nConv != 4 || c.nSwa != 1024 || c.nRel != 16 ||
+        c.extent != 1024 || c.logFloor != 8192 || !c.looped || c.loopStart != 6 || c.loopEnd != 18 || c.loopCount != 3 || c.gateRank != 64 ||
+        inklingVisits(c) != 48) {
+        println("inkling config test FAILED: unexpected values")
+        return 1
+    }
+    println("inkling config test passed")
+    0
+}
