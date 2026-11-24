@@ -91,4 +91,14 @@ extern "C" __global__ void attention_decode_rel(
     unsigned pos, unsigned extent, unsigned maxCtx, float scale) {
     attention<true>(q, k, v, table, out, nHead, nKvHead, dim, first, last, pos, extent, maxCtx, scale);
 }
+
+extern "C" __global__ void attention_decode_rel_step(
+    const float *q, const float *k, const float *v, const float *table, float *out,
+    const unsigned *step, unsigned nHead, unsigned nKvHead, unsigned dim,
+    unsigned window, unsigned extent, unsigned maxCtx, float scale) {
+    const unsigned pos = step[1];
+    if (pos >= maxCtx) return;
+    const unsigned first = window && pos + 1 > window ? pos + 1 - window : 0;
+    attention<true>(q, k, v, table, out, nHead, nKvHead, dim, first, pos, pos, extent, maxCtx, scale);
+}
 """

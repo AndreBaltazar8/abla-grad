@@ -1,0 +1,48 @@
+import "../../src/backend/backend.ab"
+import "attention_decode_test_support.ab"
+import "device_test_support.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+trusted fun testGatherStep(backend: Backend): bool {
+    val cols = 96
+    val weight = nativeByteBuffer(3 * 3 * 34)
+    val reference = nativeByteBuffer(cols * 4)
+    val output = nativeByteBuffer(cols * 4)
+    val step = nativeByteBuffer(16)
+    for (byte in 0 until weight.capacity) weight.store(byte, (byte * 5 + byte / 13) & 255)
+    for (block in 0 until 9) {
+        weight.store(block * 34, 0)
+        weight.store(block * 34 + 1, 0x38)
+    }
+    val table = backend.allocate(weight.capacity)
+    val state = backend.allocate(step.capacity)
+    val result = backend.allocate(output.capacity)
+    if (table == null || state == null || result == null ||
+        !backend.upload(table, 0, nativePointerAddress(weight.address), weight.capacity)) return false
+    val expectedAddress = nativePointerAddress(reference.address)
+    val outputAddress = nativePointerAddress(output.address)
+    val stepAddress = nativePointerAddress(step.address)
+    val stepArgs = kernelArgs().pointer(table).pointer(state).pointer(result).u32(cols)
+    for (token in [0, 2]) {
+        step.storeI64(0, token | (1 << 32))
+        step.storeI64(8, 0)
+        if (!backend.upload(state, 0, stepAddress, step.capacity) ||
+            !backend.launch("gather_row_q8_0", kernelArgs().pointer(table).u32(token).pointer(result).u32(cols), [cols]) ||
+            !backend.download(result, 0, expectedAddress, reference.capacity) ||
+            !backend.launch("gather_row_q8_0_step", stepArgs, [cols]) ||
+            !backend.download(result, 0, outputAddress, output.capacity)) return false
+        for (col in 0 until cols) {
+            if (ablaUnsafeLoadU32(nativePointerFromAddress(expectedAddress + col * 4)) !=
+                ablaUnsafeLoadU32(nativePointerFromAddress(outputAddress + col * 4))) return false
+        }
+    }
+    true
+}
+
+fun verify(backend: Backend): bool = testGatherStep(backend) &&
+    testAttention(backend, true, 0, 13, 0) &&
+    testAttention(backend, true, 3, 13, 11) &&
+    testAttention(backend, true, 0, 2, 11)
+
+fun main: int = runCudaKernelTest("step gather and relative attention (byte parity)", verify)

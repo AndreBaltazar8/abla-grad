@@ -147,6 +147,7 @@ private fun cudaL2ClipShape(args: KernelArgs, problem: array<int>): bool = args.
 private fun cudaArgmaxShape(args: KernelArgs, problem: array<int>): bool = problem[0] == 1 && args.words[1] > 0
 
 private val cudaGatherArguments = [KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_POINTER, KERNEL_ARG_U32]
+private val cudaGatherStepArguments = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32]
 private val cudaRmsnormArguments = [
     KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_F32
 ]
@@ -163,6 +164,12 @@ private val cudaRelativeAttentionArguments = [
     KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
     KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32,
     KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_F32
+]
+
+private val cudaRelativeAttentionStepArguments = [
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32,
+    KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_F32
 ]
 
 private fun cudaKQuantShape(args: KernelArgs, problem: array<int>): bool =
@@ -186,14 +193,16 @@ private fun cudaRopeShape(args: KernelArgs, problem: array<int>): bool {
         freqBase > 0 && freqBase <= 0x7f7fffff && args.words[7] <= 1
 }
 
+private fun cudaAttentionHeadShape(head: int, kvHead: int, dim: int, expected: int): bool =
+    head == expected && kvHead > 0 && head % kvHead == 0 && dim > 0 && dim <= 256
+
 private fun cudaAttentionShapeAt(args: KernelArgs, problem: array<int>, base: int, contextIndex: int): bool {
     val head = args.words[base]
     val kvHead = args.words[base + 1]
     val dim = args.words[base + 2]
     val first = args.words[base + 3]
     val last = args.words[base + 4]
-    head == problem[0] && kvHead > 0 && head % kvHead == 0 && dim > 0 && dim <= 256 &&
-        first <= last && last < args.words[contextIndex]
+    cudaAttentionHeadShape(head, kvHead, dim, problem[0]) && first <= last && last < args.words[contextIndex]
 }
 
 private fun cudaAttentionShape(args: KernelArgs, problem: array<int>): bool =
@@ -201,6 +210,9 @@ private fun cudaAttentionShape(args: KernelArgs, problem: array<int>): bool =
 
 private fun cudaRelativeAttentionShape(args: KernelArgs, problem: array<int>): bool =
     cudaAttentionShapeAt(args, problem, 5, 12) && args.words[9] <= args.words[10]
+
+private fun cudaRelativeAttentionStepShape(args: KernelArgs, problem: array<int>): bool =
+    cudaAttentionHeadShape(args.words[6], args.words[7], args.words[8], problem[0]) && args.words[11] > 0
 
 // ---- Inkling's small kernels (ablac-60-2; sources in src/kernels/inkling_small.ab) ----
 private val cudaArgsMoeCombine = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32]
@@ -293,6 +305,8 @@ private val cudaKernels = [
     CudaKernelSpec("attention_decode", kernelAttentionDecode, 1, 256, cudaAttentionArguments, cudaAttentionShape),
     CudaKernelSpec("attention_decode_rel", kernelAttentionDecode, 1, 256,
         cudaRelativeAttentionArguments, cudaRelativeAttentionShape),
+    CudaKernelSpec("attention_decode_rel_step", kernelAttentionDecode, 1, 256,
+        cudaRelativeAttentionStepArguments, cudaRelativeAttentionStepShape),
     CudaKernelSpec("matvec_nvfp4", kernelMatvecNvfp4, 4, 128, cudaMatvecArguments, cudaNvfp4Shape),
     CudaKernelSpec("matvec_nvfp4_indexed", kernelMatvecNvfp4, 4, 128,
         cudaIndexedMatvecArguments, cudaNvfp4IndexedShape, 2, 9),
@@ -307,6 +321,7 @@ private val cudaKernels = [
         cudaIndexedMatvecArguments, cudaQ6IndexedShape, 2, 9),
     CudaKernelSpec("matvec_bf16", kernelMatvecBf16, 4, 128, cudaMatvecArguments, cudaF32Shape),
     CudaKernelSpec("gather_row_q8_0", kernelMatvecQ8_0, 128, 128, cudaGatherArguments, cudaQ8GatherShape),
+    CudaKernelSpec("gather_row_q8_0_step", kernelMatvecQ8_0, 128, 128, cudaGatherStepArguments, cudaQ8GatherShape),
     CudaKernelSpec("gather_row_bf16", kernelMatvecBf16, 128, 128, cudaGatherArguments, cudaGatherShape),
     // elementwise and row kernels (60-2)
     CudaKernelSpec("add", kernelAdd, 256, 256, cudaArgsAdd, cudaCountIsLast3),

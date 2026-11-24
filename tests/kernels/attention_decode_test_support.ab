@@ -5,7 +5,7 @@ import "abla/math"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 
-trusted fun testAttention(backend: Backend, relative: bool, first: int, last: int): bool {
+trusted fun testAttention(backend: Backend, relative: bool, first: int, last: int, stepWindow: int = -1): bool {
     val heads = 6
     val kvHeads = 2
     val dim = 65
@@ -53,8 +53,29 @@ trusted fun testAttention(backend: Backend, relative: bool, first: int, last: in
     }
     args.u32(context)
     args.f32(scale)
+    if (!backend.launch(name, args, [heads])) return false
+    if (stepWindow >= 0) {
+        val reference = nativeByteBuffer(out.capacity)
+        val expectedAddress = nativePointerAddress(reference.address)
+        if (!backend.download(dy, 0, expectedAddress, reference.capacity)) return false
+        val step = nativeByteBuffer(16)
+        val stepAddress = nativePointerAddress(step.address)
+        step.storeI64(0, last << 32)
+        step.storeI64(8, 0)
+        val ds = backend.allocate(step.capacity)
+        if (ds == null || !backend.upload(ds, 0, stepAddress, step.capacity)) return false
+        val stepArgs = kernelArgs().pointer(dq).pointer(dk).pointer(dv).pointer(dt).pointer(dy)
+            .pointer(ds).u32(heads).u32(kvHeads).u32(dim).u32(stepWindow)
+            .u32(extent).u32(context).f32(scale)
+        if (!backend.launch("attention_decode_rel_step", stepArgs, [heads]) ||
+            !backend.download(dy, 0, nativePointerAddress(out.address), out.capacity)) return false
+        for (i in 0 until heads * dim) {
+            if (ablaUnsafeLoadU32(nativePointerFromAddress(expectedAddress + i * 4)) !=
+                ablaUnsafeLoadU32(nativePointerFromAddress(nativePointerAddress(out.address) + i * 4))) return false
+        }
+    }
     val ya = nativePointerAddress(out.address)
-    if (!backend.launch(name, args, [heads]) || !backend.download(dy, 0, ya, out.capacity)) return false
+    if (stepWindow < 0 && !backend.download(dy, 0, ya, out.capacity)) return false
     for (head in 0 until heads) {
         val kvHead = head / (heads / kvHeads)
         val scores: array<f64> = []

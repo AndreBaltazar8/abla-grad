@@ -49,12 +49,22 @@ extern "C" __global__ void matvec_q8_0_indexed(
     }
 }
 
-extern "C" __global__ void gather_row_q8_0(const unsigned char *table, unsigned token,
-                                            float *out, unsigned cols) {
+static __device__ __forceinline__ void q8_gather_row(const unsigned char *table,
+    unsigned token, float *out, unsigned cols) {
     unsigned col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= cols) return;
     unsigned long long block = static_cast<unsigned long long>(token) * (cols / 32) + col / 32;
     const unsigned char *packed = table + block * 34;
     out[col] = q8_scale(packed) * float(static_cast<signed char>(packed[2 + col % 32]));
+}
+
+extern "C" __global__ void gather_row_q8_0(const unsigned char *table, unsigned token,
+                                            float *out, unsigned cols) {
+    q8_gather_row(table, token, out, cols);
+}
+
+extern "C" __global__ void gather_row_q8_0_step(const unsigned char *table,
+    const unsigned *step, float *out, unsigned cols) {
+    q8_gather_row(table, step[0], out, cols);
 }
 """
