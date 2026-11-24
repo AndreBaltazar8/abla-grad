@@ -44,7 +44,7 @@ on load unless noted; kernels read them as `const float*`. Matvec kernels with `
 | kernel | parameters | problem | meaning |
 |---|---|---|---|
 | `rmsnorm` (extended) | as above, with `w` allowed to be a null pointer (`u64(0)`) | `[nVectors]` | weightless form: `y = x * rsqrt(mean(x^2)+eps)` |
-| `l2clip` | `const float* x, const float* scale, float* y, u32 rows, u32 dim, f32 t` | `[rows]` | per row: `v = scale ? x*scale : x` (scale has `rows*dim` values or `dim` values broadcast per row: see `scaleStride`), `y = v * t / max(|v|_2, t)`; in place allowed |
+| `l2clip` | `const float* x, const float* scale, float* y, u32 rows, u32 dim, f32 t` | `[rows]` | per row: `v = scale ? x*scale : x` (scale has `rows*dim` values, one per element), `y = v * t / max(|v|_2, t)`; in place allowed |
 | `scale_f32` | `float* x, f32 s, u32 n` | `[n]` | in place `x *= s` (tau, vocabulary softcap factors) |
 | `sigmoid_mul` | `const float* a, const float* g, float* out, u32 n` | `[n]` | `out = a * sigmoid(g)` |
 | `depth_mix` | `const float* bank, u32 nBank, const float* cur, const float* queries, u32 nQuery, float* out, u32 n, f32 eps` | `[nQuery]` | states = `bank[0..nBank)` (contiguous n floats each) + `cur`; each state weightless-rmsnormed with `eps`; per query q: `s_i = state_i . queries[q*n..]`, `/ sqrt(n)`, softmax over the nBank+1 states, `out[q*n..] = sum_i p_i state_i` (normalized states) |
