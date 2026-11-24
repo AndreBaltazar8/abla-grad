@@ -392,7 +392,8 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     val downRowBytes = ggmlRowBytes(downRef.type, downRef.cols)
     val nFf = c.nFfExp
     val fusable = this.fused && guKind == "nvfp4" && n == 2304 && nFf == 1152 && c.nExpert == 128 && c.nExpertUsed == 8 &&
-        c.situBeta == 4.0 && c.situLinear == 25.0
+        c.situBeta == 4.0 && c.situLinear == 25.0 &&
+        guRef.cols == n && guRef.rows == c.nExpert * 2 * nFf
     if (fusable) {
         ok = ok && opGateUpSitu(backend, this.arena, guRef.offset, this.scratch, x, this.scratch, ids, this.arena, guScales.offset,
             this.has("blk.$ip.ffn_gate_up_exps.scale"), this.scratch, this.so("act"), nFf, c.nExpertUsed)
