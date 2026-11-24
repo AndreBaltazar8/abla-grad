@@ -1,0 +1,19 @@
+// One warp per output row. Inputs and output are contiguous FP32 vectors.
+val kernelMatvecF32 = """
+extern "C" __global__ void matvec_f32(const float *weights, const float *input,
+                                       float *output, unsigned rows, unsigned cols) {
+    unsigned lane = threadIdx.x % 32;
+    unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= rows) return;
+
+    const float *values = weights + static_cast<unsigned long long>(row) * cols;
+    float sum = 0;
+    for (unsigned col = lane; col < cols; col += 32) {
+        sum = fmaf(values[col], input[col], sum);
+    }
+    for (unsigned width = 16; width; width /= 2) {
+        sum += __shfl_down_sync(0xffffffffu, sum, width);
+    }
+    if (lane == 0) output[row] = sum;
+}
+"""

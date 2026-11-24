@@ -1,0 +1,251 @@
+import "backend.ab"
+import "../kernels/matvec_f32.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+private trusted noescape extern:"c" fun cuInit(flags: u32): i32
+private trusted noescape extern:"c" fun cuDeviceGet(device: i64*, ordinal: i32): i32
+private trusted noescape extern:"c" fun cuDeviceGetAttribute(value: i64*, attribute: i32, device: i32): i32
+private trusted noescape extern:"c" fun cuCtxCreate_v2(context: i64*, flags: u32, device: i32): i32
+private trusted noescape extern:"c" fun cuCtxDestroy_v2(context: i64*): i32
+private trusted noescape extern:"c" fun cuCtxSynchronize(): i32
+private trusted noescape extern:"c" fun cuMemAlloc_v2(address: i64*, bytes: u64): i32
+private trusted noescape extern:"c" fun cuMemFree_v2(address: u64): i32
+private trusted noescape extern:"c" fun cuMemcpyHtoD_v2(destination: u64, source: i64*, bytes: u64): i32
+private trusted noescape extern:"c" fun cuMemcpyDtoH_v2(destination: i64*, source: u64, bytes: u64): i32
+private trusted noescape extern:"c" fun cuModuleLoadData(module: i64*, data: cstring): i32
+private trusted noescape extern:"c" fun cuModuleUnload(module: i64*): i32
+private trusted noescape extern:"c" fun cuModuleGetFunction(function: i64*, module: i64*, name: cstring): i32
+private trusted noescape extern:"c" fun cuLaunchKernel(
+    function: i64*, gridX: u32, gridY: u32, gridZ: u32,
+    blockX: u32, blockY: u32, blockZ: u32, sharedBytes: u32,
+    stream: i64*, params: i64*, extra: i64*
+): i32
+
+private trusted noescape extern:"c" fun nvrtcCreateProgram(
+    program: i64*, source: cstring, name: cstring,
+    headerCount: i32, headers: i64*, includeNames: i64*
+): i32
+private trusted noescape extern:"c" fun nvrtcCompileProgram(program: i64*, optionCount: i32, options: i64*): i32
+private trusted noescape extern:"c" fun nvrtcGetProgramLogSize(program: i64*, size: i64*): i32
+private trusted noescape extern:"c" fun nvrtcGetProgramLog(program: i64*, text: i64*): i32
+private trusted noescape extern:"c" fun nvrtcGetPTXSize(program: i64*, size: i64*): i32
+private trusted noescape extern:"c" fun nvrtcGetPTX(program: i64*, output: i64*): i32
+private trusted noescape extern:"c" fun nvrtcDestroyProgram(program: i64*): i32
+
+private var cudaError = ""
+
+fun cudaLastError(): string = cudaError
+
+private fun cudaStatus(status: i32, call: string): bool {
+    if (status == 0) return true
+    cudaError = "${call} failed with status ${status}"
+    false
+}
+
+private trusted fun cudaCompilePtx(source: string, name: string, architecture: string): string? {
+    val program = nativePointerCell(nativeNullPointer())
+    if (!cudaStatus(nvrtcCreateProgram(program.address, source, name, 0,
+        nativeNullPointer(), nativeNullPointer()), "nvrtcCreateProgram")) return null
+    val handle = program.load()
+    val option = "--gpu-architecture=${architecture}"
+    val optionBytes = nativeByteBuffer(option.size + 1)
+    var index = 0
+    while (index < option.size) {
+        optionBytes.store(index, option[index])
+        index += 1
+    }
+    optionBytes.store(index, 0)
+    val options = nativePointerCell(optionBytes.address)
+    val length = nativeI64Cell(0)
+    var ptx: string? = null
+    if (!cudaStatus(nvrtcCompileProgram(handle, 1, options.address), "nvrtcCompileProgram")) {
+        if (nvrtcGetProgramLogSize(handle, length.address) == 0 && length.load() > 0) {
+            val log = nativeByteBuffer(length.load())
+            if (nvrtcGetProgramLog(handle, log.address) == 0) {
+                cudaError = "${cudaError}: ${nativeCString(log.address)}"
+            }
+        }
+    } else if (cudaStatus(nvrtcGetPTXSize(handle, length.address), "nvrtcGetPTXSize")) {
+        val bytes = nativeByteBuffer(length.load())
+        if (cudaStatus(nvrtcGetPTX(handle, bytes.address), "nvrtcGetPTX")) {
+            ptx = nativeCString(bytes.address)
+        }
+    }
+    nvrtcDestroyProgram(program.address)
+    ptx
+}
+
+private trusted noescape extern:"c" fun cuCtxPushCurrent_v2(context: i64*): i32
+private trusted noescape extern:"c" fun cuCtxPopCurrent_v2(context: i64*): i32
+private trusted noescape extern:"c" fun cuMemGetInfo_v2(freeBytes: i64*, totalBytes: i64*): i32
+
+class CudaBackend(
+    var context: int,
+    val architecture: string,
+    var liveBuffers: int = 0,
+    var f32Module: int = 0,
+    var f32Function: int = 0
+) : Backend {
+    fun name(): string = "cuda"
+
+    trusted fun pushContext(): bool {
+        if (this.context == 0) {
+            cudaError = "CUDA context is closed"
+            return false
+        }
+        cudaStatus(cuCtxPushCurrent_v2(nativePointerFromAddress(this.context)), "cuCtxPushCurrent")
+    }
+
+    trusted fun popContext(): void {
+        val previous = nativePointerCell(nativeNullPointer())
+        cuCtxPopCurrent_v2(previous.address)
+        return
+    }
+
+    // Close after the last DeviceBuffer has been dropped.
+    trusted fun close(): bool {
+        if (this.context == 0) return true
+        if (this.liveBuffers != 0) {
+            cudaError = "CUDA context still owns device buffers"
+            return false
+        }
+        if (!this.pushContext()) return false
+        val waited = cudaStatus(cuCtxSynchronize(), "cuCtxSynchronize")
+        if (this.f32Module != 0) cuModuleUnload(nativePointerFromAddress(this.f32Module))
+        this.popContext()
+        val destroyed = cudaStatus(cuCtxDestroy_v2(nativePointerFromAddress(this.context)), "cuCtxDestroy")
+        if (destroyed) this.context = 0
+        waited && destroyed
+    }
+
+    trusted fun allocate(bytes: int): DeviceBuffer? {
+        if (bytes < 1) {
+            cudaError = "CUDA allocation size must be positive"
+            return null
+        }
+        if (!this.pushContext()) return null
+        val address = nativeI64Cell(0)
+        val ok = cudaStatus(cuMemAlloc_v2(address.address, u64(bytes)), "cuMemAlloc")
+        this.popContext()
+        if (!ok) return null
+        this.liveBuffers += 1
+        DeviceBuffer(this, address.load(), bytes)
+    }
+
+    fun copyRange(buffer: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool {
+        if (buffer.owner != this || offset < 0 || bytes < 0 || offset > buffer.bytes ||
+            bytes > buffer.bytes - offset || (hostAddress == 0 && bytes != 0)) {
+            cudaError = "CUDA copy range or buffer owner is invalid"
+            return false
+        }
+        true
+    }
+
+    trusted fun upload(destination: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool {
+        if (!this.copyRange(destination, offset, hostAddress, bytes)) return false
+        if (bytes == 0) return true
+        if (!this.pushContext()) return false
+        val ok = cudaStatus(cuMemcpyHtoD_v2(u64(destination.handle + offset),
+            nativePointerFromAddress(hostAddress), u64(bytes)), "cuMemcpyHtoD")
+        this.popContext()
+        ok
+    }
+
+    trusted fun download(source: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool {
+        if (!this.copyRange(source, offset, hostAddress, bytes)) return false
+        if (bytes == 0) return this.synchronize()
+        if (!this.pushContext()) return false
+        val ok = cudaStatus(cuMemcpyDtoH_v2(nativePointerFromAddress(hostAddress),
+            u64(source.handle + offset), u64(bytes)), "cuMemcpyDtoH")
+        this.popContext()
+        ok
+    }
+
+    trusted fun loadF32Kernel(): bool {
+        if (this.f32Function != 0) return true
+        val ptx = cudaCompilePtx(kernelMatvecF32, "matvec_f32.cu", this.architecture)
+        if (ptx == null) return false
+        val module = nativePointerCell(nativeNullPointer())
+        if (!cudaStatus(cuModuleLoadData(module.address, ptx), "cuModuleLoadData")) return false
+        val function = nativePointerCell(nativeNullPointer())
+        if (!cudaStatus(cuModuleGetFunction(function.address, module.load(), "matvec_f32"), "cuModuleGetFunction")) {
+            cuModuleUnload(module.load())
+            return false
+        }
+        this.f32Module = nativePointerAddress(module.load())
+        this.f32Function = nativePointerAddress(function.load())
+        true
+    }
+
+    trusted fun launch(kernel: string, args: KernelArgs, problem: array<int>): bool {
+        if (kernel != "matvec_f32" || problem.size != 1 || problem[0] < 1 ||
+            problem[0] > 4294967295 || args.kinds.size != 5 || args.words.size != 5 ||
+            args.kinds[0] != KERNEL_ARG_POINTER || args.kinds[1] != KERNEL_ARG_POINTER ||
+            args.kinds[2] != KERNEL_ARG_POINTER || args.kinds[3] != KERNEL_ARG_U32 ||
+            args.kinds[4] != KERNEL_ARG_U32 || args.words[3] != problem[0] ||
+            args.words[4] < 1 || args.words[4] > 4294967295) {
+            cudaError = "unknown CUDA kernel or invalid launch shape or arguments"
+            return false
+        }
+        if (!this.pushContext()) return false
+        var ok = this.loadF32Kernel()
+        if (ok) {
+            // The driver consumes the parameter bytes during cuLaunchKernel.
+            val values = nativeByteBuffer(40)
+            val pointers = nativeByteBuffer(40)
+            val base = nativePointerAddress(values.address)
+            var index = 0
+            while (index < 5) {
+                values.storeI64(index * 8, args.words[index])
+                pointers.storePointer(index * 8, nativePointerFromAddress(base + index * 8))
+                index += 1
+            }
+            ok = cudaStatus(cuLaunchKernel(nativePointerFromAddress(this.f32Function),
+                u32((problem[0] + 3) / 4), 1, 1, 128, 1, 1, 0,
+                nativeNullPointer(), pointers.address, nativeNullPointer()), "cuLaunchKernel")
+        }
+        this.popContext()
+        ok
+    }
+
+    trusted fun synchronize(): bool {
+        if (!this.pushContext()) return false
+        val ok = cudaStatus(cuCtxSynchronize(), "cuCtxSynchronize")
+        this.popContext()
+        ok
+    }
+
+    trusted fun freeMemory(): int {
+        if (!this.pushContext()) return 0
+        val free = nativeI64Cell(0)
+        val total = nativeI64Cell(0)
+        val ok = cudaStatus(cuMemGetInfo_v2(free.address, total.address), "cuMemGetInfo")
+        this.popContext()
+        if (ok) free.load() else 0
+    }
+
+    trusted fun release(handle: int, bytes: int): void {
+        if (!this.pushContext()) return
+        if (cudaStatus(cuMemFree_v2(u64(handle)), "cuMemFree")) this.liveBuffers -= 1
+        this.popContext()
+    }
+}
+
+trusted fun cudaBackend(ordinal: i32 = 0): CudaBackend? {
+    val device = nativeI64Cell(0)
+    val major = nativeI64Cell(0)
+    val minor = nativeI64Cell(0)
+    val context = nativePointerCell(nativeNullPointer())
+    if (!cudaStatus(cuInit(0), "cuInit") ||
+        !cudaStatus(cuDeviceGet(device.address, ordinal), "cuDeviceGet") ||
+        !cudaStatus(cuDeviceGetAttribute(major.address, 75, i32(device.load())), "cuDeviceGetAttribute(major)") ||
+        !cudaStatus(cuDeviceGetAttribute(minor.address, 76, i32(device.load())), "cuDeviceGetAttribute(minor)") ||
+        !cudaStatus(cuCtxCreate_v2(context.address, 0, i32(device.load())), "cuCtxCreate")) return null
+    val address = nativePointerAddress(context.load())
+    if (!cudaStatus(cuCtxPopCurrent_v2(context.address), "cuCtxPopCurrent")) {
+        cuCtxDestroy_v2(nativePointerFromAddress(address))
+        return null
+    }
+    CudaBackend(address, "compute_${major.load()}${minor.load()}")
+}

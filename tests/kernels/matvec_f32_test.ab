@@ -1,0 +1,76 @@
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "abla/float"
+import "abla/float/text"
+import "abla/io"
+import "abla/math"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+trusted fun testMatvec(backend: Backend, rows: int, cols: int): bool {
+    val weights = nativeByteBuffer(rows * cols * 4)
+    val input = nativeByteBuffer(cols * 4)
+    val output = nativeByteBuffer(rows * 4)
+    val w = backend.allocate(weights.capacity)
+    val x = backend.allocate(input.capacity)
+    val y = backend.allocate(output.capacity)
+    if (w == null || x == null || y == null) return false
+
+    val wAddress = nativePointerAddress(weights.address)
+    val xAddress = nativePointerAddress(input.address)
+    val yAddress = nativePointerAddress(output.address)
+    var col = 0
+    while (col < cols) {
+        ablaUnsafeStoreU32(nativePointerFromAddress(xAddress + 4 * col), int(f32ToBits(f32FromInt(col % 11 - 5) / 6.0)))
+        col += 1
+    }
+    var row = 0
+    while (row < rows) {
+        col = 0
+        while (col < cols) {
+            val value = f32FromInt((row * 19 + col * 13) % 37 - 18) / 11.0
+            ablaUnsafeStoreU32(nativePointerFromAddress(wAddress + 4 * (row * cols + col)), int(f32ToBits(value)))
+            col += 1
+        }
+        row += 1
+    }
+    if (!backend.upload(w, 0, wAddress, weights.capacity) ||
+        !backend.upload(x, 0, xAddress, input.capacity) ||
+        !backend.launch("matvec_f32", kernelArgs().pointer(w).pointer(x).pointer(y).u32(rows).u32(cols), [rows]) ||
+        !backend.download(y, 0, yAddress, output.capacity)) return false
+    row = 0
+    while (row < rows) {
+        var expected = 0.0
+        col = 0
+        while (col < cols) {
+            val weight = f32FromBits(u32(ablaUnsafeLoadU32(nativePointerFromAddress(wAddress + 4 * (row * cols + col)))))
+            val value = f32FromBits(u32(ablaUnsafeLoadU32(nativePointerFromAddress(xAddress + 4 * col))))
+            expected += f32ToF64(weight) * f32ToF64(value)
+            col += 1
+        }
+        val actual = f32FromBits(u32(ablaUnsafeLoadU32(nativePointerFromAddress(yAddress + 4 * row))))
+        // FP32 FMA and a different reduction order from the FP64 CPU sum.
+        if (!(fabs(f32ToF64(actual) - expected) <= 0.00001 + fabs(expected) * 0.000002)) {
+            eprintln("row ${row}: expected ${expected}, got ${actual}")
+            return false
+        }
+        row += 1
+    }
+    true
+}
+
+fun main: int {
+    val backend = cudaBackend()
+    if (backend == null) {
+        eprintln(cudaLastError())
+        return 1
+    }
+    val passed = testMatvec(backend, 7, 97) && testMatvec(backend, 37, 1152)
+    val closed = backend.close()
+    if (!passed || !closed) {
+        eprintln(cudaLastError())
+        return 1
+    }
+    println("CUDA FP32 matvec matches FP64 CPU reference (7x97 and 37x1152)")
+    0
+}
