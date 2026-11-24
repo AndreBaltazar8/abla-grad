@@ -2,6 +2,7 @@ import "backend.ab"
 import "../kernels/matvec_f32.ab"
 import "../kernels/elementwise.ab"
 import "../kernels/inkling_small.ab"
+import "../kernels/step.ab"
 import "../kernels/matvec_k.ab"
 import "../kernels/matvec_nvfp4.ab"
 import "../kernels/matvec_q8_0.ab"
@@ -268,6 +269,17 @@ private fun cudaQ5IndexedShape(args: KernelArgs, problem: array<int>): bool =
 private fun cudaQ6IndexedShape(args: KernelArgs, problem: array<int>): bool =
     cudaIndexedShape(args, problem, 256, 210)
 
+// ---- kernels reading the per-token `step` buffer (ablac-60-2; sources in src/kernels/step.ab) ----
+private val cudaArgsKvStoreStep = [
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
+    KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32
+]
+private val cudaArgsScaleTau = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_F32, KERNEL_ARG_F32, KERNEL_ARG_U32]
+private val cudaArgsStepAdvance = [KERNEL_ARG_POINTER]
+private fun cudaKvStoreStepShape(args: KernelArgs, problem: array<int>): bool = args.words[5] * args.words[6] == problem[0]
+private fun cudaScaleTauShape(args: KernelArgs, problem: array<int>): bool = args.words[4] == problem[0]
+private fun cudaStepAdvanceShape(args: KernelArgs, problem: array<int>): bool = problem[0] == 1
+
 private val cudaKernels = [
     CudaKernelSpec("matvec_f32", kernelMatvecF32, 4, 128, cudaMatvecArguments, cudaF32Shape),
     CudaKernelSpec("matvec_q4_k", kernelMatvecK, 4, 128, cudaMatvecArguments, cudaKQuantShape),
@@ -313,7 +325,11 @@ private val cudaKernels = [
     CudaKernelSpec("moe_route", kernelMoeRoute, 1, 1, cudaArgsMoeRoute, cudaMoeRouteShape, 1, 1),
     CudaKernelSpec("rel_table", kernelRelTable, 256, 256, cudaArgsRelTable, cudaRelTableShape),
     CudaKernelSpec("conv_step", kernelConvStep, 256, 256, cudaArgsConvStep, cudaConvStepShape, 1, 3),
-    CudaKernelSpec("depth_mix", kernelDepthMix, 1, 256, cudaArgsDepthMix, cudaDepthMixShape)
+    CudaKernelSpec("depth_mix", kernelDepthMix, 1, 256, cudaArgsDepthMix, cudaDepthMixShape),
+    // step-buffer kernels (60-2)
+    CudaKernelSpec("kv_store_step", kernelKvStoreStep, 256, 256, cudaArgsKvStoreStep, cudaKvStoreStepShape),
+    CudaKernelSpec("scale_tau", kernelScaleTau, 256, 256, cudaArgsScaleTau, cudaScaleTauShape),
+    CudaKernelSpec("step_advance", kernelStepAdvance, 1, 1, cudaArgsStepAdvance, cudaStepAdvanceShape)
 ]
 
 private fun cudaKernelSpec(name: string): CudaKernelSpec? {

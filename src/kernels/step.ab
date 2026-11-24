@@ -1,0 +1,36 @@
+// Kernels that read the per-token scalars from the device `step` buffer, so a recorded (CUDA graph) token is the same sequence of launches for every token.
+// step is u32[4]: [0] token id, [1] position, [2] and [3] reserved. The host writes [0] and [1] before each replay (one small copy); `step_advance` and the
+// argmax kernel can move them on the device. Geometry: 256 threads, 256 items per block.
+
+// kv_store with pos = step[1]. k and v are [kvHead][headDim]; the caches are [kvHead][maxCtx][headDim].
+val kernelKvStoreStep = """
+extern "C" __global__ void kv_store_step(const float *k, const float *v, float *kCache, float *vCache, const unsigned *step,
+                                         unsigned nKvHead, unsigned headDim, unsigned maxCtx) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nKvHead * headDim) return;
+    unsigned pos = step[1];
+    unsigned head = i / headDim;
+    unsigned d = i % headDim;
+    unsigned long long at = ((unsigned long long)head * maxCtx + pos) * headDim + d;
+    kCache[at] = k[i];
+    vCache[at] = v[i];
+}
+"""
+
+// x *= tau(pos) where tau = 1 + alpha * log(max(1, (pos + 1) / floor)) (the full-attention layers' log-scaled positions), pos = step[1].
+val kernelScaleTau = """
+extern "C" __global__ void scale_tau(float *x, const unsigned *step, float logFloor, float alpha, unsigned n) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float ratio = ((float)step[1] + 1.0f) / logFloor;
+    float tau = 1.0f + alpha * logf(fmaxf(ratio, 1.0f));
+    x[i] *= tau;
+}
+"""
+
+// step[1] += 1. One thread. (The argmax kernel can write its result straight into step[0] when it is given `step` as its output pointer.)
+val kernelStepAdvance = """
+extern "C" __global__ void step_advance(unsigned *step) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) step[1] = step[1] + 1;
+}
+"""

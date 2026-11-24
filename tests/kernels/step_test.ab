@@ -1,0 +1,71 @@
+// The step-buffer kernels (kv_store_step, scale_tau, step_advance) against the position-argument kernels they replace.
+import "abla/io"
+import "abla/float"
+import "abla/float/text"
+import "abla/math"
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "support.ab"
+
+fun run(var backend: Backend): bool {
+    var ok = true
+    val step = uploadWords(backend, [77, 3, 0, 0]) ?? return false
+
+    // kv_store_step at step[1] == 3 must equal kv_store at position 3
+    val k = testSignal(16, 11)
+    val v = testSignal(16, 12)
+    val zeros: array<f32> = []
+    for (i in 0 until 80) zeros.append(0.0)
+    val dk = uploadFloats(backend, k) ?? return false
+    val dv = uploadFloats(backend, v) ?? return false
+    val a1 = uploadFloats(backend, zeros) ?? return false
+    val a2 = uploadFloats(backend, zeros) ?? return false
+    val b1 = uploadFloats(backend, zeros) ?? return false
+    val b2 = uploadFloats(backend, zeros) ?? return false
+    if (!backend.launch("kv_store", kernelArgs().pointer(dk).pointer(dv).pointer(a1).pointer(a2).u32(3).u32(2).u32(8).u32(5), [16])) return false
+    if (!backend.launch("kv_store_step", kernelArgs().pointer(dk).pointer(dv).pointer(b1).pointer(b2).pointer(step).u32(2).u32(8).u32(5), [16])) return false
+    val ek = downloadFloats(backend, a1, 80) ?? return false
+    val ev = downloadFloats(backend, a2, 80) ?? return false
+    val gk = downloadFloats(backend, b1, 80) ?? return false
+    val gv = downloadFloats(backend, b2, 80) ?? return false
+    for (i in 0 until 80) {
+        if (ek[i] != gk[i] || ev[i] != gv[i]) {
+            println("kv_store_step: differs from kv_store at $i")
+            ok = false
+        }
+    }
+
+    // scale_tau at pos 3: tau = 1 + alpha * log(max(1, 4 / floor)); floor 2 -> 1 + 0.5 * ln 2
+    val x = testSignal(100, 21)
+    val dx = uploadFloats(backend, x) ?? return false
+    if (!backend.launch("scale_tau", kernelArgs().pointer(dx).pointer(step).f32(2.0).f32(0.5).u32(100), [100])) return false
+    val scaled = downloadFloats(backend, dx, 100) ?? return false
+    val tau = 1.0 + 0.5 * log(2.0)
+    for (i in 0 until 100) {
+        val expected = f32ToF64(x[i]) * tau
+        if (!(fabs(f32ToF64(scaled[i]) - expected) <= 0.000001 + fabs(expected) * 0.000002)) {
+            println("scale_tau[$i]: expected $expected, got ${f32ToF64(scaled[i])}")
+            ok = false
+        }
+    }
+
+    // step_advance: position moves, token stays
+    if (!backend.launch("step_advance", kernelArgs().pointer(step), [1])) return false
+    if (!backend.launch("step_advance", kernelArgs().pointer(step), [1])) return false
+    val after = downloadWords(backend, step, 4) ?? return false
+    if (after[0] != 77 || after[1] != 5) {
+        println("step_advance: expected [77, 5], got [${after[0]}, ${after[1]}]")
+        ok = false
+    }
+    ok
+}
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    if (!run(backend)) {
+        println("step kernel test FAILED (${cudaLastError()})")
+        return 1
+    }
+    println("step kernel test passed")
+    0
+}

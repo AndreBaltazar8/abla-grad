@@ -257,3 +257,21 @@ fun opControlMix(
         .pointer(out, outOffset).u32(n),
     [n]
 )
+
+// ---- per-token step buffer (u32[4]: token, position, reserved x2); kernels in src/kernels/step.ab ----
+fun opKvStoreStep(
+    var backend: Backend, k: DeviceBuffer, kOffset: int, v: DeviceBuffer, vOffset: int,
+    kCache: DeviceBuffer, kCacheOffset: int, vCache: DeviceBuffer, vCacheOffset: int,
+    step: DeviceBuffer, nKvHead: int, headDim: int, maxCtx: int
+): bool = backend.launch(
+    "kv_store_step",
+    kernelArgs().pointer(k, kOffset).pointer(v, vOffset).pointer(kCache, kCacheOffset).pointer(vCache, vCacheOffset)
+        .pointer(step, 0).u32(nKvHead).u32(headDim).u32(maxCtx),
+    [nKvHead * headDim]
+)
+
+fun opScaleTau(var backend: Backend, x: DeviceBuffer, xOffset: int, step: DeviceBuffer, logFloor: f32, alpha: f32, n: int): bool =
+    backend.launch("scale_tau", kernelArgs().pointer(x, xOffset).pointer(step, 0).f32(logFloor).f32(alpha).u32(n), [n])
+
+fun opStepAdvance(var backend: Backend, step: DeviceBuffer): bool =
+    backend.launch("step_advance", kernelArgs().pointer(step, 0), [1])
