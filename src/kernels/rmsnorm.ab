@@ -11,11 +11,19 @@ extern "C" __global__ void rmsnorm(const float *x, const float *w, float *y,
     }
     sums[lane] = sum;
     __syncthreads();
-    for (unsigned width = blockDim.x / 2; width; width /= 2) {
-        if (lane < width) sums[lane] += sums[lane + width];
-        __syncthreads();
+    if (lane < 32) {
+        // Combine the first two levels in the same order as the old
+        // 128-thread tree. The rest of the tree stays inside one warp.
+        float lower = sums[lane] + sums[lane + 64];
+        float upper = sums[lane + 32] + sums[lane + 96];
+        sum = lower + upper;
+        for (unsigned width = 16; width; width /= 2) {
+            sum += __shfl_down_sync(0xffffffffu, sum, width);
+        }
+        if (lane == 0) sums[0] = rsqrtf(sum / float(n) + eps);
     }
-    float factor = rsqrtf(sums[0] / float(n) + eps);
+    __syncthreads();
+    float factor = sums[0];
     for (unsigned long long i = lane; i < n; i += blockDim.x) {
         float value = x[base + i] * factor;
         y[base + i] = w ? value * w[i] : value;
