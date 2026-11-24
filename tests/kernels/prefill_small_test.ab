@@ -1,0 +1,156 @@
+// The batched prefill kernels against the decode kernels run token by token: conv_seq + conv_history vs conv_step, depth_mix_batch vs depth_mix,
+// attention_prefill_rel vs attention_decode_rel, plus the small data-movement kernels against a CPU reference. Agreement is to f32 rounding (1e-4 relative).
+import "../../src/backend/backend.ab"
+import "device_test_support.ab"
+import "abla/float"
+import "abla/io"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+trusted fun fill(address: int, count: int, seed: int, scale: f32): void {
+    for (i in 0 until count) testStoreFloat(address, i, f32FromInt((i * 37 + seed * 11 + i / 13 * 5 + i / 101 * seed) % 61 - 30) * scale)
+}
+
+// Uploads `count` floats filled by `fill`; returns the device buffer.
+trusted fun deviceFloats(backend: Backend, count: int, seed: int, scale: f32): DeviceBuffer? {
+    val host = nativeByteBuffer(count * 4 + 8)
+    fill(nativePointerAddress(host.address), count, seed, scale)
+    val device = backend.allocate(count * 4 + 8)
+    if (device == null || !backend.upload(device, 0, nativePointerAddress(host.address), count * 4)) return null
+    device
+}
+
+trusted fun downloadFloats(backend: Backend, device: DeviceBuffer, offset: int, count: int): array<f32>? {
+    val host = nativeByteBuffer(count * 4 + 8)
+    if (!backend.download(device, offset, nativePointerAddress(host.address), count * 4)) return null
+    val values: array<f32> = []
+    for (i in 0 until count) values.append(testLoadFloat(nativePointerAddress(host.address), i))
+    values
+}
+
+fun same(label: string, a: array<f32>, b: array<f32>, relative: f64 = 0.0001, absolute: f64 = 0.00002): bool {
+    if (a.size != b.size) return false
+    for (i in 0 until a.size) {
+        if (!testNear(label, i, a[i], f32ToF64(b[i]), relative, absolute)) return false
+    }
+    true
+}
+
+fun testConv(backend: Backend): bool {
+    val channels = 70
+    val nConv = 4
+    val heads = 5
+    val tokens = 9
+    val scale = f64ToF32(0.35)
+    for (dynamic in [false, true]) {
+        val x = deviceFloats(backend, tokens * channels, 1, 0.03) ?? return false
+        val w = deviceFloats(backend, channels * nConv, 2, 0.02) ?? return false
+        val dyn = deviceFloats(backend, tokens * heads * nConv, 3, 0.02) ?? return false
+        val historyA = deviceFloats(backend, (nConv - 1) * channels, 4, 0.04) ?? return false
+        val historyB = deviceFloats(backend, (nConv - 1) * channels, 4, 0.04) ?? return false
+        val outA = deviceFloats(backend, tokens * channels, 5, 0.0) ?? return false
+        val outB = deviceFloats(backend, tokens * channels, 5, 0.0) ?? return false
+        val dynArg = if (dynamic) 1 else 0
+        var ok = true
+        if (dynamic) {
+            ok = backend.launch("conv_seq", kernelArgs().pointer(x).pointer(historyA).pointer(w).pointer(dyn).pointer(outA).u32(channels).u32(nConv).u32(heads).f32(scale).u32(tokens),
+                [channels, tokens])
+        } else {
+            ok = backend.launch("conv_seq", kernelArgs().pointer(x).pointer(historyA).pointer(w).u64(0).pointer(outA).u32(channels).u32(nConv).u32(heads).f32(scale).u32(tokens),
+                [channels, tokens])
+        }
+        ok = ok && backend.launch("conv_history", kernelArgs().pointer(x).pointer(historyA).u32(channels).u32(nConv).u32(tokens), [channels])
+        for (t in 0 until tokens) {
+            if (dynamic) {
+                ok = ok && backend.launch("conv_step", kernelArgs().pointer(x, t * channels * 4).pointer(historyB).pointer(w).pointer(dyn, t * heads * nConv * 4)
+                    .pointer(outB, t * channels * 4).u32(channels).u32(nConv).u32(heads).f32(scale), [channels])
+            } else {
+                ok = ok && backend.launch("conv_step", kernelArgs().pointer(x, t * channels * 4).pointer(historyB).pointer(w).u64(0)
+                    .pointer(outB, t * channels * 4).u32(channels).u32(nConv).u32(heads).f32(scale), [channels])
+            }
+        }
+        if (!ok) return false
+        val a = downloadFloats(backend, outA, 0, tokens * channels) ?? return false
+        val b = downloadFloats(backend, outB, 0, tokens * channels) ?? return false
+        val ha = downloadFloats(backend, historyA, 0, (nConv - 1) * channels) ?? return false
+        val hb = downloadFloats(backend, historyB, 0, (nConv - 1) * channels) ?? return false
+        if (!same("conv_seq out (dyn $dynArg)", a, b) || !same("conv_history (dyn $dynArg)", ha, hb)) return false
+    }
+    // fewer tokens than the history is long: the history keeps older entries
+    val x = deviceFloats(backend, 2 * channels, 6, 0.03) ?? return false
+    val w = deviceFloats(backend, channels * nConv, 2, 0.02) ?? return false
+    val historyA = deviceFloats(backend, (nConv - 1) * channels, 4, 0.04) ?? return false
+    val historyB = deviceFloats(backend, (nConv - 1) * channels, 4, 0.04) ?? return false
+    val outB = deviceFloats(backend, 2 * channels, 5, 0.0) ?? return false
+    var ok = backend.launch("conv_history", kernelArgs().pointer(x).pointer(historyA).u32(channels).u32(nConv).u32(2), [channels])
+    for (t in 0 until 2) {
+        ok = ok && backend.launch("conv_step", kernelArgs().pointer(x, t * channels * 4).pointer(historyB).pointer(w).u64(0).pointer(outB, t * channels * 4)
+            .u32(channels).u32(nConv).u32(heads).f32(scale), [channels])
+    }
+    if (!ok) return false
+    same("conv_history short", downloadFloats(backend, historyA, 0, (nConv - 1) * channels) ?? return false,
+        downloadFloats(backend, historyB, 0, (nConv - 1) * channels) ?? return false)
+}
+
+fun testDepthMix(backend: Backend): bool {
+    val n = 300
+    val nBank = 5
+    val nQuery = 3
+    val tokens = 6
+    val stride = 8 * n
+    val bank = deviceFloats(backend, tokens * stride, 7, 0.05) ?? return false
+    val cur = deviceFloats(backend, tokens * n, 8, 0.06) ?? return false
+    val queries = deviceFloats(backend, nQuery * n, 9, 0.04) ?? return false
+    val outA = deviceFloats(backend, tokens * nQuery * n, 0, 0.0) ?? return false
+    val outB = deviceFloats(backend, tokens * nQuery * n, 0, 0.0) ?? return false
+    var ok = backend.launch("depth_mix_batch", kernelArgs().pointer(bank).u32(stride).u32(nBank).pointer(cur).u32(n).pointer(queries).u32(nQuery).pointer(outA)
+        .u32(nQuery * n).u32(n).f32(f64ToF32(0.000001)).u32(tokens), [nQuery, tokens])
+    for (t in 0 until tokens) {
+        ok = ok && backend.launch("depth_mix", kernelArgs().pointer(bank, t * stride * 4).u32(nBank).pointer(cur, t * n * 4).pointer(queries).u32(nQuery)
+            .pointer(outB, t * nQuery * n * 4).u32(n).f32(f64ToF32(0.000001)), [nQuery])
+    }
+    if (!ok) return false
+    same("depth_mix_batch", downloadFloats(backend, outA, 0, tokens * nQuery * n) ?? return false, downloadFloats(backend, outB, 0, tokens * nQuery * n) ?? return false)
+}
+
+fun testAttention(backend: Backend): bool {
+    val nHead = 6
+    val nKvHead = 2
+    val dim = 128
+    val maxCtx = 64
+    val extent = 20
+    val firstPos = 10
+    val tokens = 7
+    val scale = f64ToF32(0.088)
+    for (window in [0, 8]) {
+        val q = deviceFloats(backend, tokens * nHead * dim, 10, 0.03) ?? return false
+        val k = deviceFloats(backend, nKvHead * maxCtx * dim, 11, 0.03) ?? return false
+        val v = deviceFloats(backend, nKvHead * maxCtx * dim, 12, 0.05) ?? return false
+        val table = deviceFloats(backend, tokens * nHead * (extent + 1), 13, 0.02) ?? return false
+        val outA = deviceFloats(backend, tokens * nHead * dim, 0, 0.0) ?? return false
+        val outB = deviceFloats(backend, tokens * nHead * dim, 0, 0.0) ?? return false
+        var ok = backend.launch("attention_prefill_rel", kernelArgs().pointer(q).pointer(k).pointer(v).pointer(table).pointer(outA).u32(nHead).u32(nKvHead).u32(dim)
+            .u32(window).u32(firstPos).u32(extent).u32(maxCtx).f32(scale), [nHead, tokens])
+        for (t in 0 until tokens) {
+            val pos = firstPos + t
+            val first = if (window != 0 && pos + 1 > window) pos + 1 - window else 0
+            ok = ok && backend.launch("attention_decode_rel", kernelArgs().pointer(q, t * nHead * dim * 4).pointer(k).pointer(v)
+                .pointer(table, t * nHead * (extent + 1) * 4).pointer(outB, t * nHead * dim * 4).u32(nHead).u32(nKvHead).u32(dim).u32(first).u32(pos).u32(pos)
+                .u32(extent).u32(maxCtx).f32(scale), [nHead])
+        }
+        val outC = deviceFloats(backend, tokens * nHead * dim, 0, 0.0) ?? return false
+        ok = ok && backend.launch("attention_prefill_tc", kernelArgs().pointer(q).pointer(k).pointer(v).pointer(table).pointer(outC).u32(nHead).u32(nKvHead)
+            .u32(window).u32(firstPos).u32(extent).u32(maxCtx).f32(scale).u32(tokens), [nHead, (tokens + 31) / 32])
+        if (!ok) return false
+        // f16 inputs and probabilities: about 2^-11 per term
+        if (!same("attention_prefill_tc window $window", downloadFloats(backend, outC, 0, tokens * nHead * dim) ?? return false,
+            downloadFloats(backend, outB, 0, tokens * nHead * dim) ?? return false, 0.004, 0.0004)) return false
+        if (!same("attention_prefill_rel window $window", downloadFloats(backend, outA, 0, tokens * nHead * dim) ?? return false,
+            downloadFloats(backend, outB, 0, tokens * nHead * dim) ?? return false)) return false
+    }
+    true
+}
+
+fun verify(backend: Backend): bool = testConv(backend) && testDepthMix(backend) && testAttention(backend)
+
+fun main: int = runCudaKernelTest("conv_seq, depth_mix_batch, attention_prefill_rel (prefill)", verify)

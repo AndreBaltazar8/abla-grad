@@ -1,0 +1,55 @@
+// Throughput of the prefill matmul kernels on shapes Inkling uses (tokens = 512): TFLOPS = 2 * rows * cols * tokens / time.
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "../kernels/device_test_support.ab"
+import "abla/float"
+import "abla/float/text"
+import "abla/io"
+import "abla/process/time"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+trusted fun benchFillBytes(backend: Backend, device: DeviceBuffer): bool {
+    val host = nativeByteBuffer(device.bytes)
+    val address = nativePointerAddress(host.address)
+    for (i in 0 until device.bytes / 4) ablaUnsafeStoreU32(nativePointerFromAddress(address + i * 4), (i * 2654435761 + (i / 9) * 40503) & 0xffffffff)
+    backend.upload(device, 0, address, device.bytes)
+}
+
+trusted fun benchMatmul(backend: Backend, kind: string, blockElements: int, blockBytes: int, rows: int, cols: int, tokens: int): bool {
+    val w = backend.allocate(rows * (cols / blockElements) * blockBytes)
+    val x = backend.allocate(tokens * cols * 4)
+    val y = backend.allocate(tokens * rows * 4)
+    if (w == null || x == null || y == null) return false
+    // Reasonable activations; weights are random bytes (scales may be odd, the timing does not care).
+    val host = nativeByteBuffer(x.bytes)
+    val address = nativePointerAddress(host.address)
+    for (i in 0 until x.bytes / 4) testStoreFloat(address, i, f32FromInt((i * 19 + i / 37 * 11) % 127 - 63) / 64.0)
+    if (!backend.upload(x, 0, address, x.bytes) || !benchFillBytes(backend, w)) return false
+    val args = kernelArgs().pointer(w).pointer(x).pointer(y).u32(rows).u32(cols).u32(tokens)
+    val problem = [rows, (tokens + 63) / 64]
+    val name = "matmul_$kind"
+    for (warmup in 0 until 5) if (!backend.launch(name, args, problem)) return false
+    if (!backend.synchronize()) return false
+    val repeats = 50
+    val start = monotonicNanoseconds()
+    for (i in 0 until repeats) if (!backend.launch(name, args, problem)) return false
+    if (!backend.synchronize()) return false
+    val elapsed = monotonicNanoseconds() - start
+    val seconds = f64FromInt(elapsed) / f64FromInt(repeats) / 1000000000.0
+    val flops = 2.0 * f64FromInt(rows) * f64FromInt(cols) * f64FromInt(tokens)
+    println("$name rows=$rows cols=$cols tokens=$tokens: ${seconds * 1000000.0} us, ${flops / seconds / 1000000000000.0} TFLOPS")
+    true
+}
+
+fun main: int {
+    val backend = cudaBackend()
+    if (backend == null) return 1
+    var ok = benchMatmul(backend, "q8_0", 32, 34, 3072, 2304, 512)
+    ok = ok && benchMatmul(backend, "q8_0", 32, 34, 2304, 3072, 512)
+    ok = ok && benchMatmul(backend, "nvfp4", 64, 36, 2304, 2304, 512)
+    ok = ok && benchMatmul(backend, "nvfp4", 64, 36, 2304, 1152, 512)
+    ok = ok && benchMatmul(backend, "nvfp4", 64, 36, 2304, 2304, 32)
+    if (!ok) eprintln("failed ${cudaLastError()}")
+    if (ok) 0 else 1
+}

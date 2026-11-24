@@ -12,6 +12,8 @@ import "../model/llama_config.ab"
 import "../model/inkling.ab"
 import "../model/inkling_config.ab"
 import "../compare/grdl.ab"
+import "logits_prefill.ab"
+import "../model/inkling_prefill.ab"
 
 private fun readIds(path: string): array<int>? {
     val result = Path(path).readTextResult()
@@ -43,6 +45,8 @@ fun cmdLogits(args: array<string>): int {
     var dumpDir = ""
     var useStep = false
     var noSplit = false
+    var prefill = false
+    var chunk = 512
     val positional: array<string> = []
     var index = 0
     while (index < args.size) {
@@ -57,6 +61,15 @@ fun cmdLogits(args: array<string>): int {
             index = index + 1
         } else if (args[index] == "--dump" && index + 1 < args.size) {
             dumpDir = args[index + 1]
+            index = index + 2
+        } else if (args[index] == "--prefill") {
+            prefill = true
+            index = index + 1
+        } else if (args[index] == "--scalar-attention") {
+            setPrefillTensorAttention(false)
+            index = index + 1
+        } else if (args[index] == "--chunk" && index + 1 < args.size) {
+            chunk = args[index + 1].parseInt() ?? 512
             index = index + 2
         } else if (args[index] == "--ctx" && index + 1 < args.size) {
             maxCtx = args[index + 1].parseInt() ?? 0
@@ -103,7 +116,11 @@ fun cmdLogits(args: array<string>): int {
             println("logits: could not clear the convolution state (${cudaLastError()})")
             return 1
         }
-        for (position in 0 until ids.size) {
+        if (prefill) {
+            val rows = inklingPrefillLogits(backend, model, ids, chunk) ?? return 1
+            for (value in rows) all.append(value)
+        }
+        for (position in 0 until (if (prefill) 0 else ids.size)) {
             if (!model.forward(backend, ids[position], position)) {
                 println("logits: ${inklingLastError()} (${cudaLastError()})")
                 return 1

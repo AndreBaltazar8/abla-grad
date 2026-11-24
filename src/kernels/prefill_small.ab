@@ -1,0 +1,351 @@
+import "attention_decode.ab"
+// Batched forms of Inkling's small kernels for prefill (docs/prefill.md): a chunk of T tokens goes through every op at once. Activations are f32
+// [token][...]; the per-token states (the block bank) are [token][block][n]. One CUDA C source string per kernel (sources share nothing).
+
+// Embedding rows of Q8_0 for T token ids: out[t][col]. problem [cols, count].
+val kernelPrefillGatherQ8_0 = """
+extern "C" __global__ void gather_rows_q8_0(const unsigned char *table, const unsigned *ids, float *out, unsigned cols, unsigned count) {
+    unsigned col = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned t = blockIdx.y;
+    if (col >= cols || t >= count) return;
+    unsigned long long block = static_cast<unsigned long long>(ids[t]) * (cols / 32) + col / 32;
+    const unsigned char *packed = table + block * 34;
+    unsigned short bits = static_cast<unsigned short>(packed[0] | (packed[1] << 8));
+    float scale;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(scale) : "h"(bits));
+    out[static_cast<unsigned long long>(t) * cols + col] = scale * float(static_cast<signed char>(packed[2 + col % 32]));
+}
+"""
+
+// Strided row copy: dst[r * dstStride + i] = src[r * srcStride + i] for i < count, r < rows. problem [count, rows].
+val kernelPrefillCopyRows = """
+extern "C" __global__ void copy_rows(const float *src, unsigned srcStride, float *dst, unsigned dstStride, unsigned count, unsigned rows) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned r = blockIdx.y;
+    if (i >= count || r >= rows) return;
+    dst[static_cast<unsigned long long>(r) * dstStride + i] = src[static_cast<unsigned long long>(r) * srcStride + i];
+}
+"""
+
+// depth_mix for T tokens (docs/kernels.md depth_mix): token t's states are bank[t * bankStride + s * n] (s < nBank) then cur[t * curStride].
+// Query q of token t goes to out[t * outStride + q * n]. problem [nQuery, tokens]; one block of 256 threads per (query, token); nBank + 1 <= 64.
+val kernelPrefillDepthMix = """
+extern "C" __global__ void depth_mix_batch(const float *bank, unsigned bankStride, unsigned nBank, const float *cur, unsigned curStride,
+                                           const float *queries, unsigned nQuery, float *out, unsigned outStride, unsigned n, float eps,
+                                           unsigned tokens) {
+    unsigned q = blockIdx.x;
+    unsigned t = blockIdx.y;
+    if (q >= nQuery || t >= tokens || nBank + 1 > 64) return;
+    __shared__ float partialA[256];
+    __shared__ float partialB[256];
+    __shared__ float scores[64];
+    __shared__ float inverse[64];
+    const float *tokenBank = bank + static_cast<unsigned long long>(t) * bankStride;
+    const float *tokenCur = cur + static_cast<unsigned long long>(t) * curStride;
+    unsigned states = nBank + 1;
+    const float *query = queries + static_cast<unsigned long long>(q) * n;
+    for (unsigned s = 0; s < states; ++s) {
+        const float *state = s < nBank ? tokenBank + static_cast<unsigned long long>(s) * n : tokenCur;
+        float sumSquares = 0.0f;
+        float dot = 0.0f;
+        for (unsigned j = threadIdx.x; j < n; j += blockDim.x) {
+            float v = state[j];
+            sumSquares += v * v;
+            dot += v * query[j];
+        }
+        partialA[threadIdx.x] = sumSquares;
+        partialB[threadIdx.x] = dot;
+        __syncthreads();
+        for (unsigned width = blockDim.x / 2; width; width /= 2) {
+            if (threadIdx.x < width) {
+                partialA[threadIdx.x] += partialA[threadIdx.x + width];
+                partialB[threadIdx.x] += partialB[threadIdx.x + width];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            float inv = rsqrtf(partialA[0] / float(n) + eps);
+            inverse[s] = inv;
+            scores[s] = partialB[0] * inv / sqrtf(float(n));
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float maximum = scores[0];
+        for (unsigned s = 1; s < states; ++s) maximum = fmaxf(maximum, scores[s]);
+        float total = 0.0f;
+        for (unsigned s = 0; s < states; ++s) {
+            scores[s] = expf(scores[s] - maximum);
+            total += scores[s];
+        }
+        for (unsigned s = 0; s < states; ++s) scores[s] = scores[s] / total * inverse[s];
+    }
+    __syncthreads();
+    float *result = out + static_cast<unsigned long long>(t) * outStride + static_cast<unsigned long long>(q) * n;
+    for (unsigned j = threadIdx.x; j < n; j += blockDim.x) {
+        float sum = 0.0f;
+        for (unsigned s = 0; s < states; ++s) {
+            const float *state = s < nBank ? tokenBank + static_cast<unsigned long long>(s) * n : tokenCur;
+            sum += scores[s] * state[j];
+        }
+        result[j] = sum;
+    }
+}
+"""
+
+// The short causal convolution over a sequence (docs/inkling-graph.md `convolve`). The sequence is the history (nConv - 1 inputs, oldest first)
+// followed by x[0 .. tokens); token t's window is entries t .. t + nConv - 1 of it. out[t][c] = (x + sum_k w[c*nConv + k] * window[k]
+// + sum_lag dyn[t][head(c)][lag] * window[nConv - 1 - lag]) * outScale. x and out must not overlap. conv_history then keeps the last nConv - 1 entries.
+// problem [channels, tokens].
+val kernelPrefillConv = """
+extern "C" __global__ void conv_seq(const float *x, const float *history, const float *w, const float *dyn, float *out,
+                                    unsigned channels, unsigned nConv, unsigned heads, float outScale, unsigned tokens) {
+    unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned t = blockIdx.y;
+    if (c >= channels || t >= tokens || nConv > 64) return;
+    float window[64];
+    for (unsigned k = 0; k < nConv; ++k) {
+        unsigned index = t + k;
+        window[k] = index + 1 < nConv ? history[static_cast<unsigned long long>(index) * channels + c]
+                                      : x[static_cast<unsigned long long>(index + 1 - nConv) * channels + c];
+    }
+    float sum = window[nConv - 1];
+    for (unsigned k = 0; k < nConv; ++k) sum += w[static_cast<unsigned long long>(c) * nConv + k] * window[k];
+    if (dyn) {
+        unsigned head = c / (channels / heads);
+        const float *taps = dyn + (static_cast<unsigned long long>(t) * heads + head) * nConv;
+        for (unsigned lag = 0; lag < nConv; ++lag) sum += taps[lag] * window[nConv - 1 - lag];
+    }
+    out[static_cast<unsigned long long>(t) * channels + c] = sum * outScale;
+}
+"""
+
+val kernelPrefillConvHistory = """
+extern "C" __global__ void conv_history(const float *x, float *history, unsigned channels, unsigned nConv, unsigned tokens) {
+    unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels || nConv > 64) return;
+    float next[63];
+    for (unsigned k = 0; k + 1 < nConv; ++k) {
+        unsigned index = tokens + k;
+        next[k] = index + 1 < nConv ? history[static_cast<unsigned long long>(index) * channels + c]
+                                    : x[static_cast<unsigned long long>(index + 1 - nConv) * channels + c];
+    }
+    for (unsigned k = 0; k + 1 < nConv; ++k) history[static_cast<unsigned long long>(k) * channels + c] = next[k];
+}
+"""
+
+// l2clip over T * heads rows where the per-element scale repeats for every token: row r uses scale row (r % scaleRows). problem [rows].
+val kernelPrefillL2Clip = """
+extern "C" __global__ void l2clip_rows(const float *x, const float *scale, float *y, unsigned rows, unsigned dim, float t, unsigned scaleRows) {
+    unsigned row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + static_cast<unsigned long long>(row) * dim;
+    const float *sr = scale ? scale + static_cast<unsigned long long>(row % scaleRows) * dim : 0;
+    float *yr = y + static_cast<unsigned long long>(row) * dim;
+    __shared__ float partial[128];
+    float sum = 0.0f;
+    for (unsigned d = threadIdx.x; d < dim; d += blockDim.x) {
+        float v = sr ? xr[d] * sr[d] : xr[d];
+        sum += v * v;
+    }
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (unsigned width = blockDim.x / 2; width; width /= 2) {
+        if (threadIdx.x < width) partial[threadIdx.x] += partial[threadIdx.x + width];
+        __syncthreads();
+    }
+    float norm = sqrtf(partial[0]);
+    float factor = t / fmaxf(norm, t);
+    for (unsigned d = threadIdx.x; d < dim; d += blockDim.x) {
+        float v = sr ? xr[d] * sr[d] : xr[d];
+        yr[d] = v * factor;
+    }
+}
+"""
+
+// x[t][i] *= tau(firstPos + t) with tau(pos) = 1 + alpha * log(max(1, (pos + 1) / floor)) (double precision, as the decode path computes it).
+// problem [rowLen, tokens].
+val kernelPrefillScaleTau = """
+extern "C" __global__ void scale_tau_rows(float *x, unsigned rowLen, unsigned firstPos, unsigned floorValue, float alpha, unsigned tokens) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned t = blockIdx.y;
+    if (i >= rowLen || t >= tokens) return;
+    double ratio = (double(firstPos + t) + 1.0) / double(floorValue);
+    float tau = float(1.0 + double(alpha) * log(ratio > 1.0 ? ratio : 1.0));
+    x[static_cast<unsigned long long>(t) * rowLen + i] *= tau;
+}
+"""
+
+// Stores the K and V of tokens firstPos .. firstPos + tokens - 1 ([token][kvHead][headDim]) into the caches [kvHead][maxCtx][headDim]. problem [kvDim, tokens].
+val kernelPrefillKvStore = """
+extern "C" __global__ void kv_store_batch(const float *k, const float *v, float *kCache, float *vCache, unsigned firstPos,
+                                          unsigned nKvHead, unsigned headDim, unsigned maxCtx, unsigned tokens) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned t = blockIdx.y;
+    if (i >= nKvHead * headDim || t >= tokens) return;
+    unsigned head = i / headDim;
+    unsigned d = i % headDim;
+    unsigned long long at = (static_cast<unsigned long long>(head) * maxCtx + firstPos + t) * headDim + d;
+    kCache[at] = k[static_cast<unsigned long long>(t) * nKvHead * headDim + i];
+    vCache[at] = v[static_cast<unsigned long long>(t) * nKvHead * headDim + i];
+}
+"""
+
+// Router for T tokens: per token the decode path's moe_route (sigmoid, top k by p + bias with the lowest index winning ties, weights p / (sum + eps) * scale).
+// problem [tokens]; nExpert <= 256, k <= 64.
+val kernelPrefillMoeRoute = """
+extern "C" __global__ void moe_route_batch(const float *logits, const float *bias, unsigned nExpert, unsigned k, unsigned *ids, float *weights,
+                                           float normEps, float weightScale, unsigned tokens) {
+    unsigned t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= tokens || nExpert > 256 || k > 64) return;
+    const float *row = logits + static_cast<unsigned long long>(t) * nExpert;
+    float prob[256];
+    float sel[256];
+    bool used[256];
+    for (unsigned i = 0; i < nExpert; ++i) {
+        prob[i] = 1.0f / (1.0f + expf(-row[i]));
+        sel[i] = prob[i] + (bias ? bias[i] : 0.0f);
+        used[i] = false;
+    }
+    float chosen[64];
+    float sum = 0.0f;
+    for (unsigned s = 0; s < k; ++s) {
+        int best = -1;
+        for (unsigned i = 0; i < nExpert; ++i) {
+            if (!used[i] && (best < 0 || sel[i] > sel[best])) best = int(i);
+        }
+        used[best] = true;
+        ids[static_cast<unsigned long long>(t) * k + s] = unsigned(best);
+        chosen[s] = prob[best];
+        sum += prob[best];
+    }
+    for (unsigned s = 0; s < k; ++s) weights[static_cast<unsigned long long>(t) * k + s] = chosen[s] / (sum + normEps) * weightScale;
+}
+"""
+
+// Groups the (token, expert) pairs by expert. ids[t * k + s] is the s-th expert of token t (nPairs = tokens * k entries). Outputs: sortedToken[slot] = the
+// token of the pair at sorted position `slot`; slotOfPair[pair] = the sorted position of pair t * k + s; and the matmul plan (see pm_grouped): the group
+// offsets, the token-tile count and the (expert, first token) tile list (64 tokens per tile). One block of 1024 threads; the order inside a group is arbitrary. nExpert <= 256.
+val kernelPrefillMoeSort = """
+extern "C" __global__ void moe_sort(const unsigned *ids, unsigned nPairs, unsigned k, unsigned nExpert, unsigned tileSize, unsigned *sortedToken,
+                                    unsigned *slotOfPair, unsigned *plan) {
+    __shared__ unsigned counts[256];
+    __shared__ unsigned starts[257];
+    for (unsigned e = threadIdx.x; e < nExpert; e += blockDim.x) counts[e] = 0;
+    __syncthreads();
+    // Pass 1: the number of pairs per expert.
+    for (unsigned p = threadIdx.x; p < nPairs; p += blockDim.x) atomicAdd(&counts[ids[p]], 1u);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned sum = 0;
+        for (unsigned e = 0; e < nExpert; ++e) {
+            starts[e] = sum;
+            plan[e] = sum;
+            sum += counts[e];
+        }
+        starts[nExpert] = sum;
+        plan[nExpert] = sum;
+        unsigned tiles = 0;
+        for (unsigned e = 0; e < nExpert; ++e) {
+            for (unsigned first = 0; first < counts[e]; first += tileSize) {
+                plan[nExpert + 2 + 2 * tiles] = e;
+                plan[nExpert + 3 + 2 * tiles] = first;
+                ++tiles;
+            }
+        }
+        plan[nExpert + 1] = tiles;
+    }
+    __syncthreads();
+    // Pass 2: every pair takes the next slot of its expert (the order inside a group is arbitrary: each row is computed independently).
+    __shared__ unsigned cursor[256];
+    for (unsigned e = threadIdx.x; e < nExpert; e += blockDim.x) cursor[e] = starts[e];
+    __syncthreads();
+    for (unsigned p = threadIdx.x; p < nPairs; p += blockDim.x) {
+        unsigned slot = atomicAdd(&cursor[ids[p]], 1u);
+        sortedToken[slot] = p / k;
+        slotOfPair[p] = slot;
+    }
+}
+"""
+
+// out[t][r] = sum_s weights[t * k + s] * down[slotOfPair[t * k + s]][r]. problem [rows, tokens].
+val kernelPrefillMoeCombine = """
+extern "C" __global__ void moe_combine_batch(const float *down, const unsigned *slotOfPair, const float *weights, float *out,
+                                             unsigned rows, unsigned k, unsigned tokens) {
+    unsigned r = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned t = blockIdx.y;
+    if (r >= rows || t >= tokens) return;
+    float sum = 0.0f;
+    for (unsigned s = 0; s < k; ++s) {
+        sum += weights[static_cast<unsigned long long>(t) * k + s] * down[static_cast<unsigned long long>(slotOfPair[t * k + s]) * rows + r];
+    }
+    out[static_cast<unsigned long long>(t) * rows + r] = sum;
+}
+"""
+
+// f32 weights, f32 arithmetic (the router: the experts it selects must not move because of a rounding): y[t][r] = sum_k x[t][k] * w[r][k].
+// 16 tokens x 16 rows per block, k in tiles of 32. problem [rows, tokenTiles] with tokenTiles = ceil(tokens / 16).
+val kernelPrefillMatmulF32Exact = """
+extern "C" __global__ void matmul_f32_exact(const float *w, const float *x, float *y, unsigned rows, unsigned cols, unsigned tokens) {
+    __shared__ float xs[16][33];
+    __shared__ float ws[16][33];
+    unsigned tx = threadIdx.x & 15u;
+    unsigned ty = threadIdx.x >> 4;
+    unsigned row = blockIdx.x * 16 + tx;
+    unsigned token = blockIdx.y * 16 + ty;
+    float sum = 0.0f;
+    for (unsigned k0 = 0; k0 < cols; k0 += 32) {
+        for (unsigned i = threadIdx.x; i < 16 * 32; i += blockDim.x) {
+            unsigned r = i >> 5;
+            unsigned c = i & 31u;
+            unsigned gr = blockIdx.x * 16 + r;
+            unsigned gt = blockIdx.y * 16 + r;
+            ws[r][c] = gr < rows && k0 + c < cols ? w[static_cast<unsigned long long>(gr) * cols + k0 + c] : 0.0f;
+            xs[r][c] = gt < tokens && k0 + c < cols ? x[static_cast<unsigned long long>(gt) * cols + k0 + c] : 0.0f;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned c = 0; c < 32; ++c) sum = fmaf(xs[ty][c], ws[tx][c], sum);
+        __syncthreads();
+    }
+    if (row < rows && token < tokens) y[static_cast<unsigned long long>(token) * rows + row] = sum;
+}
+"""
+
+// Attention for T tokens: the decode kernel (attention_decode_rel) with the token as the second grid dimension. Token t has absolute position
+// firstPos + t; it sees cache positions max(0, pos + 1 - window) .. pos (window 0 = all). q, out [token][head][dim]; table [token][head][extent + 1].
+// The K and V of the whole chunk must already be in the caches. problem [nHead, tokens].
+// The relative-position bias table for T tokens: table[hh][d] = sum_k relBias[d][k] * r[hh][k] - sinks[hh] for d < extent, table[hh][extent] = -sinks[hh],
+// hh over tokens * heads (r [hh][nRel], sinks [hh]). nRel a multiple of 4. problem [extent + 1, hh count]; the thread keeps r in registers (nRel <= 32).
+val kernelPrefillRelTable = """
+extern "C" __global__ void rel_table_rows(const float *relBias, const float *r, const float *sinks, float *table, unsigned nRel, unsigned extent, unsigned count) {
+    unsigned d = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned hh = blockIdx.y;
+    if (d > extent || hh >= count || nRel > 32) return;
+    float sum = 0.0f;
+    if (d < extent) {
+        const float4 *rv = reinterpret_cast<const float4 *>(r + static_cast<unsigned long long>(hh) * nRel);
+        const float4 *bv = reinterpret_cast<const float4 *>(relBias + static_cast<unsigned long long>(d) * nRel);
+        for (unsigned i = 0; i < nRel / 4; ++i) {
+            float4 a = rv[i];
+            float4 b = bv[i];
+            sum = fmaf(a.x, b.x, sum);
+            sum = fmaf(a.y, b.y, sum);
+            sum = fmaf(a.z, b.z, sum);
+            sum = fmaf(a.w, b.w, sum);
+        }
+    }
+    table[static_cast<unsigned long long>(hh) * (extent + 1) + d] = sum - sinks[hh];
+}
+"""
+
+val kernelPrefillAttention = kernelAttentionDecode + """
+extern "C" __global__ void attention_prefill_rel(const float *q, const float *k, const float *v, const float *table, float *out,
+    unsigned nHead, unsigned nKvHead, unsigned dim, unsigned window, unsigned firstPos, unsigned extent, unsigned maxCtx, float scale) {
+    unsigned t = blockIdx.y;
+    unsigned pos = firstPos + t;
+    unsigned first = window != 0 && pos + 1 > window ? pos + 1 - window : 0;
+    attention<true>(q + static_cast<unsigned long long>(t) * nHead * dim, k, v, table + static_cast<unsigned long long>(t) * nHead * (extent + 1ull),
+                    out + static_cast<unsigned long long>(t) * nHead * dim, nHead, nKvHead, dim, first, pos, pos, extent, maxCtx, scale);
+}
+"""

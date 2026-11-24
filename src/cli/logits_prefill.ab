@@ -1,0 +1,116 @@
+// Inkling logits through the batched prefill (`abla-grad logits --prefill [--chunk N]`) and the prefill benchmark (`abla-grad prefill-bench`).
+import "abla/io"
+import "abla/integer"
+import "abla/process/time"
+import "abla/float"
+import "abla/float/text"
+import "../backend/backend.ab"
+import "../backend/cuda.ab"
+import "../gguf/reader.ab"
+import "../model/inkling.ab"
+import "../model/inkling_config.ab"
+import "../model/inkling_prefill.ab"
+
+// The logits of every position of `ids`, computed chunk by chunk with prefill; null on failure (the message is printed).
+fun inklingPrefillLogits(var backend: Backend, model: InklingModel, ids: array<int>, chunk: int): array<f32>? {
+    val ws = prefillWorkspace(backend, model.config, chunk, true)
+    if (ws == null) {
+        println("logits: ${inklingPrefillLastError()}")
+        return null
+    }
+    val all: array<f32> = []
+    var done = 0
+    while (done < ids.size) {
+        val count = if (ids.size - done < chunk) ids.size - done else chunk
+        val part: array<int> = []
+        for (i in 0 until count) part.append(ids[done + i])
+        if (!model.prefill(backend, ws, part, done)) {
+            println("logits: ${inklingPrefillLastError()} (${cudaLastError()})")
+            return null
+        }
+        for (row in 0 until count) {
+            val values = model.readPrefillLogits(backend, ws, row)
+            if (values == null) {
+                println("logits: ${inklingPrefillLastError()}")
+                return null
+            }
+            for (value in values) all.append(value)
+        }
+        done = done + count
+    }
+    all
+}
+
+private fun loadFailed(): int {
+    println("prefill-bench: ${inklingLastError()}")
+    1
+}
+
+// abla-grad prefill-bench <model.gguf> [--tokens N] [--chunk N] [--reps N] [--decode]: tokens per second of prompt processing (the logits of the last token).
+fun cmdPrefillBench(args: array<string>): int {
+    var tokens = 512
+    var chunk = 512
+    var reps = 3
+    var decode = false
+    var path = ""
+    var index = 0
+    while (index < args.size) {
+        if (args[index] == "--tokens" && index + 1 < args.size) {
+            tokens = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else if (args[index] == "--chunk" && index + 1 < args.size) {
+            chunk = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else if (args[index] == "--reps" && index + 1 < args.size) {
+            reps = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else if (args[index] == "--moe-tile" && index + 1 < args.size) {
+            setPrefillMoeTile(args[index + 1].parseInt() ?? 32)
+            index = index + 2
+        } else if (args[index] == "--decode") {
+            decode = true
+            index = index + 1
+        } else {
+            path = args[index]
+            index = index + 1
+        }
+    }
+    if (path == "" || tokens < 1 || chunk < 1 || reps < 1) {
+        println("usage: abla-grad prefill-bench <model.gguf> [--tokens N] [--chunk N] [--reps N] [--decode]")
+        return 2
+    }
+    val file = ggufOpen(path)
+    if (file == null) {
+        println("prefill-bench: ${ggufLastError()}")
+        return 2
+    }
+    val config = inklingConfigFrom(file)
+    if (config == null) {
+        println("prefill-bench: ${inklingConfigLastError()}")
+        return 2
+    }
+    var backend = cudaBackend() ?? return 2
+    var model = inklingLoad(backend, file, config, tokens + 8) ?? return loadFailed()
+    val ids: array<int> = []
+    for (i in 0 until tokens) ids.append((i * 7919 + 1013) % 150000 + 500)
+    val ws = if (decode) null else prefillWorkspace(backend, config, chunk, false)
+    if (!decode && ws == null) {
+        println("prefill-bench: ${inklingPrefillLastError()}")
+        return 1
+    }
+    for (rep in 0 until reps + 1) {
+        if (!model.reset(backend)) return 1
+        val start = monotonicNanoseconds()
+        if (decode) {
+            for (position in 0 until tokens) if (!model.forward(backend, ids[position], position)) return 1
+        } else if (ws != null && !model.prefill(backend, ws, ids, 0)) {
+            println("prefill-bench: ${inklingPrefillLastError()} (${cudaLastError()})")
+            return 1
+        }
+        if (!backend.synchronize()) return 1
+        val seconds = f64FromInt(monotonicNanoseconds() - start) / 1000000000.0
+        val label = if (rep == 0) "warmup" else "run $rep"
+        println("prefill-bench ($label): $tokens tokens in ${seconds * 1000.0} ms = ${f64FromInt(tokens) / seconds} tok/s")
+    }
+    0
+}

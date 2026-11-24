@@ -1,0 +1,69 @@
+// matmul_q8_0 and matmul_nvfp4 (prefill, tensor cores) against an f64 CPU reference. The kernel rounds x (and the Q8_0 product scale * q) to f16, so the
+// tolerance is 2e-3 of the sum of the absolute terms of each dot product (about 4 f16 roundings of 2^-11 each).
+import "../../src/backend/backend.ab"
+import "../gguf_quant_oracle.ab"
+import "device_test_support.ab"
+import "abla/float"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+trusted fun testPrefillMatmul(backend: Backend, kind: string, elements: int, blockBytes: int, decode: (string) -> array<f32>,
+    rows: int, blocks: int, tokens: int): bool {
+    val cols = blocks * elements
+    val rowBytes = blocks * blockBytes
+    val weights = nativeByteBuffer(rows * rowBytes)
+    val x = nativeByteBuffer(tokens * cols * 4)
+    val y = nativeByteBuffer(tokens * rows * 4)
+    val wa = nativePointerAddress(weights.address)
+    val xa = nativePointerAddress(x.address)
+    val ya = nativePointerAddress(y.address)
+    for (byte in 0 until weights.capacity) weights.store(byte, (byte * 29 + byte / 17 * 11 + byte / 7) & 255)
+    for (block in 0 until rows * blocks) {
+        val p = block * blockBytes
+        if (kind == "q8_0") {
+            weights.store(p, (block * 17) & 255)
+            weights.store(p + 1, if (block % 3 == 0) 0xb4 else 0x34)
+        } else if (block % 5 == 0) {
+            weights.store(p, 0x38)
+            weights.store(p + 1, 0x7f)
+            weights.store(p + 2, 0x00)
+            weights.store(p + 3, 0x44)
+        }
+    }
+    for (index in 0 until tokens * cols) testStoreFloat(xa, index, f32FromInt((index * 17 + index / 7 + index / cols * 5) % 37 - 18) / 32.0)
+    val dw = backend.allocate(weights.capacity)
+    val dx = backend.allocate(x.capacity)
+    val dy = backend.allocate(y.capacity)
+    if (dw == null || dx == null || dy == null) return false
+    if (!backend.upload(dw, 0, wa, weights.capacity) || !backend.upload(dx, 0, xa, x.capacity) ||
+        !backend.launch("matmul_${kind}", kernelArgs().pointer(dw).pointer(dx).pointer(dy).u32(rows).u32(cols).u32(tokens),
+            [rows, (tokens + 63) / 64]) ||
+        !backend.download(dy, 0, ya, y.capacity)) return false
+    for (row in 0 until rows) {
+        val decoded: array<f32> = []
+        for (block in 0 until blocks) {
+            val values = decode(testBlockBytes(wa + row * rowBytes + block * blockBytes, blockBytes))
+            if (values.size != elements) return false
+            for (value in values) decoded.append(value)
+        }
+        for (token in 0 until tokens) {
+            var expected = 0.0
+            var magnitude = 0.0
+            for (col in 0 until cols) {
+                val term = f32ToF64(decoded[col]) * f32ToF64(testLoadFloat(xa, token * cols + col))
+                expected += term
+                magnitude += if (term < 0.0) -term else term
+            }
+            if (!testNear("matmul_${kind} token $token", row, testLoadFloat(ya, token * rows + row), expected, 0.0, 0.002 * magnitude + 0.00001)) return false
+        }
+    }
+    true
+}
+
+fun verify(backend: Backend): bool =
+    testPrefillMatmul(backend, "q8_0", 32, 34, oracleQ8_0, 150, 3, 70) &&
+    testPrefillMatmul(backend, "nvfp4", 64, 36, oracleNvfp4, 150, 3, 70) &&
+    testPrefillMatmul(backend, "q8_0", 32, 34, oracleQ8_0, 128, 9, 64) &&
+    testPrefillMatmul(backend, "nvfp4", 64, 36, oracleNvfp4, 258, 2, 5)
+
+fun main: int = runCudaKernelTest("matmul_q8_0 and matmul_nvfp4 (prefill)", verify)

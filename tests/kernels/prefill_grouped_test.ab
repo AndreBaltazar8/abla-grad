@@ -1,0 +1,134 @@
+// moe_sort and the expert-grouped matmuls (nvfp4, q8_0, q5_k; 64- and 32-token tiles) against an f64 CPU reference: for every (token, slot) pair the row at its
+// sorted position must hold expertScale * dot(expert weights row, token's x). Includes an expert with no tokens and one with several tiles.
+import "../../src/backend/backend.ab"
+import "../gguf_quant_oracle.ab"
+import "device_test_support.ab"
+import "abla/float"
+import "abla/io"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+trusted fun loadU32(address: int, index: int): int = ablaUnsafeLoadU32(nativePointerFromAddress(address + index * 4))
+
+trusted fun storeU32(address: int, index: int, value: int): void = ablaUnsafeStoreU32(nativePointerFromAddress(address + index * 4), value)
+
+fun groupedLaunch(backend: Backend, name: string, w: DeviceBuffer, x: DeviceBuffer, xmap: DeviceBuffer, y: DeviceBuffer, scales: DeviceBuffer,
+    plan: DeviceBuffer, rows: int, cols: int, nExpert: int, stride: int, maxTiles: int): bool =
+    backend.launch(name, kernelArgs().pointer(w).pointer(x).pointer(xmap).pointer(y).pointer(scales).pointer(plan).u32(rows).u32(cols).u32(nExpert).u64(stride),
+        [rows, maxTiles])
+
+trusted fun testGrouped(backend: Backend, kind: string, elements: int, blockBytes: int, decode: (string) -> array<f32>, tile: int, identityMap: bool): bool {
+    val nExpert = 6
+    val k = 2
+    val tokens = 50
+    val rows = 70
+    val blocks = if (elements == 256) 1 else 3
+    val cols = blocks * elements
+    val rowBytes = blocks * blockBytes
+    val stride = rows * rowBytes + 32
+    val pairs = tokens * k
+    val weights = nativeByteBuffer(nExpert * stride)
+    val x = nativeByteBuffer(tokens * cols * 4)
+    val ids = nativeByteBuffer(pairs * 4)
+    val scales = nativeByteBuffer(nExpert * 4)
+    val wa = nativePointerAddress(weights.address)
+    val xa = nativePointerAddress(x.address)
+    val ia = nativePointerAddress(ids.address)
+    val sa = nativePointerAddress(scales.address)
+    for (byte in 0 until weights.capacity) weights.store(byte, (byte * 31 + byte / 19 * 7 + byte / 5) & 255)
+    for (expert in 0 until nExpert) {
+        for (block in 0 until rows * blocks) {
+            val p = expert * stride + block * blockBytes
+            if (kind == "q8_0") {
+                weights.store(p, (block * 17) & 255)
+                weights.store(p + 1, if (block % 3 == 0) 0xb4 else 0x34)
+            } else if (kind == "q5_k") {
+                weights.store(p, (block * 11) & 255)
+                weights.store(p + 1, 0x2c)
+                weights.store(p + 2, (block * 5) & 255)
+                weights.store(p + 3, 0x24)
+            } else if (block % 5 == 0) {
+                weights.store(p, 0x38)
+                weights.store(p + 1, 0x7f)
+                weights.store(p + 2, 0x00)
+                weights.store(p + 3, 0x44)
+            }
+        }
+        testStoreFloat(sa, expert, f32FromInt(expert - 2) / 2.0)
+    }
+    for (index in 0 until tokens * cols) testStoreFloat(xa, index, f32FromInt((index * 13 + index / 5 + index / cols * 3) % 29 - 14) / 32.0)
+    // routing: expert 5 gets no token; expert 0 gets most of them (several tiles at both tile sizes)
+    for (token in 0 until tokens) {
+        storeU32(ia, token * k, if (token % 5 == 0) 3 else 0)
+        storeU32(ia, token * k + 1, 1 + (token * 7) % 3)
+    }
+    val maxTiles = pairs / tile + nExpert
+    val planWords = nExpert + 2 + 2 * maxTiles
+    val dw = backend.allocate(weights.capacity)
+    val dx = backend.allocate(x.capacity)
+    val dids = backend.allocate(ids.capacity)
+    val dscales = backend.allocate(scales.capacity)
+    val dsorted = backend.allocate(pairs * 4)
+    val dslot = backend.allocate(pairs * 4)
+    val dplan = backend.allocate(planWords * 4)
+    val diota = backend.allocate(pairs * 4)
+    val dy = backend.allocate(pairs * rows * 4)
+    if (dw == null || dx == null || dids == null || dscales == null || dsorted == null || dslot == null || dplan == null || diota == null || dy == null) return false
+    val iota = nativeByteBuffer(pairs * 4)
+    for (i in 0 until pairs) storeU32(nativePointerAddress(iota.address), i, i)
+    val hostSlot = nativeByteBuffer(pairs * 4)
+    val hostSorted = nativeByteBuffer(pairs * 4)
+    val hostY = nativeByteBuffer(pairs * rows * 4)
+    if (!backend.upload(dw, 0, wa, weights.capacity) || !backend.upload(dx, 0, xa, x.capacity) || !backend.upload(dids, 0, ia, ids.capacity) ||
+        !backend.upload(dscales, 0, sa, scales.capacity) || !backend.upload(diota, 0, nativePointerAddress(iota.address), pairs * 4)) return false
+    if (!backend.launch("moe_sort", kernelArgs().pointer(dids).u32(pairs).u32(k).u32(nExpert).u32(tile).pointer(dsorted).pointer(dslot).pointer(dplan), [1])) return false
+    val suffix = if (tile == 32) "32" else ""
+    // with the identity map the x rows are the sorted rows themselves: use the first `pairs` rows of x (tokens * k >= tokens, so only the first `tokens` exist)
+    val launched = if (identityMap) groupedLaunch(backend, "matmul_${kind}_grouped${suffix}", dw, dx, diota, dy, dscales, dplan, rows, cols, nExpert, stride, maxTiles)
+        else groupedLaunch(backend, "matmul_${kind}_grouped${suffix}", dw, dx, dsorted, dy, dscales, dplan, rows, cols, nExpert, stride, maxTiles)
+    if (!launched ||
+        !backend.download(dslot, 0, nativePointerAddress(hostSlot.address), pairs * 4) ||
+        !backend.download(dsorted, 0, nativePointerAddress(hostSorted.address), pairs * 4) ||
+        !backend.download(dy, 0, nativePointerAddress(hostY.address), pairs * rows * 4)) return false
+    val sl = nativePointerAddress(hostSlot.address)
+    val so = nativePointerAddress(hostSorted.address)
+    val ya = nativePointerAddress(hostY.address)
+    for (pair in 0 until pairs) {
+        val expert = loadU32(ia, pair)
+        val slot = loadU32(sl, pair)
+        if (slot < 0 || slot >= pairs || loadU32(so, slot) != pair / k) {
+            eprintln("moe_sort: pair $pair: slot $slot does not point back to token ${pair / k}")
+            return false
+        }
+        // the source row of x for this slot: its token (gate/up style) or, with the identity map, the slot itself (down style; rows beyond `tokens` do not exist: skip)
+        val source = if (identityMap) slot else pair / k
+        if (source >= tokens) continue
+        for (row in 0 until rows) {
+            var expected = 0.0
+            var magnitude = 0.0
+            for (block in 0 until blocks) {
+                val values = decode(testBlockBytes(wa + expert * stride + row * rowBytes + block * blockBytes, blockBytes))
+                for (e in 0 until elements) {
+                    val term = f32ToF64(values[e]) * f32ToF64(testLoadFloat(xa, source * cols + block * elements + e))
+                    expected += term
+                    magnitude += if (term < 0.0) -term else term
+                }
+            }
+            val scale = f64FromInt(expert - 2) / 2.0
+            if (!testNear("matmul_${kind}_grouped$suffix pair $pair", row, testLoadFloat(ya, slot * rows + row), expected * scale, 0.0,
+                    0.002 * magnitude * (if (scale < 0.0) -scale else scale) + 0.00001)) return false
+        }
+    }
+    true
+}
+
+fun verify(backend: Backend): bool {
+    for (tile in [64, 32]) {
+        if (!testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, tile, false) || !testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, tile, true)) return false
+        if (!testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, tile, false) || !testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, tile, true)) return false
+        if (!testGrouped(backend, "q5_k", 256, 176, oracleQ5K, tile, false)) return false
+    }
+    true
+}
+
+fun main: int = runCudaKernelTest("moe_sort and matmul_*_grouped (prefill)", verify)

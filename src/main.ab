@@ -5,6 +5,7 @@ import "cli/info.ab"
 import "cli/logits.ab"
 import "cli/tokenize.ab"
 import "cli/compare_tensors.ab"
+import "cli/logits_prefill.ab"
 import "cli/generate.ab"
 import "cli/decode_bench.ab"
 
@@ -17,6 +18,7 @@ fun main: int {
     if (command == "info") return cmdInfo(args)
     if (command == "logits") return cmdLogits(args)
     if (command == "tokenize") return cmdTokenize(args)
+    if (command == "prefill-bench") return cmdPrefillBench(args)
     if (command == "generate") return cmdGenerate(args)
     if (command == "decode-bench") return cmdDecodeBench(args)
     if (command == "compare-tensors") return cmdCompareTensors(args)

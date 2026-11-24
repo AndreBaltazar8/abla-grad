@@ -1,0 +1,533 @@
+// Batched prefill for Inkling-2 (docs/prefill.md): `model.prefill(backend, ws, tokens, startPos, allLogits)` runs a chunk of prompt tokens through every
+// layer visit at once (the graph of docs/inkling-graph.md with each op over [token][...]) and leaves the model's state ready for `forward`: the KV
+// caches of positions startPos .. startPos + tokens - 1 and the short-convolution histories. Matrix products run on tensor cores (src/kernels/prefill_matmul.ab),
+// the MoE experts as one matmul per expert over the tokens routed to it. The result is the logits of the last token (or of every token with `allLogits`).
+import "abla/float"
+import "abla/math"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "../backend/backend.ab"
+import "../ops.ab"
+import "../gguf/quant.ab"
+import "inkling_config.ab"
+import "weights.ab"
+import "inkling.ab"
+
+private var prefillError = ""
+
+// Tokens per tile of the expert-grouped matmuls (64 or 32; the plan and the kernel must agree).
+private var prefillMoeTile = 32
+
+// false: the scalar attention kernel (f32 throughout), for A/B checks.
+private var prefillTensorAttention = true
+
+fun setPrefillTensorAttention(on: bool): void {
+    prefillTensorAttention = on
+}
+
+fun setPrefillMoeTile(tile: int): void {
+    prefillMoeTile = tile
+}
+
+fun inklingPrefillLastError(): string = prefillError
+
+// Device memory of a chunk of at most `chunk` tokens: named f32 (or u32) arrays inside one buffer.
+resource class PrefillWorkspace(
+    val chunk: int,
+    val allLogits: bool,
+    val offsets: Map<string, int>,
+    val buffer: DeviceBuffer,
+    // [chunk][nLayer + 2][nEmbd] depth-mixing states (the block bank) and the looped core's bank, one set per token
+    val blocks: DeviceBuffer,
+    val bank: DeviceBuffer
+)
+
+private fun wsAdd(var offsets: Map<string, int>, name: string, elements: int, at: int): int {
+    offsets.set(name, at)
+    at + alignUp(elements * 4)
+}
+
+fun prefillWorkspace(var backend: Backend, c: InklingConfig, chunk: int, allLogits: bool): PrefillWorkspace? {
+    prefillError = ""
+    val offsets: Map<string, int> = Map()
+    val n = c.nEmbd
+    val qDim = c.nHead * c.headDim
+    val kvDim = c.nHeadKv * c.headDim
+    val pairs = chunk * c.nExpertUsed
+    val maxTiles = pairs / 32 + c.nExpert
+    var at = 0
+    at = wsAdd(offsets, "tokenIds", chunk, at)
+    at = wsAdd(offsets, "x", chunk * n, at)
+    at = wsAdd(offsets, "inpSA", chunk * n, at)
+    at = wsAdd(offsets, "inputs", 3 * chunk * n, at)
+    at = wsAdd(offsets, "normed", 3 * chunk * n, at)
+    at = wsAdd(offsets, "mixed", 3 * chunk * n, at)
+    at = wsAdd(offsets, "q", chunk * qDim, at)
+    at = wsAdd(offsets, "kRaw", chunk * kvDim, at)
+    at = wsAdd(offsets, "vRaw", chunk * kvDim, at)
+    at = wsAdd(offsets, "k", chunk * kvDim, at)
+    at = wsAdd(offsets, "v", chunk * kvDim, at)
+    at = wsAdd(offsets, "r", chunk * c.nRel * c.nHead, at)
+    at = wsAdd(offsets, "kDyn", chunk * c.nConv * c.nHeadKv, at)
+    at = wsAdd(offsets, "vDyn", chunk * c.nConv * c.nHeadKv, at)
+    at = wsAdd(offsets, "sinks", chunk * c.nHead, at)
+    at = wsAdd(offsets, "table", chunk * c.nHead * (c.extent + 1), at)
+    at = wsAdd(offsets, "att", chunk * qDim, at)
+    at = wsAdd(offsets, "gate", chunk * qDim, at)
+    at = wsAdd(offsets, "oproj", chunk * n, at)
+    at = wsAdd(offsets, "ffnInp", chunk * n, at)
+    at = wsAdd(offsets, "moeLogits", chunk * c.nExpert, at)
+    at = wsAdd(offsets, "ids", pairs, at)
+    at = wsAdd(offsets, "weights", pairs, at)
+    at = wsAdd(offsets, "sortedToken", pairs, at)
+    at = wsAdd(offsets, "slotOfPair", pairs, at)
+    at = wsAdd(offsets, "iota", pairs, at)
+    at = wsAdd(offsets, "plan", c.nExpert + 2 + 2 * maxTiles, at)
+    at = wsAdd(offsets, "gu", pairs * 2 * c.nFfExp, at)
+    at = wsAdd(offsets, "act", pairs * c.nFfExp, at)
+    at = wsAdd(offsets, "down", pairs * n, at)
+    at = wsAdd(offsets, "moe", chunk * n, at)
+    at = wsAdd(offsets, "msgs", chunk * 4 * n, at)
+    at = wsAdd(offsets, "ctrlIn", chunk * 2 * n, at)
+    at = wsAdd(offsets, "ctrlGate", chunk * c.gateRank, at)
+    at = wsAdd(offsets, "ctrlGain", chunk * n, at)
+    at = wsAdd(offsets, "ctrlForget", chunk * n, at)
+    at = wsAdd(offsets, "ctrlOut", chunk * n, at)
+    at = wsAdd(offsets, "tmpA", chunk * n, at)
+    at = wsAdd(offsets, "tmpB", chunk * n, at)
+    at = wsAdd(offsets, "preludeOut", chunk * n, at)
+    at = wsAdd(offsets, "bankOut", chunk * n, at)
+    at = wsAdd(offsets, "logits", (if (allLogits) chunk else 1) * c.nVocabPadded, at)
+    val buffer = backend.allocate(at)
+    val blocks = backend.allocate(chunk * (c.nLayer + 2) * n * 4)
+    val bank = backend.allocate(chunk * (c.nLayer + 2) * n * 4)
+    if (buffer == null || blocks == null || bank == null) {
+        prefillError = "device memory for the prefill workspace (chunk $chunk) is not available"
+        return null
+    }
+    val workspace = PrefillWorkspace(chunk, allLogits, offsets, move(buffer), move(blocks), move(bank))
+    // iota[i] = i: the identity row map of the down projection
+    val host = nativeByteBuffer(pairs * 4 + 8)
+    prefillStoreIota(host, pairs)
+    val iotaOk = backend.upload(workspace.buffer, offsets.get("iota") ?? 0, nativePointerAddress(host.address), pairs * 4)
+    host.close()
+    if (!iotaOk) {
+        prefillError = "uploading the prefill workspace failed"
+        return null
+    }
+    workspace
+}
+
+private trusted fun prefillStoreIota(host: NativeByteBuffer, count: int): void {
+    val address = nativePointerAddress(host.address)
+    for (i in 0 until count) ablaUnsafeStoreU32(nativePointerFromAddress(address + 4 * i), i)
+}
+
+private fun PrefillWorkspace.o(name: string): int = this.offsets.get(name) ?? 0
+
+private fun InklingModel.wr(name: string): WeightRef = weightOf(this.plan, name)
+
+private fun InklingModel.hasWeight(name: string): bool = this.plan.refs.get(name) != null
+
+// One dense matrix product y[t][row] = sum_k w[row][k] * x[t][k] for `tokens` tokens of x at `xOffset` (bytes into the workspace buffer).
+private fun InklingModel.dense(var backend: Backend, ws: PrefillWorkspace, name: string, xOffset: int, yOffset: int, tokens: int, exact: bool = false): bool {
+    val ref = this.wr(name)
+    val kind = weightKind(ref.type)
+    var kernel = ""
+    var problem: array<int> = []
+    if (exact && kind == "f32") {
+        kernel = "matmul_f32_exact"
+        problem = [ref.rows, (tokens + 15) / 16]
+    } else if (kind == "q8_0" || kind == "nvfp4" || kind == "bf16" || kind == "f32") {
+        kernel = "matmul_$kind"
+        problem = [ref.rows, (tokens + 63) / 64]
+    } else {
+        prefillError = "no prefill matmul for ${ggmlTypeName(ref.type)} ($name)"
+        return false
+    }
+    backend.launch(kernel, kernelArgs().pointer(this.arena, ref.offset).pointer(ws.buffer, xOffset).pointer(ws.buffer, yOffset)
+        .u32(ref.rows).u32(ref.cols).u32(tokens), problem)
+}
+
+// rmsnorm of `tokens` rows of n values with the weight tensor `name` (null weight: plain), in place allowed.
+private fun InklingModel.normRows(var backend: Backend, ws: PrefillWorkspace, name: string, input: int, output: int, tokens: int): bool {
+    val ref = this.wr(name)
+    opRmsNorm(backend, ws.buffer, input, this.arena, ref.offset, ws.buffer, output, this.config.nEmbd, this.config.rmsEps, tokens)
+}
+
+private fun InklingModel.copyRows(var backend: Backend, src: DeviceBuffer, srcOffset: int, srcStride: int, dst: DeviceBuffer, dstOffset: int, dstStride: int,
+    count: int, rows: int): bool =
+    backend.launch("copy_rows", kernelArgs().pointer(src, srcOffset).u32(srcStride).pointer(dst, dstOffset).u32(dstStride).u32(count).u32(rows), [count, rows])
+
+// Depth mixing for every token of the chunk: states = blocks[t][0 .. nBlocks) (or `bankBuffer`) + cur[t]; nQuery queries; out[t][q][n] at `output`.
+private fun InklingModel.mixRows(var backend: Backend, ws: PrefillWorkspace, bankBuffer: DeviceBuffer, nBlocks: int, cur: int, queryName: string, nQuery: int,
+    output: int, outStride: int, tokens: int): bool {
+    val n = this.config.nEmbd
+    val ref = this.wr(queryName)
+    backend.launch("depth_mix_batch", kernelArgs().pointer(bankBuffer).u32((this.config.nLayer + 2) * n).u32(nBlocks).pointer(ws.buffer, cur).u32(n)
+        .pointer(this.arena, ref.offset).u32(nQuery).pointer(ws.buffer, output).u32(outStride).u32(n).f32(0.000001).u32(tokens), [nQuery, tokens])
+}
+
+// control(cur, message) for every token (loop passes > 0): cur - tanh(forget) cur + tanh(gain) message with the gates of physical layer `ip`.
+// `message` is token t's n values at messageBase + t * messageStride (floats), `cur` and `output` contiguous [t][n].
+private fun InklingModel.controlRows(var backend: Backend, ws: PrefillWorkspace, ip: int, which: string, cur: int, messageBase: int, messageStride: int,
+    output: int, tokens: int): bool {
+    val n = this.config.nEmbd
+    val down = this.wr("blk.$ip.loop_${which}_ctrl_down.weight")
+    val gain = this.wr("blk.$ip.loop_${which}_ctrl_gain.weight")
+    val forget = this.wr("blk.$ip.loop_${which}_ctrl_forget.weight")
+    val tmpA = ws.o("tmpA")
+    val tmpB = ws.o("tmpB")
+    val ctrlIn = ws.o("ctrlIn")
+    // contiguous copy of the message, then both normalized (weightless) into the [t][2n] controller input
+    var ok = this.copyRows(backend, ws.buffer, messageBase, messageStride, ws.buffer, tmpB, n, n, tokens)
+    ok = ok && opRmsNormPlain(backend, ws.buffer, cur, ws.buffer, tmpA, n, 0.000001, tokens)
+    ok = ok && this.copyRows(backend, ws.buffer, tmpA, n, ws.buffer, ctrlIn, 2 * n, n, tokens)
+    ok = ok && opRmsNormPlain(backend, ws.buffer, tmpB, ws.buffer, tmpA, n, 0.000001, tokens)
+    ok = ok && this.copyRows(backend, ws.buffer, tmpA, n, ws.buffer, ctrlIn + n * 4, 2 * n, n, tokens)
+    ok = ok && this.dense(backend, ws, "blk.$ip.loop_${which}_ctrl_down.weight", ctrlIn, ws.o("ctrlGate"), tokens)
+    ok = ok && this.dense(backend, ws, "blk.$ip.loop_${which}_ctrl_gain.weight", ws.o("ctrlGate"), ws.o("ctrlGain"), tokens)
+    ok = ok && this.dense(backend, ws, "blk.$ip.loop_${which}_ctrl_forget.weight", ws.o("ctrlGate"), ws.o("ctrlForget"), tokens)
+    ok && opControlMix(backend, ws.buffer, cur, ws.buffer, tmpB, ws.buffer, ws.o("ctrlGain"), ws.buffer, ws.o("ctrlForget"), ws.buffer, output, tokens * n)
+}
+
+// One layer visit for the whole chunk; returns the new block count or -1.
+private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, ip: int, visit: int, loopPass: int, nBank: int, firstPos: int, tokens: int,
+    nBlocks: int): int {
+    val c = this.config
+    val n = c.nEmbd
+    val nb = n * 4
+    val qDim = c.nHead * c.headDim
+    val kvDim = c.nHeadKv * c.headDim
+    val isSwa = !this.hasWeight("blk.$ip.attn_q_inp_norm.weight")
+    val extent = if (isSwa) c.nSwa else c.extent
+    val x = ws.o("x")
+    val inpSA = ws.o("inpSA")
+    val inputs = ws.o("inputs")
+    val normed = ws.o("normed")
+    val mixed = ws.o("mixed")
+    val rowBytes = tokens * nb
+    var blocks = nBlocks
+    var ok = opCopy(backend, ws.buffer, x, ws.buffer, inpSA, tokens * n)
+
+    // attention inputs
+    if (ip > 0) {
+        val nq = if (isSwa) 1 else 3
+        ok = ok && this.mixRows(backend, ws, ws.blocks, blocks, x, "blk.$ip.attn_res_query.weight", nq, mixed, nq * n, tokens)
+        for (j in 0 until 3) {
+            ok = ok && this.copyRows(backend, ws.buffer, mixed + (if (isSwa) 0 else j) * nb, nq * n, ws.buffer, inputs + j * ws.chunk * nb, n, n, tokens)
+        }
+    } else {
+        for (j in 0 until 3) ok = ok && opCopy(backend, ws.buffer, x, ws.buffer, inputs + j * ws.chunk * nb, tokens * n)
+    }
+    if (loopPass > 0) {
+        var j = 0
+        for (which in ["q", "k", "v"]) {
+            ok = ok && this.controlRows(backend, ws, ip, which, inputs + j * ws.chunk * nb, ws.o("msgs") + j * nb, 4 * n, ws.o("ctrlOut"), tokens)
+            ok = ok && opCopy(backend, ws.buffer, ws.o("ctrlOut"), ws.buffer, inputs + j * ws.chunk * nb, tokens * n)
+            j = j + 1
+        }
+    }
+    if (isSwa) {
+        for (j in 0 until 3) {
+            ok = ok && this.normRows(backend, ws, "blk.$ip.attn_norm.weight", inputs + j * ws.chunk * nb, normed + j * ws.chunk * nb, tokens)
+        }
+    } else {
+        ok = ok && this.normRows(backend, ws, "blk.$ip.attn_q_inp_norm.weight", inputs, normed, tokens)
+        ok = ok && this.normRows(backend, ws, "blk.$ip.attn_k_inp_norm.weight", inputs + ws.chunk * nb, normed + ws.chunk * nb, tokens)
+        ok = ok && this.normRows(backend, ws, "blk.$ip.attn_v_inp_norm.weight", inputs + 2 * ws.chunk * nb, normed + 2 * ws.chunk * nb, tokens)
+    }
+    val normedQ = normed
+    val normedK = normed + ws.chunk * nb
+    val normedV = normed + 2 * ws.chunk * nb
+    if (!ok) return -1
+
+    // projections
+    val q = ws.o("q")
+    val kRaw = ws.o("kRaw")
+    val vRaw = ws.o("vRaw")
+    val k = ws.o("k")
+    val v = ws.o("v")
+    val r = ws.o("r")
+    ok = this.dense(backend, ws, "blk.$ip.attn_q.weight", normedQ, q, tokens)
+    ok = ok && this.dense(backend, ws, "blk.$ip.attn_k.weight", normedK, kRaw, tokens)
+    ok = ok && this.dense(backend, ws, "blk.$ip.attn_v.weight", normedV, vRaw, tokens)
+    ok = ok && this.dense(backend, ws, "blk.$ip.attn_rel.weight", normedQ, r, tokens)
+    if (!isSwa) {
+        ok = ok && this.dense(backend, ws, "blk.$ip.attn_k_conv_proj.weight", normedK, ws.o("kDyn"), tokens)
+        ok = ok && this.dense(backend, ws, "blk.$ip.attn_v_conv_proj.weight", normedV, ws.o("vDyn"), tokens)
+    }
+    if (!ok) return -1
+
+    // short convolutions on K and V
+    val historyBytes = (c.nConv - 1) * (2 * kvDim + 2 * n) * 4
+    val historyBase = visit * historyBytes
+    val kHistory = historyBase
+    val vHistory = historyBase + (c.nConv - 1) * kvDim * 4
+    val aHistory = historyBase + (c.nConv - 1) * 2 * kvDim * 4
+    val fHistory = aHistory + (c.nConv - 1) * n * 4
+    val dynScale = f64ToF32(1.0 / sqrt(f64FromInt((if (isSwa) 1 else 2) * c.nConv + 1)))
+    val plainScale = f64ToF32(1.0 / sqrt(f64FromInt(c.nConv + 1)))
+    val kConv = this.wr("blk.$ip.attn_k_conv.weight")
+    val vConv = this.wr("blk.$ip.attn_v_conv.weight")
+    ok = this.convRows(backend, ws, kRaw, kHistory, kConv.offset, ws.o("kDyn"), !isSwa, k, kvDim, c.nHeadKv, dynScale, tokens)
+    ok = ok && this.convRows(backend, ws, vRaw, vHistory, vConv.offset, ws.o("vDyn"), !isSwa, v, kvDim, c.nHeadKv, dynScale, tokens)
+
+    // clip / normalize
+    val qClip = this.wr("blk.$ip.attn_q_clip.weight")
+    val relClip = this.wr("blk.$ip.attn_rel_clip.weight")
+    ok = ok && backend.launch("l2clip_rows", kernelArgs().pointer(ws.buffer, q).pointer(this.arena, qClip.offset).pointer(ws.buffer, q)
+        .u32(tokens * c.nHead).u32(c.headDim).f32(c.qkClip).u32(c.nHead), [tokens * c.nHead])
+    ok = ok && backend.launch("l2clip_rows", kernelArgs().pointer(ws.buffer, k).u64(0).pointer(ws.buffer, k)
+        .u32(tokens * c.nHeadKv).u32(c.headDim).f32(c.qkClip).u32(1), [tokens * c.nHeadKv])
+    ok = ok && opRmsNormPlain(backend, ws.buffer, v, ws.buffer, v, c.headDim, c.rmsEps, tokens * c.nHeadKv)
+    ok = ok && backend.launch("l2clip_rows", kernelArgs().pointer(ws.buffer, r).pointer(this.arena, relClip.offset).pointer(ws.buffer, r)
+        .u32(tokens * c.nHead).u32(c.nRel).f32(c.relClip).u32(c.nHead), [tokens * c.nHead])
+    if (!isSwa) {
+        ok = ok && backend.launch("scale_tau_rows", kernelArgs().pointer(ws.buffer, q).u32(qDim).u32(firstPos).u32(c.logFloor).f32(c.logAlpha).u32(tokens), [qDim, tokens])
+        ok = ok && backend.launch("scale_tau_rows", kernelArgs().pointer(ws.buffer, r).u32(c.nRel * c.nHead).u32(firstPos).u32(c.logFloor).f32(c.logAlpha).u32(tokens),
+            [c.nRel * c.nHead, tokens])
+    }
+    if (!ok) return -1
+
+    // relative-position bias table (sinks folded in), KV store, attention
+    val sinks = ws.o("sinks")
+    val table = ws.o("table")
+    val relBias = this.wr("blk.$ip.attn_rel_bias.weight")
+    ok = this.dense(backend, ws, "blk.$ip.attn_sink_proj.weight", normedQ, sinks, tokens)
+    ok = ok && backend.launch("rel_table_rows", kernelArgs().pointer(this.arena, relBias.offset).pointer(ws.buffer, r).pointer(ws.buffer, sinks)
+        .pointer(ws.buffer, table).u32(c.nRel).u32(extent).u32(tokens * c.nHead), [extent + 1, tokens * c.nHead])
+    val layerCacheBytes = c.nHeadKv * this.maxCtx * c.headDim * 4
+    ok = ok && backend.launch("kv_store_batch", kernelArgs().pointer(ws.buffer, k).pointer(ws.buffer, v).pointer(this.kCache, visit * layerCacheBytes)
+        .pointer(this.vCache, visit * layerCacheBytes).u32(firstPos).u32(c.nHeadKv).u32(c.headDim).u32(this.maxCtx).u32(tokens), [kvDim, tokens])
+    val scale = f64ToF32(1.0 / sqrt(f64FromInt(c.headDim)))
+    val att = ws.o("att")
+    if (!prefillTensorAttention) {
+        ok = ok && backend.launch("attention_prefill_rel", kernelArgs().pointer(ws.buffer, q).pointer(this.kCache, visit * layerCacheBytes)
+            .pointer(this.vCache, visit * layerCacheBytes).pointer(ws.buffer, table).pointer(ws.buffer, att).u32(c.nHead).u32(c.nHeadKv).u32(c.headDim)
+            .u32(if (isSwa) c.nSwa else 0).u32(firstPos).u32(extent).u32(this.maxCtx).f32(scale), [c.nHead, tokens])
+    } else {
+    ok = ok && backend.launch("attention_prefill_tc", kernelArgs().pointer(ws.buffer, q).pointer(this.kCache, visit * layerCacheBytes)
+        .pointer(this.vCache, visit * layerCacheBytes).pointer(ws.buffer, table).pointer(ws.buffer, att).u32(c.nHead).u32(c.nHeadKv)
+        .u32(if (isSwa) c.nSwa else 0).u32(firstPos).u32(extent).u32(this.maxCtx).f32(scale).u32(tokens), [c.nHead, (tokens + 31) / 32])
+    }
+    ok = ok && this.dense(backend, ws, "blk.$ip.attn_gate.weight", normedQ, ws.o("gate"), tokens)
+    ok = ok && opSigmoidMul(backend, ws.buffer, att, ws.buffer, ws.o("gate"), ws.buffer, att, tokens * qDim)
+    val oproj = ws.o("oproj")
+    ok = ok && this.dense(backend, ws, "blk.$ip.attn_output.weight", att, oproj, tokens)
+    val postConv = this.wr("blk.$ip.attn_post_conv.weight")
+    ok = ok && this.convRows(backend, ws, oproj, aHistory, postConv.offset, 0, false, x, n, 1, plainScale, tokens)
+    if (!ok) return -1
+
+    // block residual
+    if (ip % c.blockSize == 0) {
+        ok = this.copyRows(backend, ws.buffer, inpSA, n, ws.blocks, blocks * nb, (c.nLayer + 2) * n, n, tokens)
+        blocks = blocks + 1
+    } else {
+        ok = opAdd(backend, ws.buffer, inpSA, ws.buffer, x, ws.buffer, x, tokens * n)
+    }
+    val ffnInp = ws.o("ffnInp")
+    ok = ok && opCopy(backend, ws.buffer, x, ws.buffer, ffnInp, tokens * n)
+
+    // MoE
+    ok = ok && this.mixRows(backend, ws, ws.blocks, blocks, x, "blk.$ip.ffn_res_query.weight", 1, x, n, tokens)
+    if (loopPass > 0) {
+        ok = ok && this.controlRows(backend, ws, ip, "ffn", x, ws.o("msgs") + 3 * nb, 4 * n, ws.o("ctrlOut"), tokens)
+        ok = ok && opCopy(backend, ws.buffer, ws.o("ctrlOut"), ws.buffer, x, tokens * n)
+    }
+    ok = ok && this.normRows(backend, ws, "blk.$ip.ffn_norm.weight", x, x, tokens)
+    if (!ok) return -1
+    val pairs = tokens * c.nExpertUsed
+    val ids = ws.o("ids")
+    val weights = ws.o("weights")
+    val sortedToken = ws.o("sortedToken")
+    val slotOfPair = ws.o("slotOfPair")
+    val plan = ws.o("plan")
+    val bias = this.wr("blk.$ip.exp_probs_b.bias")
+    ok = this.dense(backend, ws, "blk.$ip.ffn_gate_inp.weight", x, ws.o("moeLogits"), tokens, true)
+    ok = ok && backend.launch("moe_route_batch", kernelArgs().pointer(ws.buffer, ws.o("moeLogits")).pointer(this.arena, bias.offset).u32(c.nExpert)
+        .u32(c.nExpertUsed).pointer(ws.buffer, ids).pointer(ws.buffer, weights).f32(0.00000000000000000001).f32(c.expertScale).u32(tokens), [tokens])
+    ok = ok && backend.launch("moe_sort", kernelArgs().pointer(ws.buffer, ids).u32(pairs).u32(c.nExpertUsed).u32(c.nExpert).u32(prefillMoeTile).pointer(ws.buffer, sortedToken)
+        .pointer(ws.buffer, slotOfPair).pointer(ws.buffer, plan), [1])
+    val guRef = this.wr("blk.$ip.ffn_gate_up_exps.weight")
+    val downRef = this.wr("blk.$ip.ffn_down_exps.weight")
+    val guKind = weightKind(guRef.type)
+    val downKind = weightKind(downRef.type)
+    if ((guKind != "nvfp4" && guKind != "q8_0" && guKind != "q5_k") || (downKind != "nvfp4" && downKind != "q8_0" && downKind != "q5_k")) {
+        prefillError = "no grouped prefill matmul for the expert types ${ggmlTypeName(guRef.type)} / ${ggmlTypeName(downRef.type)}"
+        return -1
+    }
+    val nFf = c.nFfExp
+    val maxTiles = pairs / prefillMoeTile + c.nExpert
+    val guScales = this.wr("blk.$ip.ffn_gate_up_exps.scale")
+    val downScales = this.wr("blk.$ip.ffn_down_exps.scale")
+    val guStride = ggmlRowBytes(guRef.type, guRef.cols) * 2 * nFf
+    val downStride = ggmlRowBytes(downRef.type, downRef.cols) * n
+    ok = ok && this.grouped(backend, ws, guKind, guRef.offset, x, sortedToken, ws.o("gu"), this.hasWeight("blk.$ip.ffn_gate_up_exps.scale"), guScales.offset, plan,
+        2 * nFf, n, c.nExpert, guStride, maxTiles)
+    ok = ok && opSitu(backend, ws.buffer, ws.o("gu"), ws.buffer, ws.o("act"), pairs, nFf, c.situBeta, c.situLinear)
+    ok = ok && this.grouped(backend, ws, downKind, downRef.offset, ws.o("act"), ws.o("iota"), ws.o("down"), this.hasWeight("blk.$ip.ffn_down_exps.scale"),
+        downScales.offset, plan, n, nFf, c.nExpert, downStride, maxTiles)
+    ok = ok && backend.launch("moe_combine_batch", kernelArgs().pointer(ws.buffer, ws.o("down")).pointer(ws.buffer, slotOfPair).pointer(ws.buffer, weights)
+        .pointer(ws.buffer, ws.o("moe")).u32(n).u32(c.nExpertUsed).u32(tokens), [n, tokens])
+    val ffnPost = this.wr("blk.$ip.ffn_post_conv.weight")
+    ok = ok && this.convRows(backend, ws, ws.o("moe"), fHistory, ffnPost.offset, 0, false, x, n, 1, plainScale, tokens)
+    ok = ok && opAdd(backend, ws.buffer, ffnInp, ws.buffer, x, ws.buffer, x, tokens * n)
+    if (!ok) {
+        prefillError = "a launch failed in layer $ip (visit $visit)"
+        return -1
+    }
+    blocks
+}
+
+// conv_seq + conv_history for one convolution: `input` [t][channels] in the workspace, the history at `historyOffset` bytes in the model's history buffer,
+// the taps at `wOffset` in the arena; `dynOffset` the dynamic taps (workspace) when `dynamic`; the result at `output`.
+private fun InklingModel.convRows(var backend: Backend, ws: PrefillWorkspace, input: int, historyOffset: int, wOffset: int, dynOffset: int, dynamic: bool,
+    output: int, channels: int, heads: int, outScale: f32, tokens: int): bool {
+    val c = this.config
+    var args = kernelArgs().pointer(ws.buffer, input).pointer(this.history, historyOffset).pointer(this.arena, wOffset)
+    if (dynamic) args.pointer(ws.buffer, dynOffset) else args.u64(0)
+    args.pointer(ws.buffer, output)
+    args.u32(channels)
+    args.u32(c.nConv)
+    args.u32(heads)
+    args.f32(outScale)
+    args.u32(tokens)
+    backend.launch("conv_seq", args, [channels, tokens]) &&
+        backend.launch("conv_history", kernelArgs().pointer(ws.buffer, input).pointer(this.history, historyOffset).u32(channels).u32(c.nConv).u32(tokens), [channels])
+}
+
+private fun InklingModel.grouped(var backend: Backend, ws: PrefillWorkspace, kind: string, wOffset: int, x: int, xmap: int, y: int, useScales: bool, scalesOffset: int,
+    plan: int, rows: int, cols: int, nExpert: int, stride: int, maxTiles: int): bool {
+    var args = kernelArgs().pointer(this.arena, wOffset).pointer(ws.buffer, x).pointer(ws.buffer, xmap).pointer(ws.buffer, y)
+    if (useScales) args.pointer(this.arena, scalesOffset) else args.u64(0)
+    args.pointer(ws.buffer, plan)
+    args.u32(rows)
+    args.u32(cols)
+    args.u32(nExpert)
+    args.u64(stride)
+    backend.launch("matmul_${kind}_grouped${if (prefillMoeTile == 32) "32" else ""}", args, [rows, maxTiles])
+}
+
+// Runs `tokens` prompt tokens (positions startPos ..) through the model in chunks of at most ws.chunk. Afterwards the KV caches and convolution histories
+// hold them; the logits of the last token are in `ws` (row 0 of "logits" without allLogits, else row t of the last chunk) and readable with `readPrefillLogits`.
+fun InklingModel.prefill(var backend: Backend, ws: PrefillWorkspace, tokenIds: array<int>, startPos: int): bool {
+    prefillError = ""
+    var done = 0
+    while (done < tokenIds.size) {
+        val count = if (tokenIds.size - done < ws.chunk) tokenIds.size - done else ws.chunk
+        if (!this.prefillChunk(backend, ws, tokenIds, done, count, startPos + done, done + count == tokenIds.size)) return false
+        done = done + count
+    }
+    true
+}
+
+private trusted fun InklingModel.uploadIds(var backend: Backend, ws: PrefillWorkspace, tokenIds: array<int>, from: int, count: int): bool {
+    val host = nativeByteBuffer(count * 4 + 8)
+    val address = nativePointerAddress(host.address)
+    for (i in 0 until count) ablaUnsafeStoreU32(nativePointerFromAddress(address + 4 * i), tokenIds[from + i])
+    val ok = backend.upload(ws.buffer, ws.o("tokenIds"), address, count * 4)
+    host.close()
+    ok
+}
+
+private fun InklingModel.prefillChunk(var backend: Backend, ws: PrefillWorkspace, tokenIds: array<int>, from: int, tokens: int, firstPos: int, last: bool): bool {
+    val c = this.config
+    val n = c.nEmbd
+    val nb = n * 4
+    if (firstPos < 0 || firstPos + tokens > this.maxCtx) {
+        prefillError = "positions $firstPos .. ${firstPos + tokens - 1} are outside the cache of ${this.maxCtx}"
+        return false
+    }
+    val embd = this.wr("token_embd.weight")
+    if (weightKind(embd.type) != "q8_0") {
+        prefillError = "the prefill embedding supports Q8_0 only, not ${ggmlTypeName(embd.type)}"
+        return false
+    }
+    val x = ws.o("x")
+    if (!this.uploadIds(backend, ws, tokenIds, from, tokens)) {
+        prefillError = "uploading the token ids failed"
+        return false
+    }
+    var ok = backend.launch("gather_rows_q8_0", kernelArgs().pointer(this.arena, embd.offset).pointer(ws.buffer, ws.o("tokenIds")).pointer(ws.buffer, x)
+        .u32(n).u32(tokens), [n, tokens])
+    ok = ok && this.normRows(backend, ws, "token_embd_norm.weight", x, x, tokens)
+    if (!ok) {
+        prefillError = "the embedding failed"
+        return false
+    }
+    var blocks = 0
+    var visit = 0
+    val loopStart = if (c.looped) c.loopStart else c.nLayer
+    val loopEnd = if (c.looped) c.loopEnd else c.nLayer
+    for (ip in 0 until loopStart) {
+        blocks = this.layerRows(backend, ws, ip, visit, 0, 0, firstPos, tokens, blocks)
+        visit = visit + 1
+        if (blocks < 0) return false
+    }
+    if (c.looped) {
+        val preludeBlocks = blocks
+        ok = opCopy(backend, ws.buffer, x, ws.buffer, ws.o("preludeOut"), tokens * n)
+        var nBank = 0
+        for (pass in 0 until c.loopCount) {
+            if (pass > 0) {
+                nBank = blocks - preludeBlocks - 1
+                ok = ok && opCopy(backend, ws.buffer, x, ws.buffer, ws.o("bankOut"), tokens * n)
+                if (nBank > 0) ok = ok && this.copyRows(backend, ws.blocks, (preludeBlocks + 1) * nb, (c.nLayer + 2) * n, ws.bank, 0, (c.nLayer + 2) * n, nBank * n, tokens)
+                ok = ok && opCopy(backend, ws.buffer, ws.o("preludeOut"), ws.buffer, x, tokens * n)
+                blocks = preludeBlocks
+            }
+            for (ip in loopStart until loopEnd) {
+                if (pass > 0) {
+                    ok = ok && this.mixRows(backend, ws, ws.bank, nBank, ws.o("bankOut"), "blk.$ip.loop_msg_query.weight", 4, ws.o("msgs"), 4 * n, tokens)
+                    if (!ok) {
+                        prefillError = "the loop messages failed in layer $ip"
+                        return false
+                    }
+                }
+                blocks = this.layerRows(backend, ws, ip, visit, pass, nBank, firstPos, tokens, blocks)
+                visit = visit + 1
+                if (blocks < 0) return false
+            }
+        }
+    }
+    for (ip in loopEnd until c.nLayer) {
+        blocks = this.layerRows(backend, ws, ip, visit, 0, 0, firstPos, tokens, blocks)
+        visit = visit + 1
+        if (blocks < 0) return false
+    }
+    // output: only chunks that end the prompt need logits (every chunk with allLogits)
+    if (!last && !ws.allLogits) return true
+    ok = this.mixRows(backend, ws, ws.blocks, blocks, x, "output_res_query.weight", 1, x, n, tokens)
+    ok = ok && this.normRows(backend, ws, "output_norm.weight", x, x, tokens)
+    val output = this.wr("output.weight")
+    val outputKind = weightKind(output.type)
+    if (outputKind != "q8_0") {
+        prefillError = "the prefill output projection supports Q8_0 only, not ${ggmlTypeName(output.type)}"
+        return false
+    }
+    val rowsOut = if (ws.allLogits) tokens else 1
+    val xRows = if (ws.allLogits) x else x + (tokens - 1) * nb
+    ok = ok && backend.launch("matmul_q8_0", kernelArgs().pointer(this.arena, output.offset).pointer(ws.buffer, xRows).pointer(ws.buffer, ws.o("logits"))
+        .u32(output.rows).u32(output.cols).u32(rowsOut), [output.rows, (rowsOut + 63) / 64])
+    if (c.softcap != 0.0) ok = ok && opSoftcap(backend, ws.buffer, ws.o("logits"), c.softcap, rowsOut * c.nVocabPadded)
+    if (!ok) prefillError = "the output projection failed"
+    ok
+}
+
+// The logits of row `row` of the last chunk (0 unless the workspace keeps all logits), real vocabulary only.
+trusted fun InklingModel.readPrefillLogits(var backend: Backend, ws: PrefillWorkspace, row: int): array<f32>? {
+    val count = this.config.nVocab
+    val bytes = count * 4
+    val host = nativeByteBuffer(bytes + 8)
+    if (!backend.download(ws.buffer, ws.o("logits") + row * this.config.nVocabPadded * 4, nativePointerAddress(host.address), bytes)) {
+        prefillError = "downloading the logits failed"
+        host.close()
+        return null
+    }
+    val address = nativePointerAddress(host.address)
+    val logits: array<f32> = []
+    for (index in 0 until count) logits.append(f32FromBits(u32(ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * index)))))
+    host.close()
+    logits
+}
