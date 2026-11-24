@@ -80,12 +80,40 @@ private trusted noescape extern:"c" fun cuCtxPushCurrent_v2(context: i64*): i32
 private trusted noescape extern:"c" fun cuCtxPopCurrent_v2(context: i64*): i32
 private trusted noescape extern:"c" fun cuMemGetInfo_v2(freeBytes: i64*, totalBytes: i64*): i32
 
+private class CudaKernelSpec(
+    val name: string,
+    val source: string,
+    val itemsPerBlock: int,
+    val blockX: int,
+    val argumentKinds: array<int>,
+    val validate: (KernelArgs, array<int>) -> bool,
+    val problemDimensions: int = 1,
+    val nullablePointer: int = -1
+)
+
+private class CudaFunction(val name: string, val module: int, val handle: int)
+
+private val cudaMatvecArguments = [
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
+    KERNEL_ARG_U32, KERNEL_ARG_U32
+]
+private fun cudaF32Shape(args: KernelArgs, problem: array<int>): bool =
+    args.words[3] == problem[0] && args.words[4] > 0
+
+private val cudaKernels = [
+    CudaKernelSpec("matvec_f32", kernelMatvecF32, 4, 128, cudaMatvecArguments, cudaF32Shape)
+]
+
+private fun cudaKernelSpec(name: string): CudaKernelSpec? {
+    for (spec in cudaKernels) if (spec.name == name) return spec
+    null
+}
+
 class CudaBackend(
     var context: int,
     val architecture: string,
     var liveBuffers: int = 0,
-    var f32Module: int = 0,
-    var f32Function: int = 0
+    val functions: array<CudaFunction> = []
 ) : Backend {
     fun name(): string = "cuda"
 
@@ -112,7 +140,7 @@ class CudaBackend(
         }
         if (!this.pushContext()) return false
         val waited = cudaStatus(cuCtxSynchronize(), "cuCtxSynchronize")
-        if (this.f32Module != 0) cuModuleUnload(nativePointerFromAddress(this.f32Module))
+        for (function in this.functions) cuModuleUnload(nativePointerFromAddress(function.module))
         this.popContext()
         val destroyed = cudaStatus(cuCtxDestroy_v2(nativePointerFromAddress(this.context)), "cuCtxDestroy")
         if (destroyed) this.context = 0
@@ -162,48 +190,50 @@ class CudaBackend(
         ok
     }
 
-    trusted fun loadF32Kernel(): bool {
-        if (this.f32Function != 0) return true
-        val ptx = cudaCompilePtx(kernelMatvecF32, "matvec_f32.cu", this.architecture)
-        if (ptx == null) return false
+    trusted fun loadPtx(name: string, ptx: string): CudaFunction? {
         val module = nativePointerCell(nativeNullPointer())
-        if (!cudaStatus(cuModuleLoadData(module.address, ptx), "cuModuleLoadData")) return false
+        if (!cudaStatus(cuModuleLoadData(module.address, ptx), "cuModuleLoadData")) return null
         val function = nativePointerCell(nativeNullPointer())
-        if (!cudaStatus(cuModuleGetFunction(function.address, module.load(), "matvec_f32"), "cuModuleGetFunction")) {
+        if (!cudaStatus(cuModuleGetFunction(function.address, module.load(), name), "cuModuleGetFunction")) {
             cuModuleUnload(module.load())
-            return false
+            return null
         }
-        this.f32Module = nativePointerAddress(module.load())
-        this.f32Function = nativePointerAddress(function.load())
-        true
+        CudaFunction(name, nativePointerAddress(module.load()), nativePointerAddress(function.load()))
+    }
+
+    trusted fun loadKernel(spec: CudaKernelSpec): CudaFunction? {
+        for (function in this.functions) if (function.name == spec.name) return function
+        val ptx = cudaCompilePtx(spec.source, "${spec.name}.cu", this.architecture)
+        if (ptx == null) return null
+        val loaded = this.loadPtx(spec.name, ptx)
+        if (loaded == null) return null
+        this.functions.append(loaded)
+        loaded
     }
 
     trusted fun launch(kernel: string, args: KernelArgs, problem: array<int>): bool {
-        if (kernel != "matvec_f32" || problem.size != 1 || problem[0] < 1 ||
-            problem[0] > 4294967295 || args.kinds.size != 5 || args.words.size != 5 ||
-            args.kinds[0] != KERNEL_ARG_POINTER || args.kinds[1] != KERNEL_ARG_POINTER ||
-            args.kinds[2] != KERNEL_ARG_POINTER || args.kinds[3] != KERNEL_ARG_U32 ||
-            args.kinds[4] != KERNEL_ARG_U32 || args.words[3] != problem[0] ||
-            args.words[4] < 1 || args.words[4] > 4294967295) {
+        val spec = cudaKernelSpec(kernel)
+        if (spec == null || !cudaLaunchShape(spec, args, problem)) {
             cudaError = "unknown CUDA kernel or invalid launch shape or arguments"
             return false
         }
         if (!this.pushContext()) return false
-        var ok = this.loadF32Kernel()
-        if (ok) {
+        val function = this.loadKernel(spec)
+        var ok = false
+        if (function != null) {
             // The driver consumes the parameter bytes during cuLaunchKernel.
-            val values = nativeByteBuffer(40)
-            val pointers = nativeByteBuffer(40)
+            val values = nativeByteBuffer(args.words.size * 8)
+            val pointers = nativeByteBuffer(args.words.size * 8)
             val base = nativePointerAddress(values.address)
-            var index = 0
-            while (index < 5) {
+            for (index in 0 until args.words.size) {
                 values.storeI64(index * 8, args.words[index])
                 pointers.storePointer(index * 8, nativePointerFromAddress(base + index * 8))
-                index += 1
             }
-            ok = cudaStatus(cuLaunchKernel(nativePointerFromAddress(this.f32Function),
-                u32((problem[0] + 3) / 4), 1, 1, 128, 1, 1, 0,
-                nativeNullPointer(), pointers.address, nativeNullPointer()), "cuLaunchKernel")
+            val gridX = u32((problem[0] + spec.itemsPerBlock - 1) / spec.itemsPerBlock)
+            val gridY = u32(if (spec.problemDimensions == 2) problem[1] else 1)
+            ok = cudaStatus(cuLaunchKernel(nativePointerFromAddress(function.handle),
+                gridX, gridY, 1, u32(spec.blockX), 1, 1, 0, nativeNullPointer(),
+                pointers.address, nativeNullPointer()), "cuLaunchKernel")
         }
         this.popContext()
         ok
@@ -230,6 +260,25 @@ class CudaBackend(
         if (cudaStatus(cuMemFree_v2(u64(handle)), "cuMemFree")) this.liveBuffers -= 1
         this.popContext()
     }
+}
+
+private fun cudaLaunchShape(spec: CudaKernelSpec, args: KernelArgs, problem: array<int>): bool {
+    if (problem.size != spec.problemDimensions || problem[0] < 1 ||
+        problem[0] > 4294967295 || args.words.size != spec.argumentKinds.size ||
+        args.kinds.size != spec.argumentKinds.size) return false
+    if ((problem[0] + spec.itemsPerBlock - 1) / spec.itemsPerBlock > 2147483647 ||
+        (spec.problemDimensions == 2 && (problem[1] < 1 || problem[1] > 65535))) return false
+
+    for (index in 0 until spec.argumentKinds.size) {
+        val kind = spec.argumentKinds[index]
+        val actual = args.kinds[index]
+        val word = args.words[index]
+        val nullPointer = index == spec.nullablePointer && actual == KERNEL_ARG_U64 && word == 0
+        if ((!nullPointer && (actual != kind || (kind == KERNEL_ARG_POINTER && word == 0))) ||
+            (kind == KERNEL_ARG_U32 && (word < 0 || word > 4294967295)) ||
+            (kind == KERNEL_ARG_I32 && (word < -2147483648 || word > 2147483647))) return false
+    }
+    spec.validate(args, problem)
 }
 
 trusted fun cudaBackend(ordinal: i32 = 0): CudaBackend? {
