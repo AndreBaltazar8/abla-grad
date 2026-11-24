@@ -1,0 +1,68 @@
+// `abla-grad compare a.grdl b.grdl [--tolerances file]`: per position metrics, a summary, exit 0 when every position is within the
+// tolerances (docs/interfaces.md, section 7). `a` is the oracle by convention (KL(a || b)).
+import "abla/io"
+import "abla/fs"
+import "abla/float/text"
+import "../compare/grdl.ab"
+import "../compare/metrics.ab"
+
+fun cmdCompare(args: array<string>): int {
+    var tolerancesPath = ""
+    val files: array<string> = []
+    var index = 0
+    while (index < args.size) {
+        if (args[index] == "--tolerances" && index + 1 < args.size) {
+            tolerancesPath = args[index + 1]
+            index = index + 2
+        } else {
+            files.append(args[index])
+            index = index + 1
+        }
+    }
+    if (files.size != 2) {
+        println("usage: abla-grad compare <oracle.grdl> <ours.grdl> [--tolerances <file>]")
+        return 2
+    }
+    var limits = tolerancesDefault()
+    if (tolerancesPath != "") {
+        val result = Path(tolerancesPath).readTextResult()
+        val parsed = if (result.succeeded) tolerancesParse(result.text) else null
+        if (parsed == null) {
+            println("compare: cannot read tolerances from $tolerancesPath")
+            return 2
+        }
+        limits = parsed
+    }
+    val first = grdlRead(files[0])
+    val second = grdlRead(files[1])
+    if (first == null || second == null) {
+        println("compare: ${files[0]} or ${files[1]} is not a GRDL v1 file")
+        return 2
+    }
+    if (first.vocab != second.vocab || first.tokens.size != second.tokens.size) {
+        println("compare: shapes differ: ${first.tokens.size} x ${first.vocab} against ${second.tokens.size} x ${second.vocab}")
+        return 2
+    }
+    for (position in 0 until first.tokens.size) {
+        if (first.tokens[position] != second.tokens[position]) {
+            println("compare: the token ids differ at position $position")
+            return 2
+        }
+    }
+    var failures = 0
+    var worstAbs = 0.0
+    var worstKl = 0.0
+    var argmaxMisses = 0
+    for (position in 0 until first.tokens.size) {
+        val metrics = comparePosition(first.logits, position * first.vocab, second.logits, position * first.vocab, first.vocab)
+        if (metrics.maxAbs > worstAbs) worstAbs = metrics.maxAbs
+        if (metrics.kl > worstKl) worstKl = metrics.kl
+        if (!metrics.argmaxEqual) argmaxMisses = argmaxMisses + 1
+        val violation = toleranceViolation(metrics, limits)
+        println("position $position: argmax ${metrics.argmaxEqual} top5 ${metrics.top5Equal} maxAbs ${metrics.maxAbs} meanAbs ${metrics.meanAbs} kl ${metrics.kl}" +
+            (if (violation == "") "" else "  OUT: $violation"))
+        if (violation != "") failures = failures + 1
+    }
+    println("compare: ${first.tokens.size} positions, $failures outside the tolerances, $argmaxMisses argmax differences, worst maxAbs $worstAbs, worst KL $worstKl")
+    if (failures == 0) 0 else 1
+}

@@ -1,0 +1,19 @@
+// Writes a small synthetic GRDL file for the compare CLI test: grdl_make <path> <shift>; `shift` is added to logit 3 of position 1.
+import "abla/process/arguments"
+import "abla/integer"
+import "abla/float"
+import "../src/compare/grdl.ab"
+
+fun main: int {
+    val path = processArgument(0)
+    val shift = f32FromInt(processArgument(1).parseInt() ?? 0)
+    val logits: array<f32> = []
+    for (position in 0 until 2) {
+        for (index in 0 until 6) {
+            var value = f32FromInt(index) * 0.5
+            if (position == 1 && index == 3) value = value + shift
+            logits.append(value)
+        }
+    }
+    if (grdlWrite(path, Grdl(6, [5, 9], logits))) 0 else 1
+}

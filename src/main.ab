@@ -1,6 +1,13 @@
 import "abla/io"
+import "abla/process/arguments"
+import "cli/compare.ab"
 
+// Commands: compare (here); info, tokenize, logits arrive with the reader/tokenizer (ablac-90) and the model graph.
 fun main: int {
-    println("abla-grad: see README.md; subcommands (logits, compare, info) arrive with the model graph")
-    0
+    val args: array<string> = []
+    for (index in 1 until processArgumentCount()) args.append(processArgument(index))
+    val command = if (processArgumentCount() > 0) processArgument(0) else ""
+    if (command == "compare") return cmdCompare(args)
+    println("abla-grad: commands: compare <oracle.grdl> <ours.grdl> [--tolerances file]   (info, tokenize, logits to come; see README.md)")
+    if (command == "") 0 else 2
 }

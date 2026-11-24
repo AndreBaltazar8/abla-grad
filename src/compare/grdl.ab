@@ -1,0 +1,65 @@
+// GRDL v1: the logits file the oracle (tools/oracle/dump-logits.sh) and `abla-grad logits` both write (docs/interfaces.md, section 3).
+// Little-endian: "GRDL", u32 version = 1, u32 vocab, u32 tokens, u32 token[tokens], f32 logits[tokens][vocab].
+import "abla/bytes"
+import "abla/float"
+import "abla/fs"
+import "abla/process"
+
+class Grdl(val vocab: int, val tokens: array<int>, val logits: array<f32>)
+
+fun grdlTokenCount(file: Grdl): int = file.tokens.size
+
+private fun grdlU32At(text: string, at: int): int =
+    text[at] | (text[at + 1] << 8) | (text[at + 2] << 16) | (text[at + 3] << 24)
+
+/** Parses GRDL bytes; null when they are not a complete GRDL v1 file. */
+fun grdlParse(text: string): Grdl? {
+    if (text.size < 16 || text[0] != 71 || text[1] != 82 || text[2] != 68 || text[3] != 76) return null
+    if (grdlU32At(text, 4) != 1) return null
+    val vocab = grdlU32At(text, 8)
+    val count = grdlU32At(text, 12)
+    if (vocab <= 0 || count < 0 || text.size != 16 + 4 * count + 4 * count * vocab) return null
+    val tokens: array<int> = []
+    var at = 16
+    for (index in 0 until count) {
+        tokens.append(grdlU32At(text, at))
+        at = at + 4
+    }
+    val logits: array<f32> = []
+    for (index in 0 until count * vocab) {
+        logits.append(f32FromBits(u32(grdlU32At(text, at))))
+        at = at + 4
+    }
+    Grdl(vocab, tokens, logits)
+}
+
+fun grdlRead(path: string): Grdl? {
+    val result = Path(path).readTextResult()
+    if (!result.succeeded) return null
+    grdlParse(result.text)
+}
+
+private fun grdlAppendU32(var out: ByteBuffer, value: int): void {
+    out.appendByteValue(value & 255)
+    out.appendByteValue((value >> 8) & 255)
+    out.appendByteValue((value >> 16) & 255)
+    val last = out.appendByteValue((value >> 24) & 255)
+    if (!last) panic("grdl: byte append failed")
+}
+
+/** The GRDL v1 bytes of `file`. */
+fun grdlEncode(file: Grdl): string {
+    var out = byteBuffer()
+    out.appendByteValue(71)
+    out.appendByteValue(82)
+    out.appendByteValue(68)
+    out.appendByteValue(76)
+    grdlAppendU32(out, 1)
+    grdlAppendU32(out, file.vocab)
+    grdlAppendU32(out, file.tokens.size)
+    for (token in file.tokens) grdlAppendU32(out, token)
+    for (value in file.logits) grdlAppendU32(out, int(f32ToBits(value)))
+    out.toText()
+}
+
+fun grdlWrite(path: string, file: Grdl): bool = Path(path).writeText(grdlEncode(file))

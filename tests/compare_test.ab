@@ -1,0 +1,52 @@
+// GRDL round trip and the per-position metrics on small synthetic vectors.
+import "abla/io"
+import "abla/fs"
+import "abla/float"
+import "../src/compare/grdl.ab"
+import "../src/compare/metrics.ab"
+
+fun fail(message: string): int {
+    println("compare test FAILED: $message")
+    1
+}
+
+fun main: int {
+    val vocab = 8
+    val a: array<f32> = []
+    val b: array<f32> = []
+    for (position in 0 until 2) {
+        for (index in 0 until vocab) {
+            a.append(f32FromInt(index) * 0.5 + f32FromInt(position))
+            b.append(f32FromInt(index) * 0.5 + f32FromInt(position))
+        }
+    }
+    val first = Grdl(vocab, [11, 22], a)
+    val parsed = grdlParse(grdlEncode(first))
+    if (parsed == null) return fail("an encoded file did not parse")
+    if (parsed.vocab != vocab || parsed.tokens.size != 2 || parsed.tokens[1] != 22 || parsed.logits.size != 16 ||
+        parsed.logits[9] != a[9]) return fail("the round trip changed the content")
+    val path = "/tmp/abla-grad-compare-test.grdl"
+    if (!grdlWrite(path, first)) return fail("could not write $path")
+    val read = grdlRead(path)
+    Path(path).remove()
+    if (read == null || read.logits[15] != a[15]) return fail("the file did not read back")
+    if (grdlParse("GRDL") != null || grdlParse(grdlEncode(first).slice(0, 40)) != null) return fail("a truncated file parsed")
+
+    val same = comparePosition(a, 0, b, 0, vocab)
+    if (!same.argmaxEqual || !same.top5Equal || same.maxAbs != 0.0 || same.kl > 1.0e-12) return fail("identical vectors differ")
+
+    // Move the top logit down by 0.75 (position 0, index 7: 3.5 -> 2.75): the argmax changes, the top-5 set does not.
+    b[7] = 2.75
+    val moved = comparePosition(a, 0, b, 0, vocab)
+    if (moved.argmaxEqual || !moved.top5Equal) return fail("a swapped top logit: argmax ${moved.argmaxEqual} top5 ${moved.top5Equal}")
+    if (moved.maxAbs < 0.7499 || moved.maxAbs > 0.7501) return fail("max abs ${moved.maxAbs}")
+    if (moved.kl <= 0.0) return fail("KL ${moved.kl}")
+
+    val limits = tolerancesParse("# noise floor x4\nmaxAbs 0.5\nrequireArgmax 1\n")
+    if (limits == null) return fail("tolerances did not parse")
+    if (toleranceViolation(same, limits) != "") return fail("identical vectors violate")
+    if (toleranceViolation(moved, limits) == "") return fail("a moved top logit passed the tolerances")
+    if (tolerancesParse("maxAbs\n") != null || tolerancesParse("bogus 1\n") != null) return fail("a bad tolerances file parsed")
+    println("compare test passed")
+    0
+}
