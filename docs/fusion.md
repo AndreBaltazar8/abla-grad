@@ -64,3 +64,14 @@ KV-cache write and the sink-and-bias softmax as ops); v3 persistent kernels / th
   there (one launch per grid-wide dependency) rather than use cooperative launch, unless e7 measures cooperative groups as cheaper.
 - Whether the generator emits tiled code for matvec itself or calls the hand-written device functions of the standalone quantized kernels (preferred: reuse, no second
   definition of a quantization layout).
+
+## e7's review (2026-11-24), to be applied
+- The quantized matvec sources already have row dots (`nvfp4_dot`, `q8_dot`, `k_dot`: packed row pointer, `const float* x`, `cols`, sum in lane 0): extract their CUDA text as a shared source prefix;
+  the standalone wrappers stay as they are (runtime `cols`); a fused wrapper resolves row/expert, may stage x in shared memory, and passes constexpr `cols`. One full warp per row, whole-warp tails, any block
+  barrier before the tail branch; keep dequant, FP32 reduction order and where the expert scale is applied. Bit parity with the standalone kernel and a repeat of the existing 4090 timings before claiming no slowdown.
+- Reductions: cooperate within a block for a row/head-local norm. A global norm duplicated per CTA is only worth it when the fan-out is small: the Q/K/V bundle has 5,120 output rows, four rows per CTA repeats the
+  2,304-value norm 1,280 times, so the baseline to beat is a separate norm + bundled projections. A true cross-CTA dependency (SiTU -> down projection) is a launch boundary; cooperative grid sync needs a different launch
+  and a resident grid: deferred. Geometry follows the warp/tile mapping and the state writes, not the largest output extent alone (amends "What it generates").
+- First hand-written candidate: indexed gate/up -> SiTU (a CTA pairs the gate and up rows of a slot, applies each expert scale before SiTU, writes only the activation); down stays separate. Also measure bundled Q/K/V/rel
+  projections after the norm (the shared SWA input holds before the loop controllers; later passes can have distinct inputs). Local chains: conv -> head norm/clip -> KV store, residual -> norm. If the profile ranks
+  depth_mix, moe_route or long relative attention high, parallel standalone versions go first so fusion savings are isolated.
