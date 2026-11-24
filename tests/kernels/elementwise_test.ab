@@ -1,0 +1,201 @@
+// The elementwise and row kernels against CPU references computed here (f64). Tolerance: 2e-6 relative + 1e-6 absolute (f32 tanh/exp in the kernels).
+import "abla/io"
+import "abla/float"
+import "abla/float/text"
+import "abla/math"
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "support.ab"
+
+fun close(name: string, got: array<f32>, expected: array<f64>): bool {
+    for (index in 0 until expected.size) {
+        val actual = f32ToF64(got[index])
+        if (!(fabs(actual - expected[index]) <= 0.000001 + fabs(expected[index]) * 0.000002)) {
+            println("$name[$index]: expected ${expected[index]}, got $actual")
+            return false
+        }
+    }
+    true
+}
+
+fun sigmoid(x: f64): f64 = 1.0 / (1.0 + exp(-x))
+
+fun tanh64(x: f64): f64 {
+    val e = exp(2.0 * x)
+    (e - 1.0) / (e + 1.0)
+}
+
+fun run(var backend: Backend): bool {
+    val n = 1000
+    val a = testSignal(n, 1)
+    val b = testSignal(n, 2)
+    val da = uploadFloats(backend, a)
+    val db = uploadFloats(backend, b)
+    val dout = uploadFloats(backend, testSignal(n, 3))
+    if (da == null || db == null || dout == null) return false
+    var ok = true
+
+    // add
+    if (!backend.launch("add", kernelArgs().pointer(da).pointer(db).pointer(dout).u32(n), [n])) return false
+    var expected: array<f64> = []
+    for (i in 0 until n) expected.append(f32ToF64(a[i]) + f32ToF64(b[i]))
+    ok = ok && close("add", downloadFloats(backend, dout, n) ?? [], expected)
+
+    // silu_mul
+    if (!backend.launch("silu_mul", kernelArgs().pointer(da).pointer(db).pointer(dout).u32(n), [n])) return false
+    expected = []
+    for (i in 0 until n) expected.append(f32ToF64(a[i]) * sigmoid(f32ToF64(a[i])) * f32ToF64(b[i]))
+    ok = ok && close("silu_mul", downloadFloats(backend, dout, n) ?? [], expected)
+
+    // sigmoid_mul
+    if (!backend.launch("sigmoid_mul", kernelArgs().pointer(da).pointer(db).pointer(dout).u32(n), [n])) return false
+    expected = []
+    for (i in 0 until n) expected.append(f32ToF64(a[i]) * sigmoid(f32ToF64(b[i])))
+    ok = ok && close("sigmoid_mul", downloadFloats(backend, dout, n) ?? [], expected)
+
+    // softcap and scale_f32 in place
+    val dc = uploadFloats(backend, a)
+    if (dc == null) return false
+    if (!backend.launch("softcap", kernelArgs().pointer(dc).f32(30.0).u32(n), [n])) return false
+    expected = []
+    for (i in 0 until n) expected.append(30.0 * tanh64(f32ToF64(a[i]) / 30.0))
+    ok = ok && close("softcap", downloadFloats(backend, dc, n) ?? [], expected)
+    val ds = uploadFloats(backend, a)
+    if (ds == null) return false
+    if (!backend.launch("scale_f32", kernelArgs().pointer(ds).f32(0.25).u32(n), [n])) return false
+    expected = []
+    for (i in 0 until n) expected.append(f32ToF64(a[i]) * 0.25)
+    ok = ok && close("scale_f32", downloadFloats(backend, ds, n) ?? [], expected)
+
+    // copy_f32
+    if (!backend.launch("copy_f32", kernelArgs().pointer(da).pointer(dout).u32(n), [n])) return false
+    expected = []
+    for (i in 0 until n) expected.append(f32ToF64(a[i]))
+    ok = ok && close("copy_f32", downloadFloats(backend, dout, n) ?? [], expected)
+
+    // situ: 3 slots of 40 (gate 40, up 40 each); beta 4, lb 25 and lb 0
+    val nUsed = 3
+    val nFf = 40
+    val gu = testSignal(nUsed * 2 * nFf, 5)
+    val dgu = uploadFloats(backend, gu)
+    val dsitu = uploadFloats(backend, testSignal(nUsed * nFf, 6))
+    if (dgu == null || dsitu == null) return false
+    for (lb in [25.0, 0.0]) {
+        if (!backend.launch("situ", kernelArgs().pointer(dgu).pointer(dsitu).u32(nUsed).u32(nFf).f32(4.0).f32(f64ToF32(lb)), [nUsed * nFf])) return false
+        expected = []
+        for (slot in 0 until nUsed) {
+            for (j in 0 until nFf) {
+                val g = f32ToF64(gu[slot * 2 * nFf + j])
+                val u = f32ToF64(gu[slot * 2 * nFf + nFf + j])
+                val act = 4.0 * tanh64(g / 4.0) * sigmoid(g)
+                val lin = if (lb > 0.0) lb * tanh64(u / lb) else u
+                expected.append(act * lin)
+            }
+        }
+        ok = ok && close("situ lb=$lb", downloadFloats(backend, dsitu, nUsed * nFf) ?? [], expected)
+    }
+
+    // control_mix
+    val cur = testSignal(n, 7)
+    val message = testSignal(n, 8)
+    val gain = testSignal(n, 9)
+    val forget = testSignal(n, 10)
+    val dcur = uploadFloats(backend, cur)
+    val dmsg = uploadFloats(backend, message)
+    val dgain = uploadFloats(backend, gain)
+    val dforget = uploadFloats(backend, forget)
+    if (dcur == null || dmsg == null || dgain == null || dforget == null) return false
+    if (!backend.launch("control_mix", kernelArgs().pointer(dcur).pointer(dmsg).pointer(dgain).pointer(dforget).pointer(dout).u32(n), [n])) return false
+    expected = []
+    for (i in 0 until n) {
+        expected.append(f32ToF64(cur[i]) - tanh64(f32ToF64(forget[i])) * f32ToF64(cur[i]) + tanh64(f32ToF64(gain[i])) * f32ToF64(message[i]))
+    }
+    ok = ok && close("control_mix", downloadFloats(backend, dout, n) ?? [], expected)
+
+    // kv_store: 2 kv heads, head dim 8, maxCtx 5, position 3
+    val k = testSignal(16, 11)
+    val v = testSignal(16, 12)
+    val dk = uploadFloats(backend, k)
+    val dv = uploadFloats(backend, v)
+    val zeros: array<f32> = []
+    for (i in 0 until 80) zeros.append(0.0)
+    val dkc = uploadFloats(backend, zeros)
+    val dvc = uploadFloats(backend, zeros)
+    if (dk == null || dv == null || dkc == null || dvc == null) return false
+    if (!backend.launch("kv_store", kernelArgs().pointer(dk).pointer(dv).pointer(dkc).pointer(dvc).u32(3).u32(2).u32(8).u32(5), [16])) return false
+    val kc = downloadFloats(backend, dkc, 80) ?? []
+    val vc = downloadFloats(backend, dvc, 80) ?? []
+    for (head in 0 until 2) {
+        for (d in 0 until 8) {
+            val at = (head * 5 + 3) * 8 + d
+            if (kc[at] != k[head * 8 + d] || vc[at] != v[head * 8 + d]) {
+                println("kv_store: wrong value at head $head dim $d")
+                ok = false
+            }
+        }
+    }
+    var untouched = 0
+    for (i in 0 until 80) if (kc[i] != 0.0) untouched = untouched + 1
+    if (untouched > 16) {
+        println("kv_store: wrote outside position 3 ($untouched nonzero)")
+        ok = false
+    }
+
+    // l2clip: 3 rows of 20; with and without scale; threshold 3
+    val rows = 3
+    val dim = 20
+    val x = testSignal(rows * dim, 13)
+    val scale = testSignal(rows * dim, 14)
+    val dx = uploadFloats(backend, x)
+    val dscale = uploadFloats(backend, scale)
+    val dy = uploadFloats(backend, testSignal(rows * dim, 15))
+    if (dx == null || dscale == null || dy == null) return false
+    for (useScale in [true, false]) {
+        val launched = if (useScale)
+            backend.launch("l2clip", kernelArgs().pointer(dx).pointer(dscale).pointer(dy).u32(rows).u32(dim).f32(3.0), [rows])
+        else
+            backend.launch("l2clip", kernelArgs().pointer(dx).u64(0).pointer(dy).u32(rows).u32(dim).f32(3.0), [rows])
+        if (!launched) return false
+        expected = []
+        for (row in 0 until rows) {
+            var sum = 0.0
+            for (d in 0 until dim) {
+                val value = if (useScale) f32ToF64(x[row * dim + d]) * f32ToF64(scale[row * dim + d]) else f32ToF64(x[row * dim + d])
+                sum = sum + value * value
+            }
+            val norm = sqrt(sum)
+            val factor = 3.0 / (if (norm > 3.0) norm else 3.0)
+            for (d in 0 until dim) {
+                val value = if (useScale) f32ToF64(x[row * dim + d]) * f32ToF64(scale[row * dim + d]) else f32ToF64(x[row * dim + d])
+                expected.append(value * factor)
+            }
+        }
+        ok = ok && close("l2clip scale=$useScale", downloadFloats(backend, dy, rows * dim) ?? [], expected)
+    }
+
+    // argmax: the first of two equal maxima wins
+    val big = testSignal(5000, 16)
+    big[1234] = 100.0
+    big[4000] = 100.0
+    val dbig = uploadFloats(backend, big)
+    val dwin = uploadWords(backend, [0])
+    if (dbig == null || dwin == null) return false
+    if (!backend.launch("argmax", kernelArgs().pointer(dbig).u32(5000).pointer(dwin), [1])) return false
+    val winner = downloadWords(backend, dwin, 1) ?? [-1]
+    if (winner[0] != 1234) {
+        println("argmax: expected 1234, got ${winner[0]}")
+        ok = false
+    }
+    ok
+}
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    val ok = run(backend)
+    if (!ok) {
+        println("elementwise kernel test FAILED (${cudaLastError()})")
+        return 1
+    }
+    println("elementwise kernel test passed")
+    0
+}

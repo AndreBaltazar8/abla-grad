@@ -1,5 +1,6 @@
 import "backend.ab"
 import "../kernels/matvec_f32.ab"
+import "../kernels/elementwise.ab"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 
@@ -100,8 +101,42 @@ private val cudaMatvecArguments = [
 private fun cudaF32Shape(args: KernelArgs, problem: array<int>): bool =
     args.words[3] == problem[0] && args.words[4] > 0
 
+// ---- elementwise and row kernels (ablac-60-2; sources in src/kernels/elementwise.ab, contract in docs/kernels.md) ----
+private val cudaArgsAdd = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32]
+private val cudaArgsCopy = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32]
+private val cudaArgsInPlaceF32 = [KERNEL_ARG_POINTER, KERNEL_ARG_F32, KERNEL_ARG_U32]
+private val cudaArgsSitu = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_F32, KERNEL_ARG_F32]
+private val cudaArgsControlMix = [
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32
+]
+private val cudaArgsKvStore = [
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
+    KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32
+]
+private val cudaArgsL2Clip = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_F32]
+private val cudaArgsArgmax = [KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_POINTER]
+private fun cudaCountIsLast3(args: KernelArgs, problem: array<int>): bool = args.words[3] == problem[0]
+private fun cudaCountIsLast2(args: KernelArgs, problem: array<int>): bool = args.words[2] == problem[0]
+private fun cudaCountIsLast5(args: KernelArgs, problem: array<int>): bool = args.words[5] == problem[0]
+private fun cudaSituShape(args: KernelArgs, problem: array<int>): bool = args.words[2] * args.words[3] == problem[0]
+private fun cudaKvStoreShape(args: KernelArgs, problem: array<int>): bool = args.words[5] * args.words[6] == problem[0]
+private fun cudaL2ClipShape(args: KernelArgs, problem: array<int>): bool = args.words[3] == problem[0] && args.words[4] > 0
+private fun cudaArgmaxShape(args: KernelArgs, problem: array<int>): bool = problem[0] == 1 && args.words[1] > 0
+
 private val cudaKernels = [
-    CudaKernelSpec("matvec_f32", kernelMatvecF32, 4, 128, cudaMatvecArguments, cudaF32Shape)
+    CudaKernelSpec("matvec_f32", kernelMatvecF32, 4, 128, cudaMatvecArguments, cudaF32Shape),
+    // elementwise and row kernels (60-2)
+    CudaKernelSpec("add", kernelAdd, 256, 256, cudaArgsAdd, cudaCountIsLast3),
+    CudaKernelSpec("copy_f32", kernelCopyF32, 256, 256, cudaArgsCopy, cudaCountIsLast2),
+    CudaKernelSpec("scale_f32", kernelScaleF32, 256, 256, cudaArgsInPlaceF32, cudaCountIsLast2),
+    CudaKernelSpec("silu_mul", kernelSiluMul, 256, 256, cudaArgsAdd, cudaCountIsLast3),
+    CudaKernelSpec("softcap", kernelSoftcap, 256, 256, cudaArgsInPlaceF32, cudaCountIsLast2),
+    CudaKernelSpec("sigmoid_mul", kernelSigmoidMul, 256, 256, cudaArgsAdd, cudaCountIsLast3),
+    CudaKernelSpec("situ", kernelSitu, 256, 256, cudaArgsSitu, cudaSituShape),
+    CudaKernelSpec("control_mix", kernelControlMix, 256, 256, cudaArgsControlMix, cudaCountIsLast5),
+    CudaKernelSpec("kv_store", kernelKvStore, 256, 256, cudaArgsKvStore, cudaKvStoreShape),
+    CudaKernelSpec("l2clip", kernelL2Clip, 1, 128, cudaArgsL2Clip, cudaL2ClipShape, 1, 1),
+    CudaKernelSpec("argmax", kernelArgmax, 1, 1024, cudaArgsArgmax, cudaArgmaxShape)
 ]
 
 private fun cudaKernelSpec(name: string): CudaKernelSpec? {

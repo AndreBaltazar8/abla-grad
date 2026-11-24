@@ -1,0 +1,70 @@
+// Host <-> device helpers for the kernel tests (no CPU references here: each test brings its own).
+import "abla/float"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "../../src/backend/backend.ab"
+
+trusted fun uploadFloats(var backend: Backend, values: array<f32>): DeviceBuffer? {
+    val host = nativeByteBuffer(values.size * 4 + 4)
+    val address = nativePointerAddress(host.address)
+    for (index in 0 until values.size) {
+        ablaUnsafeStoreU32(nativePointerFromAddress(address + 4 * index), int(f32ToBits(values[index])))
+    }
+    val buffer = backend.allocate(values.size * 4 + 4)
+    if (buffer == null) {
+        host.close()
+        return null
+    }
+    val ok = backend.upload(buffer, 0, address, values.size * 4)
+    host.close()
+    if (!ok) return null
+    buffer
+}
+
+trusted fun uploadWords(var backend: Backend, values: array<int>): DeviceBuffer? {
+    val host = nativeByteBuffer(values.size * 4 + 4)
+    val address = nativePointerAddress(host.address)
+    for (index in 0 until values.size) ablaUnsafeStoreU32(nativePointerFromAddress(address + 4 * index), values[index])
+    val buffer = backend.allocate(values.size * 4 + 4)
+    if (buffer == null) {
+        host.close()
+        return null
+    }
+    val ok = backend.upload(buffer, 0, address, values.size * 4)
+    host.close()
+    if (!ok) return null
+    buffer
+}
+
+trusted fun downloadFloats(var backend: Backend, buffer: DeviceBuffer, count: int): array<f32>? {
+    val host = nativeByteBuffer(count * 4 + 4)
+    val address = nativePointerAddress(host.address)
+    if (!backend.download(buffer, 0, address, count * 4)) {
+        host.close()
+        return null
+    }
+    val out: array<f32> = []
+    for (index in 0 until count) out.append(f32FromBits(u32(ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * index)))))
+    host.close()
+    out
+}
+
+trusted fun downloadWords(var backend: Backend, buffer: DeviceBuffer, count: int): array<int>? {
+    val host = nativeByteBuffer(count * 4 + 4)
+    val address = nativePointerAddress(host.address)
+    if (!backend.download(buffer, 0, address, count * 4)) {
+        host.close()
+        return null
+    }
+    val out: array<int> = []
+    for (index in 0 until count) out.append(ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * index)))
+    host.close()
+    out
+}
+
+// A deterministic spread of values in about [-3, 3] with some exact repeats.
+fun testSignal(count: int, seed: int): array<f32> {
+    val out: array<f32> = []
+    for (index in 0 until count) out.append(f32FromInt((index * 37 + seed * 101) % 97 - 48) / 16.0)
+    out
+}
