@@ -1,0 +1,75 @@
+// GGML NVFP4 rows have 36-byte blocks of 64 weights. Four UE4M3 scales
+// precede four groups of eight packed E2M1 bytes. A lane reads four bytes
+// from one group and accumulates its eight products in FP32.
+val kernelMatvecNvfp4 = """
+static __device__ __forceinline__ float nvfp4_half_scale(unsigned code) {
+    // GGML gives 0x7f a zero scale and ignores the high bit otherwise.
+    if (code == 0x7fu) return 0.0f;
+    unsigned exponent = (code >> 3) & 15u;
+    unsigned mantissa = code & 7u;
+    if (exponent == 0) return float(mantissa) * 0.0009765625f;
+    return __uint_as_float(((exponent + 119u) << 23) | (mantissa << 20));
+}
+
+static __device__ __forceinline__ float nvfp4_double_value(unsigned code) {
+    // 2 * E2M1 magnitudes packed in order: 0, 1, 2, 3, 4, 6, 8, 12.
+    float magnitude = float((0xc8643210u >> (4u * (code & 7u))) & 15u);
+    return __uint_as_float(__float_as_uint(magnitude) | ((code & 8u) << 28));
+}
+
+static __device__ __forceinline__ float nvfp4_dot(const unsigned char *row,
+                                                  const float *x,
+                                                  unsigned cols) {
+    unsigned lane = threadIdx.x & 31u;
+    unsigned part = lane & 7u;
+    unsigned group = part >> 1;
+    unsigned start = group * 16u + (part & 1u) * 4u;
+    float sum = 0.0f;
+    for (unsigned block = lane >> 3; block < cols / 64u; block += 4u) {
+        const unsigned *packed = reinterpret_cast<const unsigned *>(
+            row + static_cast<unsigned long long>(block) * 36u);
+        float scale = nvfp4_half_scale((packed[0] >> (group * 8u)) & 255u);
+        unsigned quants = packed[1 + part];
+        const float *values = x + block * 64u + start;
+        float sub = 0.0f;
+        #pragma unroll
+        for (unsigned i = 0; i < 4; ++i) {
+            unsigned byte = (quants >> (i * 8u)) & 255u;
+            sub = fmaf(nvfp4_double_value(byte), values[i], sub);
+            sub = fmaf(nvfp4_double_value(byte >> 4), values[i + 8], sub);
+        }
+        sum = fmaf(scale, sub, sum);
+    }
+    for (unsigned width = 16; width; width /= 2) {
+        sum += __shfl_down_sync(0xffffffffu, sum, width);
+    }
+    return sum;
+}
+
+extern "C" __global__ void matvec_nvfp4(const unsigned char *w, const float *x,
+                                        float *y, unsigned rows, unsigned cols) {
+    unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= rows) return;
+    unsigned long long rowBytes = static_cast<unsigned long long>(cols / 64) * 36;
+    float sum = nvfp4_dot(w + row * rowBytes, x, cols);
+    if ((threadIdx.x & 31u) == 0) y[row] = sum;
+}
+
+extern "C" __global__ void matvec_nvfp4_indexed(
+    const unsigned char *w, const float *x, float *y, unsigned rows, unsigned cols,
+    const unsigned *ids, unsigned nUsed, unsigned long long expertStrideBytes,
+    unsigned xStrideElems, const float *expertScales) {
+    unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    unsigned slot = blockIdx.y;
+    if (row >= rows || slot >= nUsed) return;
+    unsigned long long rowBytes = static_cast<unsigned long long>(cols / 64) * 36;
+    unsigned expertId = ids[slot];
+    const unsigned char *expert = w + expertId * expertStrideBytes;
+    const float *input = x + static_cast<unsigned long long>(slot) * xStrideElems;
+    float sum = nvfp4_dot(expert + row * rowBytes, input, cols);
+    if ((threadIdx.x & 31u) == 0) {
+        y[static_cast<unsigned long long>(slot) * rows + row] = expertScales ?
+            sum * expertScales[expertId] : sum;
+    }
+}
+"""

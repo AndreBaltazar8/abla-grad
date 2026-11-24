@@ -7,9 +7,9 @@ import "abla/unsafe/memory/raw"
 // All fixtures contain three blocks per row so Q8_0 and Q6_K also
 // exercise alternating row alignment. The gather fetches an interior row.
 trusted fun testPackedMatvec(backend: Backend, kind: string, elements: int, blockBytes: int,
-    decode: (string) -> array<f32>, gather: bool = false): bool {
+    decode: (string) -> array<f32>, gather: bool = false, indexed: bool = true): bool {
     val rows = 7
-    val blocks = 3
+    val blocks = if (elements == 1) 97 else 3
     val cols = blocks * elements
     val rowBytes = blockBytes * blocks
     val weights = nativeByteBuffer(rows * rowBytes)
@@ -64,6 +64,42 @@ trusted fun testPackedMatvec(backend: Backend, kind: string, elements: int, bloc
             }
         }
         if (!testNear("matvec_${kind}", row, testLoadFloat(ya, row), expected)) return false
+    }
+    if (!indexed) return true
+    // Two experts use the first six packed rows, selected out of order.
+    val expertRows = 3
+    val slots = 2
+    val hostKeys = nativeByteBuffer(slots * 4)
+    val keys = nativePointerAddress(hostKeys.address)
+    ablaUnsafeStoreU32(nativePointerFromAddress(keys), 1)
+    ablaUnsafeStoreU32(nativePointerFromAddress(keys + 4), 0)
+    val hostScales = testFloatBuffer([f32(0.5), f32(-2.0)])
+    val deviceKeys = backend.allocate(hostKeys.capacity)
+    val deviceScales = backend.allocate(hostScales.capacity)
+    if (deviceKeys == null || deviceScales == null) return false
+    if (!backend.upload(deviceKeys, 0, keys, hostKeys.capacity) ||
+        !backend.upload(deviceScales, 0, nativePointerAddress(hostScales.address), hostScales.capacity) ||
+        !backend.launch("matvec_${kind}_indexed",
+            kernelArgs().pointer(dw).pointer(dx).pointer(dy).u32(expertRows).u32(cols)
+                .pointer(deviceKeys).u32(slots).u64(expertRows * rowBytes).u32(0).pointer(deviceScales),
+            [expertRows, slots]) ||
+        !backend.download(dy, 0, ya, y.capacity)) return false
+    for (slot in 0 until slots) {
+        val expert = 1 - slot
+        val scale = if (expert == 0) 0.5 else -2.0
+        for (row in 0 until expertRows) {
+            val offset = (expert * expertRows + row) * rowBytes
+            var expected = 0.0
+            for (block in 0 until blocks) {
+                val values = decode(testBlockBytes(wa + offset + block * blockBytes, blockBytes))
+                for (col in 0 until elements) {
+                    expected += f32ToF64(values[col]) * f32ToF64(testLoadFloat(xa, block * elements + col))
+                }
+            }
+            val output = slot * expertRows + row
+            if (!testNear("matvec_${kind}_indexed", output, testLoadFloat(ya, output), expected * scale))
+                return false
+        }
     }
     true
 }

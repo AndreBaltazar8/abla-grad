@@ -42,13 +42,8 @@ static __device__ __forceinline__ float k_weight(const unsigned char *block,
 }
 
 template <int Bits>
-static __device__ __forceinline__ void k_matvec(const unsigned char *w,
-    const float *x, float *y, unsigned rows, unsigned cols) {
+static __device__ __forceinline__ float k_dot(const unsigned char *weights, const float *x, unsigned cols) {
     unsigned lane = threadIdx.x & 31u;
-    unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-    if (row >= rows) return;
-    unsigned long long rowBytes = static_cast<unsigned long long>(cols / 256) * k_block_bytes<Bits>();
-    const unsigned char *weights = w + row * rowBytes;
     float sum = 0.0f;
     for (unsigned block = 0; block < cols / 256; ++block) {
         const unsigned char *packed = weights + static_cast<unsigned long long>(block) * k_block_bytes<Bits>();
@@ -61,7 +56,33 @@ static __device__ __forceinline__ void k_matvec(const unsigned char *w,
     for (unsigned width = 16; width; width /= 2) {
         sum += __shfl_down_sync(0xffffffffu, sum, width);
     }
-    if (lane == 0) y[row] = sum;
+    return sum;
+}
+
+template <int Bits>
+static __device__ __forceinline__ void k_matvec(const unsigned char *w,
+    const float *x, float *y, unsigned rows, unsigned cols) {
+    unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= rows) return;
+    unsigned long long rowBytes = static_cast<unsigned long long>(cols / 256) * k_block_bytes<Bits>();
+    float sum = k_dot<Bits>(w + row * rowBytes, x, cols);
+    if ((threadIdx.x & 31u) == 0) y[row] = sum;
+}
+
+template <int Bits>
+static __device__ __forceinline__ void k_indexed(const unsigned char *w,
+    const float *x, float *y, unsigned rows, unsigned cols, const unsigned *ids,
+    unsigned nUsed, unsigned long long stride, unsigned xStride, const float *scales) {
+    unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    unsigned slot = blockIdx.y;
+    if (row >= rows || slot >= nUsed) return;
+    unsigned expert = ids[slot];
+    unsigned long long rowBytes = static_cast<unsigned long long>(cols / 256) * k_block_bytes<Bits>();
+    const unsigned char *weights = w + expert * stride + row * rowBytes;
+    float sum = k_dot<Bits>(weights, x + static_cast<unsigned long long>(slot) * xStride, cols);
+    if ((threadIdx.x & 31u) == 0) {
+        y[static_cast<unsigned long long>(slot) * rows + row] = scales ? sum * scales[expert] : sum;
+    }
 }
 
 template <int Bits>
@@ -84,6 +105,21 @@ extern "C" __global__ void matvec_q5_k(const unsigned char *w, const float *x,
 extern "C" __global__ void matvec_q6_k(const unsigned char *w, const float *x,
                                        float *y, unsigned rows, unsigned cols) {
     k_matvec<6>(w, x, y, rows, cols);
+}
+extern "C" __global__ void matvec_q4_k_indexed(const unsigned char *w,
+    const float *x, float *y, unsigned rows, unsigned cols, const unsigned *ids,
+    unsigned nUsed, unsigned long long stride, unsigned xStride, const float *scales) {
+    k_indexed<4>(w, x, y, rows, cols, ids, nUsed, stride, xStride, scales);
+}
+extern "C" __global__ void matvec_q5_k_indexed(const unsigned char *w,
+    const float *x, float *y, unsigned rows, unsigned cols, const unsigned *ids,
+    unsigned nUsed, unsigned long long stride, unsigned xStride, const float *scales) {
+    k_indexed<5>(w, x, y, rows, cols, ids, nUsed, stride, xStride, scales);
+}
+extern "C" __global__ void matvec_q6_k_indexed(const unsigned char *w,
+    const float *x, float *y, unsigned rows, unsigned cols, const unsigned *ids,
+    unsigned nUsed, unsigned long long stride, unsigned xStride, const float *scales) {
+    k_indexed<6>(w, x, y, rows, cols, ids, nUsed, stride, xStride, scales);
 }
 extern "C" __global__ void gather_row_q4_k(const unsigned char *w, unsigned token,
                                             float *out, unsigned cols) {

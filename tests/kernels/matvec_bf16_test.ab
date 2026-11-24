@@ -1,0 +1,13 @@
+import "../../src/backend/backend.ab"
+import "device_test_support.ab"
+import "packed_matvec_test_support.ab"
+import "abla/float"
+
+fun decodeBf16(bytes: string): array<f32> {
+    if (bytes.size != 2) return []
+    [f32FromBits(u32((bytes[0] | (bytes[1] << 8)) << 16))]
+}
+
+fun verify(backend: Backend): bool = testPackedMatvec(backend, "bf16", 1, 2, decodeBf16, true, false)
+
+fun main: int = runCudaKernelTest("matvec_bf16 (plain and gather)", verify)

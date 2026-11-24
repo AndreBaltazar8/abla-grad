@@ -1,0 +1,28 @@
+// A BF16 is the high half of its FP32 representation.
+val kernelMatvecBf16 = """
+extern "C" __global__ void matvec_bf16(const unsigned char *weights, const float *x,
+                                       float *y, unsigned rows, unsigned cols) {
+    unsigned lane = threadIdx.x & 31u;
+    unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= rows) return;
+    const unsigned short *values = reinterpret_cast<const unsigned short *>(weights)
+        + static_cast<unsigned long long>(row) * cols;
+    float sum = 0.0f;
+    for (unsigned long long col = lane; col < cols; col += 32) {
+        sum = fmaf(__uint_as_float(unsigned(values[col]) << 16), x[col], sum);
+    }
+    for (unsigned width = 16; width; width /= 2) {
+        sum += __shfl_down_sync(0xffffffffu, sum, width);
+    }
+    if (lane == 0) y[row] = sum;
+}
+
+extern "C" __global__ void gather_row_bf16(const unsigned char *table, unsigned token,
+                                            float *out, unsigned cols) {
+    unsigned col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= cols) return;
+    const unsigned short *row = reinterpret_cast<const unsigned short *>(table)
+        + static_cast<unsigned long long>(token) * cols;
+    out[col] = __uint_as_float(unsigned(row[col]) << 16);
+}
+"""

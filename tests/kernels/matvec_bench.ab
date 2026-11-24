@@ -1,0 +1,122 @@
+// Device-resident payload throughput. Timings include host launch overhead and
+// one final synchronization; uploads, NVRTC, and warmup are outside the timer.
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "abla/float"
+import "abla/float/text"
+import "abla/io"
+import "abla/process/time"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+trusted fun timeMatvec(backend: Backend, kernel: string, rows: int, cols: int,
+    rowBytes: int, experts: int = 0): bool {
+    val launches = 32
+    val weightBytes = rows * rowBytes * (if (experts == 0) 1 else experts)
+    val hostWeights = nativeByteBuffer(weightBytes)
+    val hostInput = nativeByteBuffer(cols * 4)
+    val hostIds = nativeByteBuffer(experts * 4)
+    val wAddress = nativePointerAddress(hostWeights.address)
+    val xAddress = nativePointerAddress(hostInput.address)
+    val idAddress = nativePointerAddress(hostIds.address)
+
+    // Use varied packed payloads; all FP32 weights and inputs remain finite.
+    for (word in 0 until weightBytes / 4) {
+        val packed = (word * 2654435761) ^ (word * 2971215073 >> 17)
+        val bits = if (kernel == "matvec_f32") ((packed & 0x807fffff) | 0x3f000000) else packed
+        ablaUnsafeStoreU32(nativePointerFromAddress(wAddress + word * 4), bits)
+    }
+    // Use finite scale fields and BF16 weights so the benchmark does the
+    // same arithmetic as an ordinary decode, including the activation loads.
+    if (kernel == "matvec_bf16") {
+        for (word in 0 until weightBytes / 4) {
+            val ptr = nativePointerFromAddress(wAddress + word * 4)
+            ablaUnsafeStoreU32(ptr, (ablaUnsafeLoadU32(ptr) & 0x807f807f) | 0x3f003f00)
+        }
+    }
+    val blockBytes = if (kernel == "matvec_q8_0") 34
+        else if (kernel == "matvec_q4_k") 144
+        else if (kernel == "matvec_q5_k") 176
+        else if (kernel == "matvec_q6_k") 210
+        else 0
+    if (blockBytes != 0) {
+        for (block in 0 until weightBytes / blockBytes) {
+            val base = wAddress + block * blockBytes
+            if (kernel == "matvec_q6_k") ablaUnsafeStoreU16(nativePointerFromAddress(base + 208), 0x3000)
+            else ablaUnsafeStoreU16(nativePointerFromAddress(base), 0x3000)
+            if (kernel == "matvec_q4_k" || kernel == "matvec_q5_k") {
+                ablaUnsafeStoreU16(nativePointerFromAddress(base + 2), 0x2800)
+            }
+        }
+    }
+    for (col in 0 until cols) {
+        val value = f32FromInt((col * 5 + col / 17) % 31 - 15) / 16.0
+        ablaUnsafeStoreU32(nativePointerFromAddress(xAddress + col * 4), int(f32ToBits(value)))
+    }
+    for (slot in 0 until experts) {
+        ablaUnsafeStoreU32(nativePointerFromAddress(idAddress + slot * 4), experts - 1 - slot)
+    }
+    val weights = backend.allocate(weightBytes)
+    val input = backend.allocate(hostInput.capacity)
+    val output = backend.allocate(rows * 4 * (if (experts == 0) 1 else experts))
+    if (weights == null || input == null || output == null) return false
+    if (!backend.upload(weights, 0, wAddress, weightBytes) ||
+        !backend.upload(input, 0, xAddress, hostInput.capacity)) return false
+    var args = kernelArgs().pointer(weights).pointer(input).pointer(output).u32(rows).u32(cols)
+    if (experts == 0)
+        return timedRow(backend, kernel, args, [rows], cols, weightBytes, launches)
+
+    val ids = backend.allocate(hostIds.capacity)
+    if (ids == null || !backend.upload(ids, 0, idAddress, hostIds.capacity)) return false
+    args.pointer(ids)
+    args.u32(experts)
+    args.u64(rows * rowBytes)
+    args.u32(0)
+    args.u64(0)
+    timedRow(backend, kernel, args, [rows, experts], cols, weightBytes, launches)
+}
+
+fun timedRow(backend: Backend, kernel: string, args: KernelArgs, problem: array<int>,
+    cols: int, weightBytes: int, launches: int): bool {
+    for (warmup in 0 until 4) if (!backend.launch(kernel, args, problem)) return false
+    if (!backend.synchronize()) return false
+    for (sample in 0 until 5) {
+        val start = monotonicNanoseconds()
+        for (repeat in 0 until launches) {
+            if (!backend.launch(kernel, args, problem)) return false
+        }
+        if (!backend.synchronize()) return false
+        val elapsed = monotonicNanoseconds() - start
+        if (elapsed <= 0) return false
+        val bandwidth = f64FromInt(weightBytes * launches) / f64FromInt(elapsed)
+        val microseconds = f64FromInt(elapsed) / f64FromInt(launches * 1000)
+        println("${kernel} ${problem[0]}x${cols} bytes=${weightBytes} sample=${sample + 1} us=${microseconds} GB/s=${bandwidth}")
+    }
+    true
+}
+
+fun benchAll(backend: Backend): bool {
+    timeMatvec(backend, "matvec_f32", 16384, 2048, 8192) &&
+        timeMatvec(backend, "matvec_nvfp4_indexed", 2304, 1152, 648, 8) &&
+        timeMatvec(backend, "matvec_nvfp4_indexed", 2304, 1152, 648, 128) &&
+        timeMatvec(backend, "matvec_q8_0", 32768, 4096, 4352) &&
+        timeMatvec(backend, "matvec_bf16", 16384, 4096, 8192) &&
+        timeMatvec(backend, "matvec_q4_k", 49152, 4096, 2304) &&
+        timeMatvec(backend, "matvec_q5_k", 49152, 4096, 2816) &&
+        timeMatvec(backend, "matvec_q6_k", 49152, 4096, 3360)
+}
+
+fun main: int {
+    val backend = cudaBackend()
+    if (backend == null) {
+        eprintln(cudaLastError())
+        return 1
+    }
+    val passed = benchAll(backend)
+    val closed = backend.close()
+    if (!passed || !closed) {
+        eprintln(cudaLastError())
+        return 1
+    }
+    0
+}

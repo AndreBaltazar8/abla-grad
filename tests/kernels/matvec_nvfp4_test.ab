@@ -1,0 +1,137 @@
+import "../../src/backend/backend.ab"
+import "device_test_support.ab"
+import "../gguf_quant_oracle.ab"
+import "abla/crypto"
+import "abla/float"
+import "abla/float/text"
+import "abla/fs"
+import "abla/io"
+import "abla/math"
+import "abla/process/arguments"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+trusted fun nvfp4TestReference(weights: int, input: int, cols: int): f64 {
+    var result = 0.0
+    for (block in 0 until cols / 64) {
+        val dequantized = oracleNvfp4(testBlockBytes(weights + block * 36, 36))
+        for (lane in 0 until 64) {
+            val value = testLoadFloat(input, block * 64 + lane)
+            result += f32ToF64(dequantized[lane]) * f32ToF64(value)
+        }
+    }
+    result
+}
+
+trusted fun nvfp4TestLaunch(backend: Backend, rows: int, cols: int, experts: int,
+    keys: array<int>, xStride: int, realWeights: string = "", withScales: bool = false
+): bool {
+    val rowBytes = cols / 64 * 36
+    // Pinned llama.cpp dequantize_row_nvfp4 (33aeb17) plus an FP64 dot on
+    // blk.0.ffn_down_exps.weight expert 0, rows 0 and 1, for this test input.
+    val pinned = realWeights != "" && hexEncode(sha256(realWeights)) ==
+        "e2b1cf689c530e1ae1e9aab9ebfa64ac5118d37c77ad7a2c76e10607c01c6de6"
+    val pinnedResults = [-1778.5, -2659.5]
+    val stride = rows * rowBytes + (if (experts > 1) 16 else 0)
+    val slots = if (keys.size > 0) keys.size else 1
+    val weights = nativeByteBuffer(experts * stride)
+    val input = nativeByteBuffer((cols + (slots - 1) * xStride) * 4)
+    val output = nativeByteBuffer(rows * slots * 4)
+    val ids = nativeByteBuffer(slots * 4)
+    val scales = nativeByteBuffer(experts * 4)
+    val scaleAddress = nativePointerAddress(scales.address)
+    for (e in 0 until experts) {
+        val factor = f32FromInt(e - 2) / 2.0
+        ablaUnsafeStoreU32(nativePointerFromAddress(scaleAddress + e * 4), int(f32ToBits(factor)))
+    }
+    val wAddress = nativePointerAddress(weights.address)
+    val xAddress = nativePointerAddress(input.address)
+    val yAddress = nativePointerAddress(output.address)
+    val idAddress = nativePointerAddress(ids.address)
+    if (realWeights != "") {
+        if (realWeights.size != weights.capacity) return false
+        ablaUnsafeCopyMemory(wAddress, nativeStringDataAddress(realWeights), realWeights.size)
+    } else {
+        for (byte in 0 until weights.capacity) {
+            weights.store(byte, (byte * 53 + byte / 36 * 17 + byte / 11) & 255)
+        }
+        // Include zero and GGML's reserved 0x7f scale as well as subnormals.
+        weights.store(0, 0)
+        weights.store(1, 127)
+        weights.store(2, 7)
+        weights.store(3, 126)
+    }
+    for (i in 0 until input.capacity / 4) {
+        val value = f32FromInt((i * 7 + i / 13) % 19 - 9) / 16.0
+        ablaUnsafeStoreU32(nativePointerFromAddress(xAddress + i * 4), int(f32ToBits(value)))
+    }
+
+    val w = backend.allocate(weights.capacity)
+    val x = backend.allocate(input.capacity)
+    val y = backend.allocate(output.capacity)
+    if (w == null || x == null || y == null) return false
+    if (!backend.upload(w, 0, wAddress, weights.capacity) ||
+        !backend.upload(x, 0, xAddress, input.capacity)) return false
+    var args = kernelArgs().pointer(w).pointer(x).pointer(y).u32(rows).u32(cols)
+    var launched = false
+    if (keys.size == 0) {
+        launched = backend.launch("matvec_nvfp4", args, [rows])
+    } else {
+        val gpuIds = backend.allocate(ids.capacity)
+        val gpuScales = backend.allocate(scales.capacity)
+        if (gpuIds == null || gpuScales == null ||
+            !backend.upload(gpuScales, 0, scaleAddress, scales.capacity)) return false
+        for (slot in 0 until slots) {
+            ablaUnsafeStoreU32(nativePointerFromAddress(idAddress + slot * 4), keys[slot])
+        }
+        args.pointer(gpuIds)
+        args.u32(slots)
+        args.u64(stride)
+        args.u32(xStride)
+        if (withScales) args.pointer(gpuScales)
+        else args.u64(0)
+        launched = backend.upload(gpuIds, 0, idAddress, ids.capacity) &&
+            backend.launch("matvec_nvfp4_indexed", args, [rows, slots]) &&
+            backend.synchronize()
+    }
+    if (!launched || !backend.download(y, 0, yAddress, output.capacity)) return false
+    for (slot in 0 until slots) {
+        val expert = if (keys.size > 0) keys[slot] else 0
+        for (row in 0 until rows) {
+            val factor = if (withScales) f64FromInt(expert - 2) / 2.0 else 1.0
+            val expected = factor * nvfp4TestReference(wAddress + expert * stride + row * rowBytes,
+                xAddress + slot * xStride * 4, cols)
+            if (pinned && expected != pinnedResults[row]) {
+                eprintln("scalar dequantization differs from the pinned GGML oracle")
+                return false
+            }
+            val bits = ablaUnsafeLoadU32(nativePointerFromAddress(yAddress + (slot * rows + row) * 4))
+            val actual = f32ToF64(f32FromBits(u32(bits)))
+            // FP32 accumulation against an FP64 sum of the decoded GGML weights.
+            if (!(fabs(actual - expected) <= 0.00001 + fabs(expected) * 0.0001)) {
+                eprintln("NVFP4 slot ${slot} row ${row}: expected ${expected}, got ${actual}")
+                return false
+            }
+        }
+    }
+    true
+}
+
+fun verifyFromArgs(backend: Backend): bool {
+    var passed = nvfp4TestLaunch(backend, 7, 64, 1, [], 0) &&
+        nvfp4TestLaunch(backend, 7, 320, 5, [4, 1, 4], 0) &&
+        nvfp4TestLaunch(backend, 11, 1152, 5, [3, 0, 2, 3], 1168, withScales = true)
+    if (passed && processArgumentCount() == 1) {
+        val packed = path(processArgument(0)).readText()
+        if (packed.size != 1296) {
+            eprintln("Expected two 1152-column Inkling rows (1296 bytes)")
+            passed = false
+        } else {
+            passed = nvfp4TestLaunch(backend, 2, 1152, 1, [0], 0, packed)
+            if (passed) println("NVFP4 matched both packed Inkling fixture rows")
+        }
+    }
+    passed
+}
+
+fun main: int = runCudaKernelTest("NVFP4 plain and indexed matvec", verifyFromArgs)

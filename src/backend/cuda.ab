@@ -3,6 +3,12 @@ import "../kernels/matvec_f32.ab"
 import "../kernels/elementwise.ab"
 import "../kernels/inkling_small.ab"
 import "../kernels/matvec_k.ab"
+import "../kernels/matvec_nvfp4.ab"
+import "../kernels/matvec_q8_0.ab"
+import "../kernels/matvec_bf16.ab"
+import "abla/crypto"
+import "abla/fs"
+import "abla/process/environment"
 import "../kernels/rmsnorm.ab"
 import "../kernels/rope.ab"
 import "../kernels/attention_decode.ab"
@@ -85,6 +91,8 @@ private trusted fun cudaCompilePtx(source: string, name: string, architecture: s
 private trusted noescape extern:"c" fun cuCtxPushCurrent_v2(context: i64*): i32
 private trusted noescape extern:"c" fun cuCtxPopCurrent_v2(context: i64*): i32
 private trusted noescape extern:"c" fun cuMemGetInfo_v2(freeBytes: i64*, totalBytes: i64*): i32
+
+private trusted noescape extern:"c" fun nvrtcVersion(major: i64*, minor: i64*): i32
 
 private class CudaKernelSpec(
     val name: string,
@@ -209,6 +217,48 @@ private fun cudaConvStepShape(args: KernelArgs, problem: array<int>): bool =
 private fun cudaDepthMixShape(args: KernelArgs, problem: array<int>): bool =
     args.words[4] == problem[0] && args.words[1] + 1 <= 64 && args.words[6] > 0
 
+private val cudaIndexedMatvecArguments = [
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
+    KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_POINTER,
+    KERNEL_ARG_U32, KERNEL_ARG_U64, KERNEL_ARG_U32, KERNEL_ARG_POINTER
+]
+
+private fun cudaNvfp4Shape(args: KernelArgs, problem: array<int>): bool =
+    cudaF32Shape(args, problem) && args.words[4] % 64 == 0
+
+private fun cudaQ8Shape(args: KernelArgs, problem: array<int>): bool =
+    cudaF32Shape(args, problem) && args.words[4] % 32 == 0
+
+private fun cudaQ8GatherShape(args: KernelArgs, problem: array<int>): bool =
+    cudaGatherShape(args, problem) && args.words[3] % 32 == 0
+
+private fun cudaIndexedShape(args: KernelArgs, problem: array<int>, blockElements: int, blockBytes: int): bool {
+    if (!cudaF32Shape(args, problem) || args.words[4] % blockElements != 0 ||
+        args.words[6] != problem[1]) return false
+    val cols = args.words[4]
+    val rowBytes = cols / blockElements * blockBytes
+    val stride = args.words[7]
+    val xStride = args.words[8]
+    // NVFP4 reads aligned 32-bit words. The other layouts are read bytewise.
+    stride > 0 && (blockElements != 64 || (stride % 4 == 0 && args.words[0] % 4 == 0)) &&
+        problem[0] <= stride / rowBytes && (xStride == 0 || xStride >= cols)
+}
+
+private fun cudaNvfp4IndexedShape(args: KernelArgs, problem: array<int>): bool =
+    cudaIndexedShape(args, problem, 64, 36)
+
+private fun cudaQ8IndexedShape(args: KernelArgs, problem: array<int>): bool =
+    cudaIndexedShape(args, problem, 32, 34)
+
+private fun cudaQ4IndexedShape(args: KernelArgs, problem: array<int>): bool =
+    cudaIndexedShape(args, problem, 256, 144)
+
+private fun cudaQ5IndexedShape(args: KernelArgs, problem: array<int>): bool =
+    cudaIndexedShape(args, problem, 256, 176)
+
+private fun cudaQ6IndexedShape(args: KernelArgs, problem: array<int>): bool =
+    cudaIndexedShape(args, problem, 256, 210)
+
 private val cudaKernels = [
     CudaKernelSpec("matvec_f32", kernelMatvecF32, 4, 128, cudaMatvecArguments, cudaF32Shape),
     CudaKernelSpec("matvec_q4_k", kernelMatvecK, 4, 128, cudaMatvecArguments, cudaKQuantShape),
@@ -222,6 +272,21 @@ private val cudaKernels = [
     CudaKernelSpec("attention_decode", kernelAttentionDecode, 1, 256, cudaAttentionArguments, cudaAttentionShape),
     CudaKernelSpec("attention_decode_rel", kernelAttentionDecode, 1, 256,
         cudaRelativeAttentionArguments, cudaRelativeAttentionShape),
+    CudaKernelSpec("matvec_nvfp4", kernelMatvecNvfp4, 4, 128, cudaMatvecArguments, cudaNvfp4Shape),
+    CudaKernelSpec("matvec_nvfp4_indexed", kernelMatvecNvfp4, 4, 128,
+        cudaIndexedMatvecArguments, cudaNvfp4IndexedShape, 2, 9),
+    CudaKernelSpec("matvec_q8_0", kernelMatvecQ8_0, 4, 128, cudaMatvecArguments, cudaQ8Shape),
+    CudaKernelSpec("matvec_q8_0_indexed", kernelMatvecQ8_0, 4, 128,
+        cudaIndexedMatvecArguments, cudaQ8IndexedShape, 2, 9),
+    CudaKernelSpec("matvec_q4_k_indexed", kernelMatvecK, 4, 128,
+        cudaIndexedMatvecArguments, cudaQ4IndexedShape, 2, 9),
+    CudaKernelSpec("matvec_q5_k_indexed", kernelMatvecK, 4, 128,
+        cudaIndexedMatvecArguments, cudaQ5IndexedShape, 2, 9),
+    CudaKernelSpec("matvec_q6_k_indexed", kernelMatvecK, 4, 128,
+        cudaIndexedMatvecArguments, cudaQ6IndexedShape, 2, 9),
+    CudaKernelSpec("matvec_bf16", kernelMatvecBf16, 4, 128, cudaMatvecArguments, cudaF32Shape),
+    CudaKernelSpec("gather_row_q8_0", kernelMatvecQ8_0, 128, 128, cudaGatherArguments, cudaQ8GatherShape),
+    CudaKernelSpec("gather_row_bf16", kernelMatvecBf16, 128, 128, cudaGatherArguments, cudaGatherShape),
     // elementwise and row kernels (60-2)
     CudaKernelSpec("add", kernelAdd, 256, 256, cudaArgsAdd, cudaCountIsLast3),
     CudaKernelSpec("copy_f32", kernelCopyF32, 256, 256, cudaArgsCopy, cudaCountIsLast2),
@@ -245,6 +310,25 @@ private val cudaKernels = [
 private fun cudaKernelSpec(name: string): CudaKernelSpec? {
     for (spec in cudaKernels) if (spec.name == name) return spec
     null
+}
+
+private trusted fun cudaPtxCachePath(spec: CudaKernelSpec, architecture: string): Path? {
+    val major = nativeI64Cell(0)
+    val minor = nativeI64Cell(0)
+    if (nvrtcVersion(major.address, minor.address) != 0) return null
+
+    var root = processEnvironmentOr("XDG_CACHE_HOME", "")
+    if (root == "" || root[0] != 47) {
+        val home = processEnvironmentOr("HOME", "")
+        if (home == "" || home[0] != 47) return null
+        root = "${home}/.cache"
+    }
+    val directory = path("${root}/abla-grad")
+    if (!directory.createDirectories(0o700)) return null
+
+    val key = hexEncode(sha256(
+        "ptx-v1:${major.load()}.${minor.load()}:${architecture}:${spec.name}:${spec.source}"))
+    path("${root}/abla-grad/${key}.ptx")
 }
 
 class CudaBackend(
@@ -341,11 +425,23 @@ class CudaBackend(
 
     trusted fun loadKernel(spec: CudaKernelSpec): CudaFunction? {
         for (function in this.functions) if (function.name == spec.name) return function
+        val cache = cudaPtxCachePath(spec, this.architecture)
+        if (cache != null) {
+            val previous = cache.readText()
+            if (previous != "") {
+                val cached = this.loadPtx(spec.name, previous)
+                if (cached != null) {
+                    this.functions.append(cached)
+                    return cached
+                }
+            }
+        }
         val ptx = cudaCompilePtx(spec.source, "${spec.name}.cu", this.architecture)
         if (ptx == null) return null
         val loaded = this.loadPtx(spec.name, ptx)
         if (loaded == null) return null
         this.functions.append(loaded)
+        if (cache != null) cache.writeTextAtomic(ptx, 0o600)
         loaded
     }
 
