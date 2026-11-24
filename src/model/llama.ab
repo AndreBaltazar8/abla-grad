@@ -9,25 +9,11 @@ import "../ops.ab"
 import "../gguf/reader.ab"
 import "../gguf/quant.ab"
 import "llama_config.ab"
+import "weights.ab"
 
 private var llamaError = ""
 
 fun llamaLastError(): string = llamaError
-
-// The kernel-name suffix of a weight storage type ("" when no kernel exists for it).
-fun weightKind(type: int): string = when (type) {
-    GGML_TYPE_F32 -> "f32"
-    GGML_TYPE_BF16 -> "bf16"
-    GGML_TYPE_Q8_0 -> "q8_0"
-    GGML_TYPE_Q4_K -> "q4_k"
-    GGML_TYPE_Q5_K -> "q5_k"
-    GGML_TYPE_Q6_K -> "q6_k"
-    GGML_TYPE_NVFP4 -> "nvfp4"
-    else -> ""
-}
-
-// A tensor in the weight arena: byte offset, stored size, ggml type, and matrix shape (cols = elements per row).
-class WeightRef(val offset: int, val bytes: int, val type: int, val rows: int, val cols: int)
 
 class LlamaLayer(
     val attnNorm: WeightRef, val wq: WeightRef, val wk: WeightRef, val wv: WeightRef, val wo: WeightRef,
@@ -39,8 +25,6 @@ class ScratchLayout(
     val x: int, val xn: int, val q: int, val k: int, val v: int, val att: int, val proj: int,
     val gate: int, val up: int, val act: int, val logits: int, val total: int
 )
-
-private fun alignUp(value: int): int = (value + 255) / 256 * 256
 
 fun scratchLayout(config: LlamaConfig): ScratchLayout {
     val qSize = config.nHead * config.headDim * 4
@@ -71,26 +55,8 @@ fun scratchLayout(config: LlamaConfig): ScratchLayout {
     ScratchLayout(x, xn, q, k, v, att, proj, gate, up, act, logits, at)
 }
 
-// Plans the arena: every tensor the model needs, in order, with 256-byte aligned offsets. `total` is the arena size.
-class ArenaPlan(val refs: Map<string, WeightRef>, val total: int)
-
-private fun planTensor(file: GgufFile, name: string, var refs: Map<string, WeightRef>, at: int): int {
-    val info = file.tensor(name)
-    if (info == null) {
-        llamaError = "tensor $name is missing"
-        return -1
-    }
-    val cols = info.dims[0]
-    var rows = 1
-    for (index in 1 until info.dims.size) rows = rows * info.dims[index]
-    refs.set(name, WeightRef(at, info.bytes, info.type, rows, cols))
-    at + alignUp(info.bytes)
-}
-
 fun llamaPlan(file: GgufFile, config: LlamaConfig): ArenaPlan? {
     llamaError = ""
-    val refs: Map<string, WeightRef> = Map()
-    var at = 0
     val names: array<string> = ["token_embd.weight", "output_norm.weight"]
     if (file.tensor("output.weight") != null) names.append("output.weight")
     if (file.tensor("rope_freqs.weight") != null) names.append("rope_freqs.weight")
@@ -99,25 +65,20 @@ fun llamaPlan(file: GgufFile, config: LlamaConfig): ArenaPlan? {
             names.append("blk.$layer.$part.weight")
         }
     }
-    for (name in names) {
-        at = planTensor(file, name, refs, at)
-        if (at < 0) return null
-    }
-    ArenaPlan(refs, at)
+    val plan = planWeights(file, names)
+    if (plan == null) llamaError = weightsLastError()
+    plan
 }
-
-private fun refOf(plan: ArenaPlan, name: string): WeightRef =
-    plan.refs.get(name) ?? WeightRef(0, 0, 0, 0, 0)
 
 fun llamaLayers(plan: ArenaPlan, config: LlamaConfig): array<LlamaLayer> {
     val layers: array<LlamaLayer> = []
     for (layer in 0 until config.nLayer) {
         layers.append(LlamaLayer(
-            refOf(plan, "blk.$layer.attn_norm.weight"), refOf(plan, "blk.$layer.attn_q.weight"),
-            refOf(plan, "blk.$layer.attn_k.weight"), refOf(plan, "blk.$layer.attn_v.weight"),
-            refOf(plan, "blk.$layer.attn_output.weight"), refOf(plan, "blk.$layer.ffn_norm.weight"),
-            refOf(plan, "blk.$layer.ffn_gate.weight"), refOf(plan, "blk.$layer.ffn_up.weight"),
-            refOf(plan, "blk.$layer.ffn_down.weight")
+            weightOf(plan, "blk.$layer.attn_norm.weight"), weightOf(plan, "blk.$layer.attn_q.weight"),
+            weightOf(plan, "blk.$layer.attn_k.weight"), weightOf(plan, "blk.$layer.attn_v.weight"),
+            weightOf(plan, "blk.$layer.attn_output.weight"), weightOf(plan, "blk.$layer.ffn_norm.weight"),
+            weightOf(plan, "blk.$layer.ffn_gate.weight"), weightOf(plan, "blk.$layer.ffn_up.weight"),
+            weightOf(plan, "blk.$layer.ffn_down.weight")
         ))
     }
     layers
@@ -142,20 +103,10 @@ resource class LlamaModel(
 fun llamaLoad(var backend: Backend, file: GgufFile, config: LlamaConfig, maxCtx: int): LlamaModel? {
     val plan = llamaPlan(file, config)
     if (plan == null) return null
-    val arena = backend.allocate(plan.total)
+    val arena = uploadWeights(backend, file, plan)
     if (arena == null) {
-        llamaError = "device memory for ${plan.total} bytes of weights is not available"
+        llamaError = weightsLastError()
         return null
-    }
-    for (name in plan.refs.keys()) {
-        val info = file.tensor(name)
-        val ref = plan.refs.get(name)
-        if (info == null || ref == null) return null
-        val address = file.tensorAddress(info)
-        if (address == 0 || !backend.upload(arena, ref.offset, address, info.bytes)) {
-            llamaError = "uploading $name failed"
-            return null
-        }
     }
     val layout = scratchLayout(config)
     val scratch = backend.allocate(layout.total)
@@ -166,13 +117,12 @@ fun llamaLoad(var backend: Backend, file: GgufFile, config: LlamaConfig, maxCtx:
         llamaError = "device memory for the scratch buffer and KV cache is not available"
         return null
     }
-    val output = plan.refs.get("output.weight") ?? refOf(plan, "token_embd.weight")
+    val output = plan.refs.get("output.weight") ?? weightOf(plan, "token_embd.weight")
     LlamaModel(
-        config, llamaLayers(plan, config), refOf(plan, "token_embd.weight"), refOf(plan, "output_norm.weight"), output,
+        config, llamaLayers(plan, config), weightOf(plan, "token_embd.weight"), weightOf(plan, "output_norm.weight"), output,
         plan.refs.get("rope_freqs.weight"), maxCtx, layout, move(arena), move(scratch), move(kCache), move(vCache)
     )
 }
-
 private fun ropeFactorsAvailable(model: LlamaModel): bool = model.ropeFreqs != null
 
 // One token at position `pos`: embeds it, runs every layer, leaves the logits in the scratch buffer. False when a launch failed.

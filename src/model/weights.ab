@@ -1,0 +1,68 @@
+// A model's weights in one device arena, in their stored quantization: a plan (tensor name -> offset/shape/type) and the upload.
+import "../backend/backend.ab"
+import "../gguf/reader.ab"
+import "../gguf/quant.ab"
+
+private var weightsError = ""
+
+fun weightsLastError(): string = weightsError
+
+// The kernel-name suffix of a weight storage type ("" when no kernel exists for it).
+fun weightKind(type: int): string = when (type) {
+    GGML_TYPE_F32 -> "f32"
+    GGML_TYPE_BF16 -> "bf16"
+    GGML_TYPE_Q8_0 -> "q8_0"
+    GGML_TYPE_Q4_K -> "q4_k"
+    GGML_TYPE_Q5_K -> "q5_k"
+    GGML_TYPE_Q6_K -> "q6_k"
+    GGML_TYPE_NVFP4 -> "nvfp4"
+    else -> ""
+}
+
+// A tensor in the arena: byte offset, stored size, ggml type, and shape: `cols` = elements per row (dims[0]), `rows` = the product of the other dims.
+class WeightRef(val offset: int, val bytes: int, val type: int, val rows: int, val cols: int)
+
+class ArenaPlan(val refs: Map<string, WeightRef>, val names: array<string>, val total: int)
+
+fun alignUp(value: int): int = (value + 255) / 256 * 256
+
+/** Offsets for `names` (each must exist in `file`), 256-byte aligned. */
+fun planWeights(file: GgufFile, names: array<string>): ArenaPlan? {
+    weightsError = ""
+    val refs: Map<string, WeightRef> = Map()
+    var at = 0
+    for (name in names) {
+        val info = file.tensor(name)
+        if (info == null) {
+            weightsError = "tensor $name is missing"
+            return null
+        }
+        var rows = 1
+        for (index in 1 until info.dims.size) rows = rows * info.dims[index]
+        refs.set(name, WeightRef(at, info.bytes, info.type, rows, info.dims[0]))
+        at = at + alignUp(info.bytes)
+    }
+    ArenaPlan(refs, names, at)
+}
+
+fun weightOf(plan: ArenaPlan, name: string): WeightRef = plan.refs.get(name) ?? WeightRef(0, 0, 0, 0, 0)
+
+/** Allocates the arena and copies every planned tensor from the mapped file. */
+fun uploadWeights(var backend: Backend, file: GgufFile, plan: ArenaPlan): DeviceBuffer? {
+    val arena = backend.allocate(plan.total)
+    if (arena == null) {
+        weightsError = "device memory for ${plan.total} bytes of weights is not available"
+        return null
+    }
+    for (name in plan.names) {
+        val info = file.tensor(name)
+        val ref = plan.refs.get(name)
+        if (info == null || ref == null) return null
+        val address = file.tensorAddress(info)
+        if (address == 0 || !backend.upload(arena, ref.offset, address, info.bytes)) {
+            weightsError = "uploading $name failed"
+            return null
+        }
+    }
+    arena
+}
