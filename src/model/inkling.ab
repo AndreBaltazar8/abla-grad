@@ -234,29 +234,31 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     var ok = this.copy(backend, x, inpSA, n)
 
     // attention inputs
+    // The three attention inputs (q, k, v): the depth mix's rows (one shared row for sliding layers) or x itself; in later loop passes the
+    // controller writes them into `inputs`. Nothing is copied: the norms read where the data already is.
+    val source: array<int> = []
     if (ip > 0) {
         val nq = if (isSwa) 1 else 3
         ok = ok && this.mix(backend, blocks, x, "blk.$ip.attn_res_query.weight", nq, mixed)
-        for (j in 0 until 3) ok = ok && this.copy(backend, mixed + (if (isSwa) 0 else j) * nb, inputs + j * nb, n)
+        for (j in 0 until 3) source.append(mixed + (if (isSwa) 0 else j) * nb)
     } else {
-        for (j in 0 until 3) ok = ok && this.copy(backend, x, inputs + j * nb, n)
+        for (j in 0 until 3) source.append(x)
     }
     if (loopPass > 0) {
         val messages = this.so("msgs")
-        val controlled = this.so("ctrlOut")
         var j = 0
         for (which in ["q", "k", "v"]) {
-            ok = ok && this.control(backend, ip, which, inputs + j * nb, messages + j * nb, controlled)
-            ok = ok && this.copy(backend, controlled, inputs + j * nb, n)
+            ok = ok && this.control(backend, ip, which, source[j], messages + j * nb, inputs + j * nb)
+            source[j] = inputs + j * nb
             j = j + 1
         }
     }
     if (isSwa) {
-        for (j in 0 until 3) ok = ok && this.norm(backend, "blk.$ip.attn_norm.weight", inputs + j * nb, normed + j * nb)
+        for (j in 0 until 3) ok = ok && this.norm(backend, "blk.$ip.attn_norm.weight", source[j], normed + j * nb)
     } else {
-        ok = ok && this.norm(backend, "blk.$ip.attn_q_inp_norm.weight", inputs, normed)
-        ok = ok && this.norm(backend, "blk.$ip.attn_k_inp_norm.weight", inputs + nb, normed + nb)
-        ok = ok && this.norm(backend, "blk.$ip.attn_v_inp_norm.weight", inputs + 2 * nb, normed + 2 * nb)
+        ok = ok && this.norm(backend, "blk.$ip.attn_q_inp_norm.weight", source[0], normed)
+        ok = ok && this.norm(backend, "blk.$ip.attn_k_inp_norm.weight", source[1], normed + nb)
+        ok = ok && this.norm(backend, "blk.$ip.attn_v_inp_norm.weight", source[2], normed + 2 * nb)
     }
     if (!ok) return -1
 
@@ -366,8 +368,8 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     // MoE
     ok = ok && this.mix(backend, blocks, x, "blk.$ip.ffn_res_query.weight", 1, x)
     if (loopPass > 0) {
-        ok = ok && this.control(backend, ip, "ffn", x, this.so("msgs") + 3 * nb, this.so("ctrlOut"))
-        ok = ok && this.copy(backend, this.so("ctrlOut"), x, n)
+        // control_mix is elementwise, so it can overwrite its own `cur`
+        ok = ok && this.control(backend, ip, "ffn", x, this.so("msgs") + 3 * nb, x)
     }
     ok = ok && this.norm(backend, "blk.$ip.ffn_norm.weight", x, x)
     if (!ok) return -1
