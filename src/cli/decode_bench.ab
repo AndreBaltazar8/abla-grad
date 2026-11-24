@@ -45,12 +45,16 @@ fun cmdDecodeBench(args: array<string>): int {
     var maxCtx = 0
     var logPath = ""
     var noSplit = false
+    var splits = 16
     var noFuse = false
     val positional: array<string> = []
     var index = 0
     while (index < args.size) {
         if (args[index] == "--n" && index + 1 < args.size) {
             count = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else if (args[index] == "--splits" && index + 1 < args.size) {
+            splits = args[index + 1].parseInt() ?? 16
             index = index + 2
         } else if (args[index] == "--no-split") {
             noSplit = true
@@ -97,6 +101,7 @@ fun cmdDecodeBench(args: array<string>): int {
     if (!model.reset(backend)) return 1
     model.useStep = true
     model.splitAttention = !noSplit
+    model.attentionSplits = splits
     model.fused = !noFuse
     // prefill all but the last prompt token (this also loads every kernel module, which must happen before recording)
     for (position in 0 until ids.size - 1) {

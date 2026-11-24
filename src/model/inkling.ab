@@ -16,7 +16,7 @@ import "dump.ab"
 private var inklingError = ""
 
 // Blocks per head in the split decode attention (position-parallel; the recorded graph keeps this fixed).
-val ATTENTION_SPLITS = 8
+val ATTENTION_SPLITS_MAX = 64
 
 fun inklingLastError(): string = inklingError
 
@@ -49,7 +49,7 @@ fun inklingScratch(c: InklingConfig): ScratchMap {
     at = scratchAdd(offsets, "vDyn", c.nConv * c.nHeadKv, at)
     at = scratchAdd(offsets, "sinks", c.nHead, at)
     at = scratchAdd(offsets, "table", c.nHead * (c.extent + 1), at)
-    at = scratchAdd(offsets, "attPart", c.nHead * ATTENTION_SPLITS * (c.headDim + 2), at)
+    at = scratchAdd(offsets, "attPart", c.nHead * ATTENTION_SPLITS_MAX * (c.headDim + 2), at)
     at = scratchAdd(offsets, "att", qDim, at)
     at = scratchAdd(offsets, "gate", qDim, at)
     at = scratchAdd(offsets, "oproj", n, at)
@@ -116,6 +116,8 @@ resource class InklingModel(
     var useStep: bool = false,
     // Split-position decode attention in step mode (--no-split restores the one-block-per-head kernel for A/B runs).
     var splitAttention: bool = true,
+    // Blocks per head (1..ATTENTION_SPLITS_MAX); fixed once a token is recorded.
+    var attentionSplits: int = 16,
     // Use the generated fused gate/up + SiTU kernel for the experts when the shapes match (--no-fuse turns it off for A/B runs).
     var fused: bool = true,
     // When not empty, `forward` at position 0 writes named intermediate vectors (the oracle's names) into this directory.
@@ -329,7 +331,7 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
         if (this.splitAttention) {
             ok = ok && opAttentionRelSplitStep(backend, this.scratch, q, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
                 this.scratch, table, this.scratch, this.so("attPart"), this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent,
-                this.maxCtx, scale, ATTENTION_SPLITS)
+                this.maxCtx, scale, this.attentionSplits)
         } else {
             ok = ok && opAttentionDecodeRelStep(backend, this.scratch, q, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
                 this.scratch, table, this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent, this.maxCtx, scale)
