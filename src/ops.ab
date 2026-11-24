@@ -136,3 +136,124 @@ fun opArgmax(var backend: Backend, x: DeviceBuffer, xOffset: int, n: int, out: D
 
 fun opCopy(var backend: Backend, src: DeviceBuffer, srcOffset: int, dst: DeviceBuffer, dstOffset: int, n: int): bool =
     backend.launch("copy_f32", kernelArgs().pointer(src, srcOffset).pointer(dst, dstOffset).u32(n), [n])
+
+// ---- Inkling additions (docs/inkling-graph.md, docs/kernels.md) ----
+
+// Weightless rmsnorm (the weight pointer is null).
+fun opRmsNormPlain(
+    var backend: Backend, x: DeviceBuffer, xOffset: int, y: DeviceBuffer, yOffset: int, n: int, eps: f32, vectors: int
+): bool = backend.launch(
+    "rmsnorm", kernelArgs().pointer(x, xOffset).u64(0).pointer(y, yOffset).u32(n).f32(eps), [vectors]
+)
+
+// `scale` (rows * dim values) when `useScale`, else none.
+fun opL2Clip(
+    var backend: Backend, x: DeviceBuffer, xOffset: int, scale: DeviceBuffer, scaleOffset: int, useScale: bool,
+    y: DeviceBuffer, yOffset: int, rows: int, dim: int, t: f32
+): bool {
+    if (useScale) {
+        return backend.launch(
+            "l2clip", kernelArgs().pointer(x, xOffset).pointer(scale, scaleOffset).pointer(y, yOffset).u32(rows).u32(dim).f32(t), [rows]
+        )
+    }
+    backend.launch("l2clip", kernelArgs().pointer(x, xOffset).u64(0).pointer(y, yOffset).u32(rows).u32(dim).f32(t), [rows])
+}
+
+fun opScale(var backend: Backend, x: DeviceBuffer, xOffset: int, s: f32, n: int): bool =
+    backend.launch("scale_f32", kernelArgs().pointer(x, xOffset).f32(s).u32(n), [n])
+
+fun opSigmoidMul(
+    var backend: Backend, a: DeviceBuffer, aOffset: int, g: DeviceBuffer, gOffset: int, out: DeviceBuffer, outOffset: int, n: int
+): bool = backend.launch(
+    "sigmoid_mul", kernelArgs().pointer(a, aOffset).pointer(g, gOffset).pointer(out, outOffset).u32(n), [n]
+)
+
+// states = bank[0..nBank) (n floats each, contiguous) + cur; out = [nQuery][n].
+fun opDepthMix(
+    var backend: Backend, bank: DeviceBuffer, bankOffset: int, nBank: int, cur: DeviceBuffer, curOffset: int,
+    queries: DeviceBuffer, queriesOffset: int, nQuery: int, out: DeviceBuffer, outOffset: int, n: int, eps: f32
+): bool = backend.launch(
+    "depth_mix",
+    kernelArgs().pointer(bank, bankOffset).u32(nBank).pointer(cur, curOffset).pointer(queries, queriesOffset).u32(nQuery)
+        .pointer(out, outOffset).u32(n).f32(eps),
+    [nQuery]
+)
+
+fun opConvStep(
+    var backend: Backend, x: DeviceBuffer, xOffset: int, history: DeviceBuffer, historyOffset: int, w: DeviceBuffer, wOffset: int,
+    dyn: DeviceBuffer, dynOffset: int, useDyn: bool, out: DeviceBuffer, outOffset: int,
+    channels: int, nConv: int, heads: int, outScale: f32
+): bool {
+    if (useDyn) {
+        return backend.launch(
+            "conv_step",
+            kernelArgs().pointer(x, xOffset).pointer(history, historyOffset).pointer(w, wOffset).pointer(dyn, dynOffset)
+                .pointer(out, outOffset).u32(channels).u32(nConv).u32(heads).f32(outScale),
+            [channels]
+        )
+    }
+    backend.launch(
+        "conv_step",
+        kernelArgs().pointer(x, xOffset).pointer(history, historyOffset).pointer(w, wOffset).u64(0)
+            .pointer(out, outOffset).u32(channels).u32(nConv).u32(heads).f32(outScale),
+        [channels]
+    )
+}
+
+fun opRelTable(
+    var backend: Backend, relBias: DeviceBuffer, relBiasOffset: int, r: DeviceBuffer, rOffset: int, sinks: DeviceBuffer, sinksOffset: int,
+    table: DeviceBuffer, tableOffset: int, nRel: int, extent: int, nHead: int
+): bool = backend.launch(
+    "rel_table",
+    kernelArgs().pointer(relBias, relBiasOffset).pointer(r, rOffset).pointer(sinks, sinksOffset).pointer(table, tableOffset)
+        .u32(nRel).u32(extent).u32(nHead),
+    [nHead * (extent + 1)]
+)
+
+fun opAttentionDecodeRel(
+    var backend: Backend, q: DeviceBuffer, qOffset: int, kCache: DeviceBuffer, kCacheOffset: int, vCache: DeviceBuffer, vCacheOffset: int,
+    table: DeviceBuffer, tableOffset: int, out: DeviceBuffer, outOffset: int,
+    nHead: int, nKvHead: int, headDim: int, first: int, last: int, pos: int, extent: int, maxCtx: int, scale: f32
+): bool = backend.launch(
+    "attention_decode_rel",
+    kernelArgs().pointer(q, qOffset).pointer(kCache, kCacheOffset).pointer(vCache, vCacheOffset).pointer(table, tableOffset)
+        .pointer(out, outOffset).u32(nHead).u32(nKvHead).u32(headDim).u32(first).u32(last).u32(pos).u32(extent).u32(maxCtx).f32(scale),
+    [nHead]
+)
+
+fun opMoeRoute(
+    var backend: Backend, logits: DeviceBuffer, logitsOffset: int, bias: DeviceBuffer, biasOffset: int, useBias: bool,
+    nExpert: int, k: int, ids: DeviceBuffer, idsOffset: int, weights: DeviceBuffer, weightsOffset: int, normEps: f32, weightScale: f32
+): bool {
+    if (useBias) {
+        return backend.launch(
+            "moe_route",
+            kernelArgs().pointer(logits, logitsOffset).pointer(bias, biasOffset).u32(nExpert).u32(k).pointer(ids, idsOffset)
+                .pointer(weights, weightsOffset).f32(normEps).f32(weightScale),
+            [1]
+        )
+    }
+    backend.launch(
+        "moe_route",
+        kernelArgs().pointer(logits, logitsOffset).u64(0).u32(nExpert).u32(k).pointer(ids, idsOffset)
+            .pointer(weights, weightsOffset).f32(normEps).f32(weightScale),
+        [1]
+    )
+}
+
+fun opSitu(
+    var backend: Backend, gateUp: DeviceBuffer, gateUpOffset: int, out: DeviceBuffer, outOffset: int,
+    nUsed: int, nFf: int, beta: f32, lb: f32
+): bool = backend.launch(
+    "situ", kernelArgs().pointer(gateUp, gateUpOffset).pointer(out, outOffset).u32(nUsed).u32(nFf).f32(beta).f32(lb), [nUsed * nFf]
+)
+
+fun opControlMix(
+    var backend: Backend, cur: DeviceBuffer, curOffset: int, message: DeviceBuffer, messageOffset: int,
+    gain: DeviceBuffer, gainOffset: int, forget: DeviceBuffer, forgetOffset: int, out: DeviceBuffer, outOffset: int, n: int
+): bool = backend.launch(
+    "control_mix",
+    kernelArgs().pointer(cur, curOffset).pointer(message, messageOffset).pointer(gain, gainOffset).pointer(forget, forgetOffset)
+        .pointer(out, outOffset).u32(n),
+    [n]
+)
