@@ -1,0 +1,464 @@
+// The Inkling-2 decoder (docs/inkling-graph.md is the spec; llama.cpp's inkling2.cpp at the oracle's commit the source). One token at a time:
+// `forward(token, pos)` runs every layer visit (looped core included) and leaves the logits in the scratch buffer. Weights stay in one device arena
+// in their stored types; activations are f32; the state per layer visit is a KV cache and four short-convolution histories.
+import "abla/float"
+import "abla/math"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "../backend/backend.ab"
+import "../ops.ab"
+import "../gguf/reader.ab"
+import "../gguf/quant.ab"
+import "inkling_config.ab"
+import "weights.ab"
+
+private var inklingError = ""
+
+fun inklingLastError(): string = inklingError
+
+// ---- scratch layout: named f32 vectors inside one device buffer (byte offsets) ----
+class ScratchMap(val offsets: Map<string, int>, val total: int)
+
+private fun scratchAdd(var offsets: Map<string, int>, name: string, floats: int, at: int): int {
+    offsets.set(name, at)
+    at + alignUp(floats * 4)
+}
+
+fun inklingScratch(c: InklingConfig): ScratchMap {
+    val offsets: Map<string, int> = Map()
+    val n = c.nEmbd
+    val qDim = c.nHead * c.headDim
+    val kvDim = c.nHeadKv * c.headDim
+    var at = 0
+    at = scratchAdd(offsets, "x", n, at)
+    at = scratchAdd(offsets, "inpSA", n, at)
+    at = scratchAdd(offsets, "inputs", 3 * n, at)
+    at = scratchAdd(offsets, "normed", 3 * n, at)
+    at = scratchAdd(offsets, "mixed", 3 * n, at)
+    at = scratchAdd(offsets, "q", qDim, at)
+    at = scratchAdd(offsets, "kRaw", kvDim, at)
+    at = scratchAdd(offsets, "vRaw", kvDim, at)
+    at = scratchAdd(offsets, "k", kvDim, at)
+    at = scratchAdd(offsets, "v", kvDim, at)
+    at = scratchAdd(offsets, "r", c.nRel * c.nHead, at)
+    at = scratchAdd(offsets, "kDyn", c.nConv * c.nHeadKv, at)
+    at = scratchAdd(offsets, "vDyn", c.nConv * c.nHeadKv, at)
+    at = scratchAdd(offsets, "sinks", c.nHead, at)
+    at = scratchAdd(offsets, "table", c.nHead * (c.extent + 1), at)
+    at = scratchAdd(offsets, "att", qDim, at)
+    at = scratchAdd(offsets, "gate", qDim, at)
+    at = scratchAdd(offsets, "oproj", n, at)
+    at = scratchAdd(offsets, "ffnInp", n, at)
+    at = scratchAdd(offsets, "moeLogits", c.nExpert, at)
+    at = scratchAdd(offsets, "ids", c.nExpertUsed, at)
+    at = scratchAdd(offsets, "weights", c.nExpertUsed, at)
+    at = scratchAdd(offsets, "gu", c.nExpertUsed * 2 * c.nFfExp, at)
+    at = scratchAdd(offsets, "act", c.nExpertUsed * c.nFfExp, at)
+    at = scratchAdd(offsets, "down", c.nExpertUsed * n, at)
+    at = scratchAdd(offsets, "moe", n, at)
+    at = scratchAdd(offsets, "msgs", 4 * n, at)
+    at = scratchAdd(offsets, "ctrlIn", 2 * n, at)
+    at = scratchAdd(offsets, "ctrlGate", c.gateRank, at)
+    at = scratchAdd(offsets, "ctrlGain", n, at)
+    at = scratchAdd(offsets, "ctrlForget", n, at)
+    at = scratchAdd(offsets, "ctrlOut", n, at)
+    at = scratchAdd(offsets, "preludeOut", n, at)
+    at = scratchAdd(offsets, "bankOut", n, at)
+    at = scratchAdd(offsets, "logits", c.nVocabPadded, at)
+    ScratchMap(offsets, at)
+}
+
+private fun inklingNames(file: GgufFile, c: InklingConfig): array<string> {
+    val names: array<string> = ["token_embd.weight", "token_embd_norm.weight", "output.weight", "output_norm.weight", "output_res_query.weight"]
+    for (ip in 0 until c.nLayer) {
+        for (part in ["attn_q", "attn_k", "attn_v", "attn_output", "attn_gate", "attn_k_conv", "attn_v_conv", "attn_post_conv", "ffn_post_conv",
+            "attn_q_clip", "attn_rel", "attn_rel_bias", "attn_rel_clip", "attn_sink_proj", "ffn_norm", "ffn_gate_inp", "ffn_gate_up_exps",
+            "ffn_down_exps", "ffn_res_query"]) {
+            names.append("blk.$ip.$part.weight")
+        }
+        names.append("blk.$ip.exp_probs_b.bias")
+        for (optional in ["attn_norm.weight", "attn_q_inp_norm.weight", "attn_k_inp_norm.weight", "attn_v_inp_norm.weight", "attn_k_conv_proj.weight",
+            "attn_v_conv_proj.weight", "attn_res_query.weight", "ffn_gate_up_exps.scale", "ffn_down_exps.scale", "loop_msg_query.weight"]) {
+            if (file.tensor("blk.$ip.$optional") != null) names.append("blk.$ip.$optional")
+        }
+        for (control in ["q", "k", "v", "ffn"]) {
+            for (part in ["down", "gain", "forget"]) {
+                val name = "blk.$ip.loop_${control}_ctrl_$part.weight"
+                if (file.tensor(name) != null) names.append(name)
+            }
+        }
+    }
+    names
+}
+
+// The loaded model.
+resource class InklingModel(
+    val config: InklingConfig,
+    val plan: ArenaPlan,
+    val scratchMap: ScratchMap,
+    val maxCtx: int,
+    val visits: int,
+    val arena: DeviceBuffer,
+    val scratch: DeviceBuffer,
+    val kCache: DeviceBuffer,
+    val vCache: DeviceBuffer,
+    val history: DeviceBuffer,
+    val blocks: DeviceBuffer,
+    val bank: DeviceBuffer
+)
+
+private fun historyBytesPerVisit(c: InklingConfig): int = (c.nConv - 1) * (2 * c.nHeadKv * c.headDim + 2 * c.nEmbd) * 4
+
+fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: int): InklingModel? {
+    inklingError = ""
+    val plan = planWeights(file, inklingNames(file, c))
+    if (plan == null) {
+        inklingError = weightsLastError()
+        return null
+    }
+    val arena = uploadWeights(backend, file, plan)
+    if (arena == null) {
+        inklingError = weightsLastError()
+        return null
+    }
+    val map = inklingScratch(c)
+    val visits = inklingVisits(c)
+    val scratch = backend.allocate(map.total)
+    val kvBytes = visits * c.nHeadKv * maxCtx * c.headDim * 4
+    val kCache = backend.allocate(kvBytes)
+    val vCache = backend.allocate(kvBytes)
+    val history = backend.allocate(visits * historyBytesPerVisit(c))
+    val blocks = backend.allocate((c.nLayer + 2) * c.nEmbd * 4)
+    val bank = backend.allocate((c.nLayer + 2) * c.nEmbd * 4)
+    if (scratch == null || kCache == null || vCache == null || history == null || blocks == null || bank == null) {
+        inklingError = "device memory for the activations, KV caches and convolution histories is not available"
+        return null
+    }
+    InklingModel(c, plan, map, maxCtx, visits, move(arena), move(scratch), move(kCache), move(vCache), move(history), move(blocks), move(bank))
+}
+
+// Zeroes the convolution histories (a fresh sequence).
+trusted fun InklingModel.reset(var backend: Backend): bool {
+    val bytes = this.visits * historyBytesPerVisit(this.config)
+    val host = nativeByteBuffer(bytes + 8)
+    val address = nativePointerAddress(host.address)
+    for (index in 0 until bytes / 8) ablaUnsafeStoreI64(nativePointerFromAddress(address + 8 * index), 0)
+    val ok = backend.upload(this.history, 0, address, bytes)
+    host.close()
+    ok
+}
+
+// ---- helpers ----
+private fun InklingModel.so(name: string): int = this.scratchMap.offsets.get(name) ?? 0
+
+private fun InklingModel.w(name: string): WeightRef = weightOf(this.plan, name)
+
+private fun InklingModel.has(name: string): bool = this.plan.refs.get(name) != null
+
+private fun InklingModel.matvec(var backend: Backend, name: string, input: int, output: int): bool {
+    val ref = this.w(name)
+    val kind = weightKind(ref.type)
+    if (kind == "") {
+        inklingError = "no kernel for ${ggmlTypeName(ref.type)} ($name)"
+        return false
+    }
+    opMatvec(backend, kind, this.arena, ref.offset, this.scratch, input, this.scratch, output, ref.rows, ref.cols)
+}
+
+private fun InklingModel.norm(var backend: Backend, name: string, input: int, output: int): bool {
+    val ref = this.w(name)
+    opRmsNorm(backend, this.scratch, input, this.arena, ref.offset, this.scratch, output, this.config.nEmbd, this.config.rmsEps, 1)
+}
+
+private fun InklingModel.copy(var backend: Backend, src: int, dst: int, n: int): bool =
+    opCopy(backend, this.scratch, src, this.scratch, dst, n)
+
+// depth mixing: states = blocks[0..nBlocks) + cur; `queryName` has nQuery queries; the result is [nQuery][n] at `output`.
+private fun InklingModel.mix(var backend: Backend, nBlocks: int, curOffset: int, queryName: string, nQuery: int, output: int): bool {
+    val ref = this.w(queryName)
+    opDepthMix(backend, this.blocks, 0, nBlocks, this.scratch, curOffset, this.arena, ref.offset, nQuery, this.scratch, output, this.config.nEmbd, 0.000001)
+}
+
+// control(cur, message): cur - tanh(forget)*cur + tanh(gain)*message, gates from the controller tensors of physical layer `ip`.
+private fun InklingModel.control(var backend: Backend, ip: int, which: string, curOffset: int, messageOffset: int, output: int): bool {
+    val n = this.config.nEmbd
+    val down = this.w("blk.$ip.loop_${which}_ctrl_down.weight")
+    val gain = this.w("blk.$ip.loop_${which}_ctrl_gain.weight")
+    val forget = this.w("blk.$ip.loop_${which}_ctrl_forget.weight")
+    var ok = opRmsNormPlain(backend, this.scratch, curOffset, this.scratch, this.so("ctrlIn"), n, 0.000001, 1)
+    ok = ok && opRmsNormPlain(backend, this.scratch, messageOffset, this.scratch, this.so("ctrlIn") + n * 4, n, 0.000001, 1)
+    ok = ok && opMatvec(backend, "f32", this.arena, down.offset, this.scratch, this.so("ctrlIn"), this.scratch, this.so("ctrlGate"), down.rows, down.cols)
+    ok = ok && opMatvec(backend, "f32", this.arena, gain.offset, this.scratch, this.so("ctrlGate"), this.scratch, this.so("ctrlGain"), gain.rows, gain.cols)
+    ok = ok && opMatvec(backend, "f32", this.arena, forget.offset, this.scratch, this.so("ctrlGate"), this.scratch, this.so("ctrlForget"), forget.rows, forget.cols)
+    ok && opControlMix(backend, this.scratch, curOffset, this.scratch, messageOffset, this.scratch, this.so("ctrlGain"),
+        this.scratch, this.so("ctrlForget"), this.scratch, output, n)
+}
+
+// ---- one layer visit ----
+// `ip` is the physical layer (its tensors), `visit` the cache slot (its KV cache and histories), `loopPass` > 0 inside the looped core's later passes
+// (then `nBank` bank states and the messages are valid). `nBlocks` is the current block count; returns the new one, or -1 on failure.
+private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPass: int, nBank: int, pos: int, nBlocks: int): int {
+    val c = this.config
+    val n = c.nEmbd
+    val nb = n * 4
+    val qDim = c.nHead * c.headDim
+    val kvDim = c.nHeadKv * c.headDim
+    val isSwa = !this.has("blk.$ip.attn_q_inp_norm.weight")
+    val extent = if (isSwa) c.nSwa else c.extent
+    val x = this.so("x")
+    val inpSA = this.so("inpSA")
+    val inputs = this.so("inputs")
+    val normed = this.so("normed")
+    val mixed = this.so("mixed")
+    var blocks = nBlocks
+    var ok = this.copy(backend, x, inpSA, n)
+
+    // attention inputs
+    if (ip > 0) {
+        val nq = if (isSwa) 1 else 3
+        ok = ok && this.mix(backend, blocks, x, "blk.$ip.attn_res_query.weight", nq, mixed)
+        for (j in 0 until 3) ok = ok && this.copy(backend, mixed + (if (isSwa) 0 else j) * nb, inputs + j * nb, n)
+    } else {
+        for (j in 0 until 3) ok = ok && this.copy(backend, x, inputs + j * nb, n)
+    }
+    if (loopPass > 0) {
+        val messages = this.so("msgs")
+        val controlled = this.so("ctrlOut")
+        var j = 0
+        for (which in ["q", "k", "v"]) {
+            ok = ok && this.control(backend, ip, which, inputs + j * nb, messages + j * nb, controlled)
+            ok = ok && this.copy(backend, controlled, inputs + j * nb, n)
+            j = j + 1
+        }
+    }
+    if (isSwa) {
+        for (j in 0 until 3) ok = ok && this.norm(backend, "blk.$ip.attn_norm.weight", inputs + j * nb, normed + j * nb)
+    } else {
+        ok = ok && this.norm(backend, "blk.$ip.attn_q_inp_norm.weight", inputs, normed)
+        ok = ok && this.norm(backend, "blk.$ip.attn_k_inp_norm.weight", inputs + nb, normed + nb)
+        ok = ok && this.norm(backend, "blk.$ip.attn_v_inp_norm.weight", inputs + 2 * nb, normed + 2 * nb)
+    }
+    if (!ok) return -1
+
+    // projections
+    val q = this.so("q")
+    val kRaw = this.so("kRaw")
+    val vRaw = this.so("vRaw")
+    val k = this.so("k")
+    val v = this.so("v")
+    val r = this.so("r")
+    ok = this.matvec(backend, "blk.$ip.attn_q.weight", normed, q)
+    ok = ok && this.matvec(backend, "blk.$ip.attn_k.weight", normed + nb, kRaw)
+    ok = ok && this.matvec(backend, "blk.$ip.attn_v.weight", normed + 2 * nb, vRaw)
+    ok = ok && this.matvec(backend, "blk.$ip.attn_rel.weight", normed, r)
+    if (!isSwa) {
+        ok = ok && this.matvec(backend, "blk.$ip.attn_k_conv_proj.weight", normed + nb, this.so("kDyn"))
+        ok = ok && this.matvec(backend, "blk.$ip.attn_v_conv_proj.weight", normed + 2 * nb, this.so("vDyn"))
+    }
+    if (!ok) return -1
+
+    // short convolutions on K and V (state per visit)
+    val historyBase = visit * historyBytesPerVisit(c)
+    val kHistory = historyBase
+    val vHistory = historyBase + (c.nConv - 1) * kvDim * 4
+    val aHistory = historyBase + (c.nConv - 1) * 2 * kvDim * 4
+    val fHistory = aHistory + (c.nConv - 1) * n * 4
+    val dynScale = f64ToF32(1.0 / sqrt(f64FromInt((if (isSwa) 1 else 2) * c.nConv + 1)))
+    val plainScale = f64ToF32(1.0 / sqrt(f64FromInt(c.nConv + 1)))
+    val kConv = this.w("blk.$ip.attn_k_conv.weight")
+    val vConv = this.w("blk.$ip.attn_v_conv.weight")
+    ok = opConvStep(backend, this.scratch, kRaw, this.history, kHistory, this.arena, kConv.offset, this.scratch, this.so("kDyn"), !isSwa,
+        this.scratch, k, kvDim, c.nConv, c.nHeadKv, dynScale)
+    ok = ok && opConvStep(backend, this.scratch, vRaw, this.history, vHistory, this.arena, vConv.offset, this.scratch, this.so("vDyn"), !isSwa,
+        this.scratch, v, kvDim, c.nConv, c.nHeadKv, dynScale)
+
+    // clip / normalize
+    val qClip = this.w("blk.$ip.attn_q_clip.weight")
+    val relClip = this.w("blk.$ip.attn_rel_clip.weight")
+    ok = ok && opL2Clip(backend, this.scratch, q, this.arena, qClip.offset, true, this.scratch, q, c.nHead, c.headDim, c.qkClip)
+    ok = ok && opL2Clip(backend, this.scratch, k, this.arena, 0, false, this.scratch, k, c.nHeadKv, c.headDim, c.qkClip)
+    ok = ok && opRmsNormPlain(backend, this.scratch, v, this.scratch, v, c.headDim, c.rmsEps, c.nHeadKv)
+    ok = ok && opL2Clip(backend, this.scratch, r, this.arena, relClip.offset, true, this.scratch, r, c.nHead, c.nRel, c.relClip)
+    if (!isSwa) {
+        val ratio = (f64FromInt(pos) + 1.0) / f64FromInt(c.logFloor)
+        val tau = f64ToF32(1.0 + f32ToF64(c.logAlpha) * log(if (ratio > 1.0) ratio else 1.0))
+        ok = ok && opScale(backend, this.scratch, q, tau, qDim)
+        ok = ok && opScale(backend, this.scratch, r, tau, c.nRel * c.nHead)
+    }
+    if (!ok) return -1
+
+    // relative-position bias table with the sinks folded in, then attention
+    val sinks = this.so("sinks")
+    val table = this.so("table")
+    val relBias = this.w("blk.$ip.attn_rel_bias.weight")
+    ok = this.matvec(backend, "blk.$ip.attn_sink_proj.weight", normed, sinks)
+    ok = ok && opRelTable(backend, this.arena, relBias.offset, this.scratch, r, this.scratch, sinks, this.scratch, table, c.nRel, extent, c.nHead)
+    val layerCacheBytes = c.nHeadKv * this.maxCtx * c.headDim * 4
+    ok = ok && opKvStore(backend, this.scratch, k, this.scratch, v, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
+        pos, c.nHeadKv, c.headDim, this.maxCtx)
+    val first = if (isSwa && pos - c.nSwa + 1 > 0) pos - c.nSwa + 1 else 0
+    val scale = f64ToF32(1.0 / sqrt(f64FromInt(c.headDim)))
+    val att = this.so("att")
+    ok = ok && opAttentionDecodeRel(backend, this.scratch, q, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
+        this.scratch, table, this.scratch, att, c.nHead, c.nHeadKv, c.headDim, first, pos, pos, extent, this.maxCtx, scale)
+    ok = ok && this.matvec(backend, "blk.$ip.attn_gate.weight", normed, this.so("gate"))
+    ok = ok && opSigmoidMul(backend, this.scratch, att, this.scratch, this.so("gate"), this.scratch, att, qDim)
+    val oproj = this.so("oproj")
+    ok = ok && this.matvec(backend, "blk.$ip.attn_output.weight", att, oproj)
+    val postConv = this.w("blk.$ip.attn_post_conv.weight")
+    ok = ok && opConvStep(backend, this.scratch, oproj, this.history, aHistory, this.arena, postConv.offset, this.scratch, 0, false,
+        this.scratch, x, n, c.nConv, 1, plainScale)
+    if (!ok) return -1
+
+    // block residual
+    if (ip % c.blockSize == 0) {
+        ok = opCopy(backend, this.scratch, inpSA, this.blocks, blocks * nb, n)
+        blocks = blocks + 1
+    } else {
+        ok = opAdd(backend, this.scratch, inpSA, this.scratch, x, this.scratch, x, n)
+    }
+    val ffnInp = this.so("ffnInp")
+    ok = ok && this.copy(backend, x, ffnInp, n)
+
+    // MoE
+    ok = ok && this.mix(backend, blocks, x, "blk.$ip.ffn_res_query.weight", 1, x)
+    if (loopPass > 0) {
+        ok = ok && this.control(backend, ip, "ffn", x, this.so("msgs") + 3 * nb, this.so("ctrlOut"))
+        ok = ok && this.copy(backend, this.so("ctrlOut"), x, n)
+    }
+    ok = ok && this.norm(backend, "blk.$ip.ffn_norm.weight", x, x)
+    if (!ok) return -1
+    val ids = this.so("ids")
+    val weights = this.so("weights")
+    val routerLogits = this.so("moeLogits")
+    val bias = this.w("blk.$ip.exp_probs_b.bias")
+    ok = this.matvec(backend, "blk.$ip.ffn_gate_inp.weight", x, routerLogits)
+    ok = ok && opMoeRoute(backend, this.scratch, routerLogits, this.arena, bias.offset, true, c.nExpert, c.nExpertUsed, this.scratch, ids,
+        this.scratch, weights, 0.00000000000000000001, c.expertScale)
+    val guRef = this.w("blk.$ip.ffn_gate_up_exps.weight")
+    val downRef = this.w("blk.$ip.ffn_down_exps.weight")
+    val guKind = weightKind(guRef.type)
+    val downKind = weightKind(downRef.type)
+    if (guKind == "" || downKind == "") {
+        inklingError = "no kernel for the expert types ${ggmlTypeName(guRef.type)} / ${ggmlTypeName(downRef.type)}"
+        return -1
+    }
+    val guScales = this.w("blk.$ip.ffn_gate_up_exps.scale")
+    val downScales = this.w("blk.$ip.ffn_down_exps.scale")
+    val guRowBytes = ggmlRowBytes(guRef.type, guRef.cols)
+    val downRowBytes = ggmlRowBytes(downRef.type, downRef.cols)
+    val nFf = c.nFfExp
+    ok = ok && opMatvecIndexed(backend, guKind, this.arena, guRef.offset, this.scratch, x, this.scratch, this.so("gu"), 2 * nFf, n,
+        this.scratch, ids, c.nExpertUsed, guRowBytes * 2 * nFf, 0, this.arena, guScales.offset, this.has("blk.$ip.ffn_gate_up_exps.scale"))
+    ok = ok && opSitu(backend, this.scratch, this.so("gu"), this.scratch, this.so("act"), c.nExpertUsed, nFf, c.situBeta, c.situLinear)
+    ok = ok && opMatvecIndexed(backend, downKind, this.arena, downRef.offset, this.scratch, this.so("act"), this.scratch, this.so("down"), n, nFf,
+        this.scratch, ids, c.nExpertUsed, downRowBytes * n, nFf, this.arena, downScales.offset, this.has("blk.$ip.ffn_down_exps.scale"))
+    ok = ok && opMoeCombine(backend, this.scratch, this.so("down"), this.scratch, weights, this.scratch, this.so("moe"), n, c.nExpertUsed)
+    val ffnPost = this.w("blk.$ip.ffn_post_conv.weight")
+    ok = ok && opConvStep(backend, this.scratch, this.so("moe"), this.history, fHistory, this.arena, ffnPost.offset, this.scratch, 0, false,
+        this.scratch, x, n, c.nConv, 1, plainScale)
+    ok = ok && opAdd(backend, this.scratch, ffnInp, this.scratch, x, this.scratch, x, n)
+    if (!ok) {
+        inklingError = "a launch failed in layer $ip (visit $visit)"
+        return -1
+    }
+    blocks
+}
+
+// One token at position `pos` (the sequence's `pos`-th token; call `reset` before a new sequence). Leaves the logits (padded vocabulary) in the scratch buffer.
+fun InklingModel.forward(var backend: Backend, token: int, pos: int): bool {
+    val c = this.config
+    val n = c.nEmbd
+    val nb = n * 4
+    if (pos < 0 || pos >= this.maxCtx) {
+        inklingError = "position $pos is outside the cache of ${this.maxCtx}"
+        return false
+    }
+    val embd = this.w("token_embd.weight")
+    val embdKind = weightKind(embd.type)
+    if (embdKind == "") {
+        inklingError = "no kernel for the embedding type ${ggmlTypeName(embd.type)}"
+        return false
+    }
+    val x = this.so("x")
+    var ok = opGatherRow(backend, embdKind, this.arena, embd.offset, token, this.scratch, x, n)
+    ok = ok && this.norm(backend, "token_embd_norm.weight", x, x)
+    if (!ok) {
+        inklingError = "the embedding failed"
+        return false
+    }
+    var blocks = 0
+    var visit = 0
+    val loopStart = if (c.looped) c.loopStart else c.nLayer
+    val loopEnd = if (c.looped) c.loopEnd else c.nLayer
+    for (ip in 0 until loopStart) {
+        blocks = this.layer(backend, ip, visit, 0, 0, pos, blocks)
+        visit = visit + 1
+        if (blocks < 0) return false
+    }
+    if (c.looped) {
+        val preludeBlocks = blocks
+        ok = this.copy(backend, x, this.so("preludeOut"), n)
+        var nBank = 0
+        for (pass in 0 until c.loopCount) {
+            if (pass > 0) {
+                // the previous pass's blocks after the first core block are the bank; its output is the bank output; this pass restarts from the prelude
+                nBank = blocks - preludeBlocks - 1
+                ok = ok && this.copy(backend, x, this.so("bankOut"), n)
+                if (nBank > 0) ok = ok && opCopy(backend, this.blocks, (preludeBlocks + 1) * nb, this.bank, 0, nBank * n)
+                ok = ok && this.copy(backend, this.so("preludeOut"), x, n)
+                blocks = preludeBlocks
+                // messages = mix(bank, bankOut, msg_query of the first core layer?) per layer: computed inside the loop below
+            }
+            for (ip in loopStart until loopEnd) {
+                if (pass > 0) {
+                    val query = this.w("blk.$ip.loop_msg_query.weight")
+                    ok = ok && opDepthMix(backend, this.bank, 0, nBank, this.scratch, this.so("bankOut"), this.arena, query.offset, 4, this.scratch,
+                        this.so("msgs"), n, 0.000001)
+                    if (!ok) {
+                        inklingError = "the loop messages failed in layer $ip"
+                        return false
+                    }
+                }
+                blocks = this.layer(backend, ip, visit, pass, nBank, pos, blocks)
+                visit = visit + 1
+                if (blocks < 0) return false
+            }
+        }
+    }
+    for (ip in loopEnd until c.nLayer) {
+        blocks = this.layer(backend, ip, visit, 0, 0, pos, blocks)
+        visit = visit + 1
+        if (blocks < 0) return false
+    }
+    // output: depth mix, norm, lm head, softcap
+    ok = this.mix(backend, blocks, x, "output_res_query.weight", 1, x)
+    ok = ok && this.norm(backend, "output_norm.weight", x, x)
+    val output = this.w("output.weight")
+    val outputKind = weightKind(output.type)
+    if (outputKind == "") {
+        inklingError = "no kernel for the output type ${ggmlTypeName(output.type)}"
+        return false
+    }
+    ok = ok && opMatvec(backend, outputKind, this.arena, output.offset, this.scratch, x, this.scratch, this.so("logits"), output.rows, output.cols)
+    if (c.softcap != 0.0) ok = ok && opSoftcap(backend, this.scratch, this.so("logits"), c.softcap, c.nVocabPadded)
+    if (!ok) inklingError = "the output projection failed"
+    ok
+}
+
+// The logits of the last `forward` (the real vocabulary only), as host floats.
+trusted fun InklingModel.readLogits(var backend: Backend): array<f32>? {
+    val count = this.config.nVocab
+    val bytes = count * 4
+    val host = nativeByteBuffer(bytes + 8)
+    if (!backend.download(this.scratch, this.so("logits"), nativePointerAddress(host.address), bytes)) {
+        inklingError = "downloading the logits failed"
+        host.close()
+        return null
+    }
+    val address = nativePointerAddress(host.address)
+    val logits: array<f32> = []
+    for (index in 0 until count) logits.append(f32FromBits(u32(ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * index)))))
+    host.close()
+    logits
+}

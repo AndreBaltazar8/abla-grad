@@ -1,0 +1,2 @@
+import "../src/model/inkling.ab"
+fun main: int = 0
