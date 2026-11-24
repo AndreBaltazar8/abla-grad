@@ -1,0 +1,44 @@
+// The Backend interface compiles, a buffer returns itself to its owner on drop, and KernelArgs packs in order.
+// RecordingBackend is a test double (no device); the real implementations are tested in their own files.
+import "abla/io"
+import "../src/backend/backend.ab"
+
+class RecordingBackend(var launchedWords: int, var live: int, var lastKernel: string) : Backend {
+    fun name(): string = "recording"
+    fun allocate(bytes: int): DeviceBuffer? {
+        this.live = this.live + 1
+        DeviceBuffer(this, 4096, bytes)
+    }
+    fun upload(destination: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool = true
+    fun download(source: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool = true
+    fun launch(kernel: string, args: KernelArgs, problem: array<int>): bool {
+        this.launchedWords = this.launchedWords + args.words.size
+        this.lastKernel = kernel
+        args.kinds.size == args.words.size
+    }
+    fun synchronize(): bool = true
+    fun freeMemory(): int = 0
+    fun release(handle: int, bytes: int): void {
+        this.live = this.live - 1
+    }
+}
+
+fun launchOne(var backend: RecordingBackend): bool {
+    val buffer = backend.allocate(64)
+    if (buffer == null) return false
+    val args = kernelArgs().pointer(buffer, 8).u32(7).f32(1.5)
+    val ok = backend.launch("k", args, [3]) && args.words[0] == 4096 + 8 && args.words[1] == 7
+    ok
+}
+
+fun main: int {
+    var backend = RecordingBackend(0, 0, "")
+    val ok = launchOne(backend)
+    // The buffer was dropped when launchOne returned.
+    if (!ok || backend.launchedWords != 3 || backend.lastKernel != "k" || backend.live != 0) {
+        println("backend interface test FAILED words=${backend.launchedWords} live=${backend.live}")
+        return 1
+    }
+    println("backend interface test passed")
+    0
+}

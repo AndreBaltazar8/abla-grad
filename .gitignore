@@ -2,3 +2,4 @@
 /.abla-cache/
 /result
 *.spv.tmp
+/.claude/

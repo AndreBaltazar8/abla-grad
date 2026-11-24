@@ -1,4 +1,3 @@
 name = "abla-grad"
 version = "0.0.1"
 entry = "src/main.ab"
-nativeLibraries = ["vulkan"]

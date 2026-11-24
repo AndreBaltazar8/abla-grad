@@ -66,26 +66,15 @@ Tensor dump: `<outdir>/<tensor-name>.f32` raw little-endian f32 plus `<outdir>/i
 Report: the Inkling GGUF's file size, tensor census and whether llama.cpp's `inkling2` implementation is in the pinned commit.
 
 ## 4. Backend interface (60-2): `src/backend/backend.ab`
-The only thing the model, ops and CLI know about devices. Implementations: `CudaBackend` (first), later Vulkan, CPU, Metal.
-```
-resource class DeviceBuffer            // owned device memory, freed on drop; created only by a Backend
-fun DeviceBuffer.size(): int
-fun DeviceBuffer.address(): int        // the device pointer value, for KernelArgs.pointer
-class KernelArgs                       // the kernel's parameters packed in order, as the backend's launch ABI wants them
-fun kernelArgs(): KernelArgs
-fun KernelArgs.pointer(buffer: borrow DeviceBuffer): KernelArgs
-fun KernelArgs.u32(value: int): KernelArgs     fun KernelArgs.i32(value: int): KernelArgs
-fun KernelArgs.u64(value: int): KernelArgs     fun KernelArgs.f32(value: f32): KernelArgs
-interface Backend {
-    fun name(): string
-    fun allocate(bytes: int): DeviceBuffer?                        // uninitialised; null when out of memory
-    fun upload(destination: borrow DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool
-    fun download(source: borrow DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool   // synchronizes first
-    fun launch(kernel: string, args: KernelArgs, problem: array<int>): bool   // asynchronous, ordered with other launches
-    fun synchronize(): bool                                        // all queued launches and copies done
-    fun freeMemory(): int                                          // bytes the device still has
-}
-```
+The only thing the model, ops and CLI know about devices. **`src/backend/backend.ab` is the contract** (it compiles; tests/backend_interface_test.ab
+checks it with a recording test double). Implementations: `CudaBackend` (first, ablac-e7), later Vulkan, CPU, Metal.
+- `DeviceBuffer(owner: Backend, handle: int, bytes: int)` is a resource class created by `Backend.allocate`; dropping it calls
+  `owner.release(handle, bytes)`. `owner` carries the context identity; a buffer is only valid with its owner.
+- `KernelArgs` packs the parameters in the kernel's order: `.pointer(buffer, offset = 0)` (bounds-checked: offset within the buffer),
+  `.u32`, `.i32`, `.u64`, `.f32`. Pointers and u64 take 8 bytes, the rest 4 (aligned to their size).
+- `Backend`: `name`, `allocate(bytes): DeviceBuffer?`, `upload(dst, offset, hostAddress, bytes)`, `download(src, offset, hostAddress, bytes)`
+  (waits for queued work), `launch(kernel, args, problem)`, `synchronize()`, `freeMemory()`, `release(handle, bytes)` (drop only).
+
 `launch` takes the kernel by **name** and a `problem` (op-specific sizes, e.g. `[rows]` for a matvec); the backend maps
 `problem` to its launch geometry from its own registry (for CUDA: block dims and items-per-block per kernel, `grid =
 ceilDiv(problem[i], perBlock[i])`). Launches on one backend run in order on one stream, so no explicit barrier is needed
@@ -100,7 +89,7 @@ wrapped in checked types; no other module imports an extern.
 Kernel parameter conventions (so ops.ab can call every kernel the same way):
 - weights: `const unsigned char* w` (raw GGUF bytes of the tensor; row r starts at `r * rowBytes`), then `const float* x`,
   `float* y`, then scalars `u32 rows, u32 cols` (cols = elements per row, a multiple of the type's block).
-- indexed: `... const unsigned* ids, u32 nUsed, u64 expertStrideBytes` (expert e starts at `e * expertStrideBytes`).
+- indexed (MoE): `... const unsigned* ids, u32 nUsed, u64 expertStrideBytes, u32 xStrideElems` after rows/cols; problem = `[rows, nUsed]`; expert `ids[i]` starts at `ids[i] * expertStrideBytes`; `x` for slot i is at `i * xStrideElems` (0 = one x broadcast to every expert, as gate/up use; `cols` = a separate x per expert, as down uses); `y` is `nUsed * rows` contiguous.
 - activations f32; norm/scale weights f32 (converted at load if stored f16/bf16).
 - Each kernel has `tests/kernels/<name>_test.ab` with a CPU reference **in the test file** and its tolerance.
 The kernel list and order is in `docs/plan.md`.
