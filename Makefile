@@ -12,3 +12,4 @@ test-host:
 	$(COMPILER) build tests/ops_test.ab -o $(BUILD)/ops_test --fast --no-cache && $(BUILD)/ops_test
 	$(COMPILER) build tests/compare_test.ab -o $(BUILD)/compare_test --fast --no-cache && $(BUILD)/compare_test
 	tests/compare_cli_test.sh $(COMPILER)
+	$(COMPILER) build tests/gguf_reader_test.ab -o $(BUILD)/gguf_reader_test --fast --no-cache && $(BUILD)/gguf_reader_test $(BUILD)/gguf-fixture.gguf
