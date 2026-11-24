@@ -275,3 +275,24 @@ fun opScaleTau(var backend: Backend, x: DeviceBuffer, xOffset: int, step: Device
 
 fun opStepAdvance(var backend: Backend, step: DeviceBuffer): bool =
     backend.launch("step_advance", kernelArgs().pointer(step, 0), [1])
+
+// The token and position come from `step` (e7's kernels: gather_row_q8_0_step, attention_decode_rel_step).
+fun opGatherRowStep(
+    var backend: Backend, kind: string, table: DeviceBuffer, tableOffset: int, step: DeviceBuffer, out: DeviceBuffer, outOffset: int, cols: int
+): bool = backend.launch(
+    "gather_row_${kind}_step", kernelArgs().pointer(table, tableOffset).pointer(step, 0).pointer(out, outOffset).u32(cols), [cols]
+)
+
+fun opAttentionDecodeRelStep(
+    var backend: Backend, q: DeviceBuffer, qOffset: int, kCache: DeviceBuffer, kCacheOffset: int, vCache: DeviceBuffer, vCacheOffset: int,
+    table: DeviceBuffer, tableOffset: int, out: DeviceBuffer, outOffset: int, step: DeviceBuffer,
+    nHead: int, nKvHead: int, headDim: int, window: int, extent: int, maxCtx: int, scale: f32
+): bool = backend.launch(
+    "attention_decode_rel_step",
+    kernelArgs().pointer(q, qOffset).pointer(kCache, kCacheOffset).pointer(vCache, vCacheOffset).pointer(table, tableOffset)
+        .pointer(out, outOffset).pointer(step, 0).u32(nHead).u32(nKvHead).u32(headDim).u32(window).u32(extent).u32(maxCtx).f32(scale),
+    [nHead]
+)
+
+fun opStepRecord(var backend: Backend, step: DeviceBuffer): bool =
+    backend.launch("step_record", kernelArgs().pointer(step, 0), [1])

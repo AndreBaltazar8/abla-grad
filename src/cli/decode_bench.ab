@@ -1,0 +1,136 @@
+// `abla-grad decode-bench <model.gguf> <ids-file> [--n N] [--mode direct|graph] [--ctx N] [--log file]`: greedy decode speed of an Inkling model, tg128-style.
+// The prompt (one token id per line) is prefilled token by token (not timed); then N tokens are generated and timed with nothing else in the loop:
+// `direct` launches every kernel from the host each token and reads the argmax back; `graph` replays one recorded token N times with the argmax,
+// the token log and the position all on the device. Prints tok/s and the generated ids (to --log if given).
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/integer"
+import "abla/float"
+import "abla/float/text"
+import "abla/process/time"
+import "../backend/backend.ab"
+import "../backend/cuda.ab"
+import "../gguf/reader.ab"
+import "../model/inkling.ab"
+import "../model/inkling_config.ab"
+import "../ops.ab"
+
+private fun readPromptIds(path: string): array<int>? {
+    val result = Path(path).readTextResult()
+    if (!result.succeeded) return null
+    val ids: array<int> = []
+    for (rawLine in result.text.split("\n")) {
+        val line = rawLine.trim()
+        if (line == "") continue
+        val id = line.parseInt()
+        if (id == null) return null
+        ids.append(id)
+    }
+    ids
+}
+
+private fun benchReport(mode: string, count: int, nanoseconds: int, tokens: array<int>, logPath: string): int {
+    val seconds = f64FromInt(nanoseconds) / 1000000000.0
+    println("decode-bench: $mode $count tokens in ${seconds} s = ${f64FromInt(count) / seconds} tok/s (${seconds * 1000.0 / f64FromInt(count)} ms/token)")
+    var lines = ""
+    for (t in tokens) lines = lines + "$t\n"
+    if (logPath != "") Path(logPath).writeText(lines)
+    0
+}
+
+fun cmdDecodeBench(args: array<string>): int {
+    var count = 128
+    var mode = "graph"
+    var maxCtx = 0
+    var logPath = ""
+    val positional: array<string> = []
+    var index = 0
+    while (index < args.size) {
+        if (args[index] == "--n" && index + 1 < args.size) {
+            count = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else if (args[index] == "--mode" && index + 1 < args.size) {
+            mode = args[index + 1]
+            index = index + 2
+        } else if (args[index] == "--ctx" && index + 1 < args.size) {
+            maxCtx = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else if (args[index] == "--log" && index + 1 < args.size) {
+            logPath = args[index + 1]
+            index = index + 2
+        } else {
+            positional.append(args[index])
+            index = index + 1
+        }
+    }
+    if (positional.size != 2 || count <= 0 || (mode != "direct" && mode != "graph")) {
+        println("usage: abla-grad decode-bench <model.gguf> <ids-file> [--n N] [--mode direct|graph] [--ctx N] [--log file]")
+        return 2
+    }
+    val ids = readPromptIds(positional[1])
+    if (ids == null || ids.size == 0) {
+        println("decode-bench: ${positional[1]} is not a file of token ids")
+        return 2
+    }
+    val file = ggufOpen(positional[0])
+    if (file == null) {
+        println("decode-bench: ${ggufLastError()}")
+        return 2
+    }
+    val config = inklingConfigFrom(file)
+    if (config == null) {
+        println("decode-bench: ${inklingConfigLastError()} (decode-bench supports Inkling models)")
+        return 2
+    }
+    var backend = cudaBackend() ?? return 2
+    val context = if (maxCtx > 0) maxCtx else ids.size + count + 8
+    var model = inklingLoad(backend, file, config, context) ?? return 1
+    if (!model.reset(backend)) return 1
+    model.useStep = true
+    // prefill all but the last prompt token (this also loads every kernel module, which must happen before recording)
+    for (position in 0 until ids.size - 1) {
+        if (!model.forward(backend, ids[position], position)) {
+            println("decode-bench: ${inklingLastError()} (${cudaLastError()})")
+            return 1
+        }
+    }
+    val last = ids.size - 1
+    val generated: array<int> = []
+    if (mode == "graph") {
+        // one direct pass of the last prompt token warms the kernels; its effects are undone by resetting and prefilling again
+        if (!model.forward(backend, ids[last], last)) return 1
+        val recording = model.capture(backend)
+        if (recording == null) {
+            println("decode-bench: ${inklingLastError()} (${cudaLastError()})")
+            return 1
+        }
+        if (!model.reset(backend)) return 1
+        for (position in 0 until ids.size - 1) if (!model.forward(backend, ids[position], position)) return 1
+        if (!model.seed(backend, ids[last], last)) return 1
+        if (!backend.synchronize()) return 1
+        val start = monotonicNanoseconds()
+        if (!model.replayMany(backend, recording, count)) {
+            println("decode-bench: ${inklingLastError()} (${cudaLastError()})")
+            return 1
+        }
+        val elapsed = monotonicNanoseconds() - start
+        val log = model.readLog(backend, last, count) ?? return 1
+        for (t in log) generated.append(t)
+        return benchReport("graph", count, elapsed, generated, logPath)
+    }
+    // direct: every kernel launched from the host, the argmax read back (device argmax into step[0] then a 4-byte download)
+    var token = ids[last]
+    val start = monotonicNanoseconds()
+    for (step in 0 until count) {
+        if (!model.forward(backend, token, last + step)) {
+            println("decode-bench: ${inklingLastError()} (${cudaLastError()})")
+            return 1
+        }
+        if (!opArgmax(backend, model.scratch, model.so("logits"), config.nVocab, model.step, 0)) return 1
+        val next = model.readStepWord(backend, 0) ?? return 1
+        generated.append(next)
+        token = next
+    }
+    benchReport("direct", count, monotonicNanoseconds() - start, generated, logPath)
+}

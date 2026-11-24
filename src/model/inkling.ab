@@ -106,6 +106,10 @@ resource class InklingModel(
     val history: DeviceBuffer,
     val blocks: DeviceBuffer,
     val bank: DeviceBuffer,
+    // u32[4]: token, position, reserved. Read by the *_step kernels when `useStep` is set (needed for a recorded token).
+    val step: DeviceBuffer,
+    // Use the step-buffer kernels (token and position come from `step`, uploaded by `forward`); required for `inklingCapture`.
+    var useStep: bool = false,
     // When not empty, `forward` at position 0 writes named intermediate vectors (the oracle's names) into this directory.
     var dumpDir: string = ""
 )
@@ -133,11 +137,12 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
     val history = backend.allocate(visits * historyBytesPerVisit(c))
     val blocks = backend.allocate((c.nLayer + 2) * c.nEmbd * 4)
     val bank = backend.allocate((c.nLayer + 2) * c.nEmbd * 4)
-    if (scratch == null || kCache == null || vCache == null || history == null || blocks == null || bank == null) {
+    val step = backend.allocate(16 + 4 * maxCtx)
+    if (scratch == null || kCache == null || vCache == null || history == null || blocks == null || bank == null || step == null) {
         inklingError = "device memory for the activations, KV caches and convolution histories is not available"
         return null
     }
-    InklingModel(c, plan, map, maxCtx, visits, move(arena), move(scratch), move(kCache), move(vCache), move(history), move(blocks), move(bank))
+    InklingModel(c, plan, map, maxCtx, visits, move(arena), move(scratch), move(kCache), move(vCache), move(history), move(blocks), move(bank), move(step))
 }
 
 // Zeroes the convolution histories (a fresh sequence).
@@ -152,7 +157,7 @@ trusted fun InklingModel.reset(var backend: Backend): bool {
 }
 
 // ---- helpers ----
-private fun InklingModel.so(name: string): int = this.scratchMap.offsets.get(name) ?? 0
+fun InklingModel.so(name: string): int = this.scratchMap.offsets.get(name) ?? 0
 
 private fun InklingModel.w(name: string): WeightRef = weightOf(this.plan, name)
 
@@ -285,10 +290,15 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     ok = ok && opRmsNormPlain(backend, this.scratch, v, this.scratch, v, c.headDim, c.rmsEps, c.nHeadKv)
     ok = ok && opL2Clip(backend, this.scratch, r, this.arena, relClip.offset, true, this.scratch, r, c.nHead, c.nRel, c.relClip)
     if (!isSwa) {
-        val ratio = (f64FromInt(pos) + 1.0) / f64FromInt(c.logFloor)
-        val tau = f64ToF32(1.0 + f32ToF64(c.logAlpha) * log(if (ratio > 1.0) ratio else 1.0))
-        ok = ok && opScale(backend, this.scratch, q, tau, qDim)
-        ok = ok && opScale(backend, this.scratch, r, tau, c.nRel * c.nHead)
+        if (this.useStep) {
+            ok = ok && opScaleTau(backend, this.scratch, q, this.step, f64ToF32(f64FromInt(c.logFloor)), c.logAlpha, qDim)
+            ok = ok && opScaleTau(backend, this.scratch, r, this.step, f64ToF32(f64FromInt(c.logFloor)), c.logAlpha, c.nRel * c.nHead)
+        } else {
+            val ratio = (f64FromInt(pos) + 1.0) / f64FromInt(c.logFloor)
+            val tau = f64ToF32(1.0 + f32ToF64(c.logAlpha) * log(if (ratio > 1.0) ratio else 1.0))
+            ok = ok && opScale(backend, this.scratch, q, tau, qDim)
+            ok = ok && opScale(backend, this.scratch, r, tau, c.nRel * c.nHead)
+        }
     }
     if (!ok) return -1
 
@@ -302,13 +312,20 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     ok = this.matvec(backend, "blk.$ip.attn_sink_proj.weight", normed, sinks)
     ok = ok && opRelTable(backend, this.arena, relBias.offset, this.scratch, r, this.scratch, sinks, this.scratch, table, c.nRel, extent, c.nHead)
     val layerCacheBytes = c.nHeadKv * this.maxCtx * c.headDim * 4
-    ok = ok && opKvStore(backend, this.scratch, k, this.scratch, v, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
-        pos, c.nHeadKv, c.headDim, this.maxCtx)
-    val first = if (isSwa && pos - c.nSwa + 1 > 0) pos - c.nSwa + 1 else 0
     val scale = f64ToF32(1.0 / sqrt(f64FromInt(c.headDim)))
     val att = this.so("att")
-    ok = ok && opAttentionDecodeRel(backend, this.scratch, q, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
-        this.scratch, table, this.scratch, att, c.nHead, c.nHeadKv, c.headDim, first, pos, pos, extent, this.maxCtx, scale)
+    if (this.useStep) {
+        ok = ok && opKvStoreStep(backend, this.scratch, k, this.scratch, v, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
+            this.step, c.nHeadKv, c.headDim, this.maxCtx)
+        ok = ok && opAttentionDecodeRelStep(backend, this.scratch, q, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
+            this.scratch, table, this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, if (isSwa) c.nSwa else 0, extent, this.maxCtx, scale)
+    } else {
+        ok = ok && opKvStore(backend, this.scratch, k, this.scratch, v, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
+            pos, c.nHeadKv, c.headDim, this.maxCtx)
+        val first = if (isSwa && pos - c.nSwa + 1 > 0) pos - c.nSwa + 1 else 0
+        ok = ok && opAttentionDecodeRel(backend, this.scratch, q, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
+            this.scratch, table, this.scratch, att, c.nHead, c.nHeadKv, c.headDim, first, pos, pos, extent, this.maxCtx, scale)
+    }
     ok = ok && this.matvec(backend, "blk.$ip.attn_gate.weight", normed, this.so("gate"))
     ok = ok && opSigmoidMul(backend, this.scratch, att, this.scratch, this.so("gate"), this.scratch, att, qDim)
     val oproj = this.so("oproj")
@@ -381,13 +398,74 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
 
 // One token at position `pos` (the sequence's `pos`-th token; call `reset` before a new sequence). Leaves the logits (padded vocabulary) in the scratch buffer.
 fun InklingModel.forward(var backend: Backend, token: int, pos: int): bool {
-    val c = this.config
-    val n = c.nEmbd
-    val nb = n * 4
     if (pos < 0 || pos >= this.maxCtx) {
         inklingError = "position $pos is outside the cache of ${this.maxCtx}"
         return false
     }
+    if (this.useStep && !this.uploadStep(backend, token, pos)) return false
+    this.run(backend, token, pos)
+}
+
+// Writes [token, pos, 0, 0] into the step buffer (one 16-byte copy).
+private trusted fun InklingModel.uploadStep(var backend: Backend, token: int, pos: int): bool {
+    val host = nativeByteBuffer(32)
+    val address = nativePointerAddress(host.address)
+    ablaUnsafeStoreU32(nativePointerFromAddress(address), token)
+    ablaUnsafeStoreU32(nativePointerFromAddress(address + 4), pos)
+    ablaUnsafeStoreU32(nativePointerFromAddress(address + 8), 0)
+    ablaUnsafeStoreU32(nativePointerFromAddress(address + 12), 0)
+    val ok = backend.upload(this.step, 0, address, 16)
+    host.close()
+    if (!ok) inklingError = "uploading the step buffer failed"
+    ok
+}
+
+// Records one token's launches as a replayable graph (requires `useStep`; the kernels must already be loaded, so run one `forward` first). Nothing
+// executes while recording. Dumps are not recorded.
+fun InklingModel.capture(var backend: Backend): Recording? {
+    if (!this.useStep) {
+        inklingError = "capture needs useStep"
+        return null
+    }
+    if (!backend.beginRecording()) {
+        inklingError = "the backend cannot record"
+        return null
+    }
+    val c = this.config
+    val saved = this.dumpDir
+    this.dumpDir = ""
+    var ok = this.run(backend, 0, 1)
+    // greedy token feedback on the device: step[0] = argmax(logits), log[pos] = token, pos += 1
+    ok = ok && opArgmax(backend, this.scratch, this.so("logits"), c.nVocab, this.step, 0)
+    ok = ok && opStepRecord(backend, this.step)
+    ok = ok && opStepAdvance(backend, this.step)
+    this.dumpDir = saved
+    val recording = backend.endRecording()
+    if (!ok || recording == null) {
+        if (inklingError == "") inklingError = "recording the token failed"
+        return null
+    }
+    recording
+}
+
+// One token from a recording: one step upload and one replay. The logits are in the scratch buffer after the backend synchronizes.
+fun InklingModel.replayToken(var backend: Backend, recording: Recording, token: int, pos: int): bool {
+    if (pos < 0 || pos >= this.maxCtx) {
+        inklingError = "position $pos is outside the cache of ${this.maxCtx}"
+        return false
+    }
+    if (!this.uploadStep(backend, token, pos)) return false
+    if (!backend.replay(recording)) {
+        inklingError = "replaying the token failed"
+        return false
+    }
+    true
+}
+
+private fun InklingModel.run(var backend: Backend, token: int, pos: int): bool {
+    val c = this.config
+    val n = c.nEmbd
+    val nb = n * 4
     val embd = this.w("token_embd.weight")
     val embdKind = weightKind(embd.type)
     if (embdKind == "") {
@@ -395,7 +473,8 @@ fun InklingModel.forward(var backend: Backend, token: int, pos: int): bool {
         return false
     }
     val x = this.so("x")
-    var ok = opGatherRow(backend, embdKind, this.arena, embd.offset, token, this.scratch, x, n)
+    var ok = if (this.useStep) opGatherRowStep(backend, embdKind, this.arena, embd.offset, this.step, this.scratch, x, n)
+        else opGatherRow(backend, embdKind, this.arena, embd.offset, token, this.scratch, x, n)
     ok = ok && this.norm(backend, "token_embd_norm.weight", x, x)
     if (!ok) {
         inklingError = "the embedding failed"
@@ -501,4 +580,51 @@ trusted fun InklingModel.readScratch(var backend: Backend, offset: int, count: i
     for (index in 0 until count) values.append(f32FromBits(u32(ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * index)))))
     host.close()
     values
+}
+
+// ---- device-side greedy decoding from a recording made by `capture` ----
+// Sets the token and position the next replay starts from.
+fun InklingModel.seed(var backend: Backend, token: int, pos: int): bool = this.uploadStep(backend, token, pos)
+
+// Replays `count` tokens back to back with no host work between them, then waits. Each replay samples the argmax token, logs it and advances the position.
+fun InklingModel.replayMany(var backend: Backend, recording: Recording, count: int): bool {
+    for (i in 0 until count) {
+        if (!backend.replay(recording)) {
+            inklingError = "replaying the token failed"
+            return false
+        }
+    }
+    if (!backend.synchronize()) {
+        inklingError = "the device failed while decoding"
+        return false
+    }
+    true
+}
+
+// The tokens the argmax produced at positions `from` until `from + count`.
+trusted fun InklingModel.readLog(var backend: Backend, from: int, count: int): array<int>? {
+    val host = nativeByteBuffer(count * 4 + 4)
+    val address = nativePointerAddress(host.address)
+    if (!backend.download(this.step, 16 + 4 * from, address, count * 4)) {
+        inklingError = "downloading the token log failed"
+        host.close()
+        return null
+    }
+    val out: array<int> = []
+    for (i in 0 until count) out.append(ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * i)))
+    host.close()
+    out
+}
+
+// Word `index` of the step buffer (0 = the token the last argmax wrote).
+trusted fun InklingModel.readStepWord(var backend: Backend, index: int): int? {
+    val host = nativeByteBuffer(16)
+    val address = nativePointerAddress(host.address)
+    if (!backend.download(this.step, 4 * index, address, 4)) {
+        host.close()
+        return null
+    }
+    val word = ablaUnsafeLoadU32(nativePointerFromAddress(address))
+    host.close()
+    word
 }

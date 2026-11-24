@@ -11,7 +11,7 @@ mkdir -p "$out"
 positions=0
 argmax=0
 for prompt in 01 02 03 04; do
-    "$binary" logits "$model" "tests/prompts/$prompt.inkling.ids" -o "$out/$prompt.grdl" > /dev/null
+    "$binary" logits "$model" "tests/prompts/$prompt.inkling.ids" ${GATE_LOGITS_FLAGS:-} -o "$out/$prompt.grdl" > /dev/null
     status=0
     "$binary" compare "$oracle/$prompt.grdl" "$out/$prompt.grdl" --tolerances tests/tolerances-inkling.txt > "$out/$prompt.txt" || status=$?
     summary=$(tail -1 "$out/$prompt.txt")

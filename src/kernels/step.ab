@@ -34,3 +34,10 @@ extern "C" __global__ void step_advance(unsigned *step) {
     if (blockIdx.x == 0 && threadIdx.x == 0) step[1] = step[1] + 1;
 }
 """
+
+// log[step[1]] = step[0]: records the token the argmax just wrote, indexed by the position that produced it. The log is u32 words 4.. of the step buffer.
+val kernelStepRecord = """
+extern "C" __global__ void step_record(unsigned *step) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) step[4 + step[1]] = step[0];
+}
+"""
