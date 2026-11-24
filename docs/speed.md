@@ -6,16 +6,71 @@ Method: ours = `abla-grad decode-bench <gguf> <ids> --n 128 --mode graph` (greed
 
 | tg128, tok/s | d0 | d15 | d300 | d512 |
 |---|---:|---:|---:|---:|
-| llama.cpp mainline 33aeb17 | 74.4 | 78.1 | 77.5 | 77.3 |
-| Unsloth b12649-mix | 104.1 | 106.6 | 106.2 | 105.5 |
+| llama.cpp mainline 33aeb17 | 74.43 | 78.10 | 77.50 | 77.29 |
+| Unsloth b12649-mix-c7059d6 | 104.06 | 106.58 | 106.15 | 105.50 |
 | abla-grad a02be45 | 96.5 | 95.7 | 81.5 | 73.8 |
 | abla-grad + split attention (4c1ee1f) | | 98.9 | 96.1 | 93.7 |
 
-| pp512, tok/s | |
-|---|---:|
-| Unsloth b12649-mix | 5,475 |
-| llama.cpp mainline | 3,506 (74's figure) |
-| abla-grad | prefill in progress (ablac-4e) |
+| Depth 0, tok/s | pp512 | tg1024 |
+|---|---:|---:|
+| Unsloth b12649-mix-c7059d6 | 5,474.87 | 103.96 |
+| llama.cpp mainline 33aeb17 | 3,506.31 (prior run) | |
+| abla-grad c01d3f3 | ~3,550 ([prefill benchmark](prefill.md)) | |
+
+The llama-bench results are means of three repetitions on E-cores 24–27.
+`-d N` fills N tokens of KV cache before timing; `tg1024 -d 0` averages
+a 1,024-token generation starting with an empty cache. Unsloth used its
+verified CUDA 12 portable prebuilt (compiled commit `189f431bf`). Both
+llama-bench builds had access to the full 4090 and used no draft model.
+
+The Unsloth logits check reused the pinned CUDA oracle’s four prompts
+and matched all 324 argmax IDs. Maximum absolute logit difference was
+10.9349, the largest row mean absolute difference was 2.9223, and
+maximum KL was 0.013805. All three passed the Inkling tolerances.
+Raw benchmark samples are in
+`~/src/abla-grad-oracle/artifacts/bench-depth-33aeb17/` and
+`~/src/abla-grad-oracle/unsloth-b12649-mix-c7059d6/`.
+
+## Decode profiles at d15 and d512
+
+On the same 4090, CUPTI recorded 128 decode steps per depth with zero
+dropped records. abla-grad `9a46740` used direct mode and context capacity
+700. Its forward pass uses the same step-buffer kernels as graph replay.
+Graph replay adds the two device-side token feedback kernels. CUPTI and
+Nsight node profiling both crashed at abla-grad graph launch, so its
+direct kernel durations are a screen for hot kernels. The untraced d15
+graph run measured 98.78 tok/s. Direct launch cadence and profiling can
+change clock and cache behavior. Unsloth used its CUDA graphs and synthetic
+llama-bench token stream.
+
+| Engine | Depth | GPU kernel ms/token | Kernels/token | GPU busy ms/token | Gap ms/token |
+|---|---:|---:|---:|---:|---:|
+| abla-grad direct | 15 | 10.719 | 2,613 | 10.720 | |
+| abla-grad direct | 512 | 10.980 | 2,613 | 10.981 | |
+| Unsloth graph | 15 | 9.335 | 3,281 | 9.393 | 1.137 |
+| Unsloth graph | 512 | 9.409 | 3,281 | 9.467 | 1.228 |
+
+GPU busy is the union of kernel and copy intervals. Gap is the rest of
+the timed decode window. abla-grad direct mode synchronizes for host
+feedback per token, so its gaps are omitted.
+
+| Kernel or group | abla-grad d15 → d512, GPU ms/token (launches/token) | Unsloth d15 → d512, GPU ms/token (launches/token) |
+|---|---:|---:|
+| Q8_0 matvec | 2.626 → 2.598 (289) | 2.549 → 2.552 (293) |
+| Indexed NVFP4 matvec / fused NVFP4 matvec | 1.935 → 1.920 (88) | 1.806 → 1.807 (81) |
+| RMSNorm | 1.240 → 1.190 (434) | 0.547 → 0.543 (342, two largest variants) |
+| F32 matvec | 1.173 → 1.141 (336) | 0.799 → 0.793 (343, two largest variants) |
+| Depth mix | 1.126 → 1.082 (120) | 0.448 → 0.428 (86) |
+| Convolution | 0.452 → 0.435 (192) | 0.224 → 0.224 (176, conv chain) |
+| Relative split attention + merge / flash attention | 0.302 → 0.823 (96) | 0.161 → 0.254 (48) |
+
+The controller accounts for 576 kernel launches per token. At d15 its
+two norms take 0.257 GPU ms/token, the down projection takes 0.615, and
+gain, forget and mix together take 0.468. The whole chain takes 1.339 ms
+at d15 and 1.296 ms at d512.
+
+Exact symbols, launch counts and raw traces are in
+`~/src/abla-grad-oracle/profile-9a46740/`.
 
 ## Log
 - a02be45: graph decode, e7's router/RMSNorm/matvec work. Per-token cost grew with context (one attention block per head walked the context serially).
