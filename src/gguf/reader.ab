@@ -1,0 +1,385 @@
+import "quant.ab"
+import "abla/float"
+import "abla/sys/linux"
+import "abla/text"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+private val ggufMaxInt = 9223372036854775807
+// Cap bookkeeping separately from the (potentially tens of GB) tensor data.
+private val ggufMaxIndexBytes = 268435456
+private val ggufMaxEntries = 1048576
+private var ggufError = ""
+
+// Returns the diagnostic from the last ggufOpen on the calling application.
+fun ggufLastError(): string = ggufError
+
+// The offset is relative to the tensor data section. The first dimension is
+// the number of elements per row. The byte count excludes alignment padding.
+class GgufTensorInfo(
+    val name: string, val type: int, val dims: array<int>, val offset: int, val bytes: int
+)
+
+private class GgufMetadata(val kind: int, val itemKind: int, val count: int, val offset: int)
+
+private class GgufCursor(val address: int, val limit: int, var offset: int = 0, var error: string = "") {
+    fun reserve(size: int): int {
+        if (this.error != "") return -1
+        if (size < 0 || size > this.limit - this.offset) {
+            this.error = "truncated or oversized GGUF index at byte ${this.offset}"
+            return -1
+        }
+        val start = this.offset
+        this.offset += size
+        start
+    }
+
+    trusted fun bits(width: int): int {
+        val start = this.reserve(width)
+        if (start < 0) return 0
+        val at = nativePointerFromAddress(this.address + start)
+        // Linux x86-64 unaligned reads, in the wire's little-endian order.
+        if (width == 1) return ablaUnsafeLoadU8(at)
+        if (width == 2) return ablaUnsafeLoadU16(at)
+        if (width == 4) return ablaUnsafeLoadU32(at)
+        ablaUnsafeLoadI64(at)
+    }
+
+    trusted fun text(copy: bool): string {
+        val length = this.bits(8)
+        val start = this.reserve(length)
+        if (start < 0 || !copy || length == 0) return ""
+        val buffer = nativeByteBuffer(length + 1)
+        ablaUnsafeCopyMemory(nativePointerAddress(buffer.address), this.address + start, length)
+        buffer.adoptString(length)
+    }
+}
+
+private fun ggufFixedWidth(kind: int): int {
+    if (kind == 0 || kind == 1 || kind == 7) return 1
+    if (kind == 2 || kind == 3) return 2
+    if (kind == 4 || kind == 5 || kind == 6) return 4
+    if (kind == 10 || kind == 11 || kind == 12) return 8
+    0
+}
+
+private fun ggufIntegerKind(kind: int): bool =
+    (kind >= 0 && kind <= 5) || kind == 10 || kind == 11
+
+private fun ggufInteger(var cursor: GgufCursor, kind: int): int? {
+    val width = ggufFixedWidth(kind)
+    val bits = cursor.bits(width)
+    if (kind == 10 && bits < 0) return null
+    if (kind == 1 || kind == 3 || kind == 5) {
+        val sign = 1 << (width * 8 - 1)
+        return if (bits >= sign) bits - sign * 2 else bits
+    }
+    bits
+}
+
+private fun ggufFloat(var cursor: GgufCursor, kind: int): f64 =
+    if (kind == 6) f32ToF64(f32FromBits(u32(cursor.bits(4)))) else f64FromBits(cursor.bits(8))
+
+private fun ggufReadMetadata(var cursor: GgufCursor, kind: int): GgufMetadata? {
+    var count = 1
+    var item = kind
+    if (kind == 9) {
+        item = cursor.bits(4)
+        count = cursor.bits(8)
+    }
+    val start = cursor.offset
+    val width = if (item == 8) 8 else ggufFixedWidth(item)
+    if (width == 0 || count < 0 || count > (cursor.limit - start) / width || count > ggufMaxEntries) {
+        cursor.error = "invalid GGUF metadata value at byte $start (type $item, count $count)"
+        return null
+    }
+    if (item == 8) {
+        for (i in 0 until count) {
+            cursor.text(false)
+            if (cursor.error != "") return null
+        }
+    } else if (item == 7) {
+        for (i in 0 until count) {
+            if (cursor.bits(1) > 1) {
+                cursor.error = "invalid GGUF boolean at byte ${cursor.offset - 1}"
+                return null
+            }
+        }
+    } else {
+        cursor.reserve(count * width)
+    }
+    if (cursor.error != "") return null
+    GgufMetadata(kind, item, count, start)
+}
+
+private fun ggufNameIsValid(name: string): bool = name != "" && name.isValidUtf8()
+
+private fun ggufReadTensor(var cursor: GgufCursor, alignment: int): GgufTensorInfo? {
+    val name = cursor.text(true)
+    val rank = cursor.bits(4)
+    if (cursor.error != "") return null
+    if (!ggufNameIsValid(name) || rank < 1 || rank > 4) {
+        cursor.error = "invalid GGUF tensor name or rank at byte ${cursor.offset}"
+        return null
+    }
+
+    val dims: array<int> = []
+    for (i in 0 until rank) dims.append(cursor.bits(8))
+    val type = cursor.bits(4)
+    val offset = cursor.bits(8)
+    if (cursor.error != "") return null
+    if (ggmlBlockElements(type) == 0) {
+        cursor.error = "unsupported GGML type $type in tensor '$name'"
+        return null
+    }
+
+    var bytes = ggmlRowBytes(type, dims[0])
+    if (bytes == 0 || offset < 0 || offset % alignment != 0) {
+        cursor.error = "invalid row or unaligned offset for GGUF tensor '$name'"
+        return null
+    }
+    for (i in 1 until rank) {
+        val dimension = dims[i]
+        if (dimension <= 0 || bytes > ggufMaxInt / dimension) {
+            cursor.error = "invalid or overflowing GGUF dimensions for tensor '$name'"
+            return null
+        }
+        bytes *= dimension
+    }
+    GgufTensorInfo(name, type, dims, offset, bytes)
+}
+
+private fun ggufPadding(offset: int, alignment: int): int =
+    (alignment - offset % alignment) % alignment
+
+// Owns a read-only mapping. The underlying file must remain unchanged until
+// close. Keep the file alive through every upload from tensorAddress.
+resource class GgufFile(
+    val ggufAddress: int, val ggufSize: int, val ggufVersion: int, val ggufDataStart: int,
+    val ggufFields: array<GgufMetadata>, val ggufKeys: Map<string, int>,
+    val ggufTensors: array<GgufTensorInfo>, val ggufNames: Map<string, int>,
+    var ggufClosed: bool = false
+) {
+    fun drop(): void { this.close() }
+
+    // Releases the mapping. Calling close again is harmless.
+    fun close(): void {
+        if (this.ggufClosed) return
+        linuxSyscall2(11, this.ggufAddress, this.ggufSize)
+        this.ggufClosed = true
+    }
+
+    // GGUF wire version.
+    fun version(): int = this.ggufVersion
+
+    // Checks for metadata by key, including after close.
+    fun has(key: string): bool = this.ggufKeys.has(key)
+
+    // Returns the metadata keys in file order.
+    fun metadataKeys(): array<string> {
+        val out: array<string> = []
+        for (key in this.ggufKeys.keys()) out.append(key)
+        out
+    }
+
+    // Returns the number of indexed tensors.
+    fun tensorCount(): int = this.ggufTensors.size
+
+    // Returns a tensor record, or a zero-size sentinel for an invalid index.
+    fun tensorAt(index: int): GgufTensorInfo {
+        if (index < 0 || index >= this.ggufTensors.size) return GgufTensorInfo("", -1, [], 0, 0)
+        this.ggufTensors[index]
+    }
+
+    // Finds a tensor by name.
+    fun tensor(name: string): GgufTensorInfo? {
+        val index = this.ggufNames.get(name)
+        if (index == null) return null
+        this.ggufTensors[index]
+    }
+
+    // Returns a bounded address from this file until close, otherwise zero.
+    fun tensorAddress(tensor: GgufTensorInfo): int {
+        if (this.ggufClosed) return 0
+        val entry = this.tensor(tensor.name)
+        if (entry == null || entry != tensor) return 0
+        this.ggufAddress + this.ggufDataStart + entry.offset
+    }
+
+    // Returns the string metadata or null on missing key, wrong type or close.
+    fun getString(key: string): string? {
+        val entry = this.ggufField(key)
+        if (entry == null || entry.kind != 8) return null
+        val cursor = this.ggufAt(entry)
+        cursor.text(true)
+    }
+
+    // Returns integer metadata if it fits in signed int.
+    fun getInt(key: string): int? {
+        val entry = this.ggufField(key)
+        if (entry == null || !ggufIntegerKind(entry.kind)) return null
+        val cursor = this.ggufAt(entry)
+        ggufInteger(cursor, entry.kind)
+    }
+
+    // Returns F32 or F64 metadata widened to F64, or null on wrong type.
+    fun getFloat(key: string): f64? {
+        val entry = this.ggufField(key)
+        if (entry == null || (entry.kind != 6 && entry.kind != 12)) return null
+        val cursor = this.ggufAt(entry)
+        ggufFloat(cursor, entry.kind)
+    }
+
+    // Returns boolean metadata or null on missing key, wrong type or close.
+    fun getBool(key: string): bool? {
+        val entry = this.ggufField(key)
+        if (entry == null || entry.kind != 7) return null
+        val cursor = this.ggufAt(entry)
+        cursor.bits(1) == 1
+    }
+
+    // Copies a string array from the mapping. Results survive close.
+    fun getStringArray(key: string): array<string>? {
+        val entry = this.ggufField(key)
+        if (entry == null || entry.kind != 9 || entry.itemKind != 8) return null
+        val cursor = this.ggufAt(entry)
+        val out: array<string> = []
+        for (i in 0 until entry.count) out.append(cursor.text(true))
+        out
+    }
+
+    // Returns the integer array, or null if any item cannot fit in signed int.
+    fun getIntArray(key: string): array<int>? {
+        val entry = this.ggufField(key)
+        if (entry == null || entry.kind != 9 || !ggufIntegerKind(entry.itemKind)) return null
+        val cursor = this.ggufAt(entry)
+        val out: array<int> = []
+        for (i in 0 until entry.count) {
+            val value = ggufInteger(cursor, entry.itemKind)
+            if (value == null) return null
+            out.append(value)
+        }
+        out
+    }
+
+    // Returns the floating-point array widened to F64.
+    fun getFloatArray(key: string): array<f64>? {
+        val entry = this.ggufField(key)
+        if (entry == null || entry.kind != 9 || (entry.itemKind != 6 && entry.itemKind != 12)) return null
+        val cursor = this.ggufAt(entry)
+        val out: array<f64> = []
+        for (i in 0 until entry.count) out.append(ggufFloat(cursor, entry.itemKind))
+        out
+    }
+}
+
+private fun GgufFile.ggufField(key: string): GgufMetadata? {
+    if (this.ggufClosed) return null
+    val index = this.ggufKeys.get(key)
+    if (index == null) return null
+    this.ggufFields[index]
+}
+
+private fun GgufFile.ggufAt(entry: GgufMetadata): GgufCursor =
+    GgufCursor(this.ggufAddress, this.ggufDataStart, entry.offset)
+
+private fun ggufFail(message: string): GgufFile? {
+    ggufError = message
+    null
+}
+
+private fun ggufParse(address: int, size: int): GgufFile? {
+    val cursor = GgufCursor(address, if (size < ggufMaxIndexBytes) size else ggufMaxIndexBytes)
+    if (cursor.bits(4) != 1179993927) return ggufFail("bad GGUF magic")
+    val version = cursor.bits(4)
+    if (version != 2 && version != 3) return ggufFail("unsupported GGUF version $version")
+    val tensorCount = cursor.bits(8)
+    val fieldCount = cursor.bits(8)
+    if (cursor.error != "") return ggufFail(cursor.error)
+    if (tensorCount < 0 || tensorCount > ggufMaxEntries || fieldCount < 0 || fieldCount > ggufMaxEntries ||
+        tensorCount * 32 + fieldCount * 13 > cursor.limit - cursor.offset) {
+        return ggufFail("impossible GGUF tensor or metadata count")
+    }
+
+    val keys: Map<string, int> = Map()
+    val fields: array<GgufMetadata> = []
+    var alignment = 32
+    for (i in 0 until fieldCount) {
+        val key = cursor.text(true)
+        val kind = cursor.bits(4)
+        if (cursor.error != "") return ggufFail(cursor.error)
+        if (!ggufNameIsValid(key) || keys.has(key)) return ggufFail("empty, malformed or duplicate GGUF metadata key '$key'")
+        val field = ggufReadMetadata(cursor, kind)
+        if (field == null) return ggufFail(cursor.error)
+        if (key == "general.alignment") {
+            if (kind != 4) return ggufFail("GGUF general.alignment must be uint32")
+            val at = GgufCursor(address, cursor.limit, field.offset)
+            alignment = at.bits(4)
+            if (alignment == 0 || (alignment & (alignment - 1)) != 0)
+                return ggufFail("GGUF general.alignment must be a power of two")
+        }
+        keys.set(key, i)
+        fields.append(field)
+    }
+
+    val names: Map<string, int> = Map()
+    val tensors: array<GgufTensorInfo> = []
+    for (i in 0 until tensorCount) {
+        val tensor = ggufReadTensor(cursor, alignment)
+        if (tensor == null) return ggufFail(cursor.error)
+        if (names.has(tensor.name)) return ggufFail("duplicate GGUF tensor '${tensor.name}'")
+        names.set(tensor.name, i)
+        tensors.append(tensor)
+    }
+
+    val padding = if (tensorCount == 0) 0 else ggufPadding(cursor.offset, alignment)
+    if (padding > size - cursor.offset) return ggufFail("missing alignment padding before GGUF data")
+    val dataStart = cursor.offset + padding
+    val available = size - dataStart
+    var next = 0
+    for (tensor in tensors) {
+        // Follow llama.cpp's packed, index-order layout. The last tensor may
+        // end at EOF without trailing padding.
+        if (tensor.offset != next || tensor.offset > available || tensor.bytes > available - tensor.offset) {
+            return ggufFail("invalid or truncated data range for GGUF tensor '${tensor.name}'")
+        }
+        val end = tensor.offset + tensor.bytes
+        val pad = ggufPadding(end, alignment)
+        if (pad > ggufMaxInt - end) return ggufFail("GGUF data padding overflows")
+        next = end + pad
+    }
+    GgufFile(address, size, version, dataStart, fields, keys, tensors, names)
+}
+
+// Opens a regular x86-64 Linux GGUF using a read-only private mapping.
+// Supports little-endian v2/v3 and the formats in quant.ab.
+trusted fun ggufOpen(path: string): GgufFile? {
+    ggufError = ""
+    for (i in 0 until path.size) {
+        if (path[i] == 0) return ggufFail("GGUF path contains NUL")
+    }
+    // openat(AT_FDCWD, path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+    val fd = linuxSyscall4(257, -100, nativeCStringAddress(path), 526336, 0)
+    if (fd < 0) return ggufFail("could not open GGUF '$path' (errno ${-fd})")
+    val status = nativeByteBuffer(144)
+    val measured = linuxSyscall2(5, fd, nativePointerAddress(status.address))
+    if (measured < 0) {
+        status.close()
+        linuxSyscall1(3, fd)
+        return ggufFail("could not stat GGUF (errno ${-measured})")
+    }
+    val mode = status.load(24) + status.load(25) * 256
+    val size = status.loadI64(48)
+    status.close()
+    if ((mode & 61440) != 32768 || size < 24) {
+        linuxSyscall1(3, fd)
+        return ggufFail("GGUF must be a readable regular file with a complete header")
+    }
+    // mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0)
+    val address = linuxSyscall6(9, 0, size, 1, 2, fd, 0)
+    linuxSyscall1(3, fd)
+    if (address < 0) return ggufFail("could not mmap GGUF '$path' (errno ${-address})")
+    val model = ggufParse(address, size)
+    if (model == null) linuxSyscall2(11, address, size)
+    model
+}

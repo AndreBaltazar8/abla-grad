@@ -1,0 +1,65 @@
+// GGML wire layouts from llama.cpp 33aeb17f, ggml/include/ggml.h and
+// ggml/src/ggml-common.h. Offsets are bytes within one little-endian block.
+// These describe stored weights; kernels unpack them on the GPU.
+val GGML_TYPE_F32 = 0
+val GGML_TYPE_F16 = 1
+val GGML_TYPE_Q8_0 = 8
+val GGML_TYPE_Q4_K = 12
+val GGML_TYPE_Q5_K = 13
+val GGML_TYPE_Q6_K = 14
+val GGML_TYPE_BF16 = 30
+val GGML_TYPE_NVFP4 = 40
+
+// Returns the wire-format name, or "unknown" for an unsupported type.
+fun ggmlTypeName(type: int): string = when (type) {
+    GGML_TYPE_F32 -> "F32"
+    GGML_TYPE_F16 -> "F16"
+    GGML_TYPE_Q8_0 -> "Q8_0"
+    GGML_TYPE_Q4_K -> "Q4_K"
+    GGML_TYPE_Q5_K -> "Q5_K"
+    GGML_TYPE_Q6_K -> "Q6_K"
+    GGML_TYPE_BF16 -> "BF16"
+    GGML_TYPE_NVFP4 -> "NVFP4"
+    else -> "unknown"
+}
+
+// Returns the number of values encoded in a block, or zero for an unknown type.
+fun ggmlBlockElements(type: int): int = when (type) {
+    GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 -> 1
+    GGML_TYPE_Q8_0 -> 32
+    GGML_TYPE_NVFP4 -> 64
+    GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K -> 256
+    else -> 0
+}
+
+// Returns the wire size of a block, or zero for an unknown type.
+fun ggmlBlockBytes(type: int): int = when (type) {
+    GGML_TYPE_F32 -> 4
+    GGML_TYPE_F16, GGML_TYPE_BF16 -> 2
+    // f16 scale at 0 and 32 signed bytes at 2.
+    GGML_TYPE_Q8_0 -> 34
+    // f16 scale/min at 0/2, 12 packed scale/min bytes at 4, and 128
+    // nibble pairs at 16. Each 32-byte strip packs two groups of 32.
+    GGML_TYPE_Q4_K -> 144
+    // Same groups and scales as Q4_K, 32 high-bit bytes at 16,
+    // then 128 low-nibble pairs at 48. Bit g selects group g.
+    GGML_TYPE_Q5_K -> 176
+    // 128 low-nibble pairs at 0, 64 two-high-bit packs at 128,
+    // 16 signed per-group scales at 192, and an f16 scale at 208.
+    GGML_TYPE_Q6_K -> 210
+    // Four UE4M3 scales at 0 and four groups of 8 E2M1 nibble pairs at 4.
+    // Each group's low and high nibbles hold its first and last 8 values.
+    GGML_TYPE_NVFP4 -> 36
+    else -> 0
+}
+
+// Returns the exact bytes of one row, or zero for an unsupported, partial,
+// empty or overflowing row.
+fun ggmlRowBytes(type: int, elements: int): int {
+    val block = ggmlBlockElements(type)
+    if (block == 0 || elements <= 0 || elements % block != 0) return 0
+    val blocks = elements / block
+    val bytes = ggmlBlockBytes(type)
+    if (blocks > 9223372036854775807 / bytes) return 0
+    blocks * bytes
+}

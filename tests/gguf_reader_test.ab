@@ -1,0 +1,183 @@
+import "../src/gguf/reader.ab"
+import "../src/gguf/quant.ab"
+import "gguf_quant_oracle.ab"
+import "abla/bytes"
+import "abla/fs"
+import "abla/float"
+import "abla/io"
+import "abla/process"
+import "abla/unsafe/memory/raw"
+
+private fun ByteBuffer.le(value: int, width: int): void {
+    for (i in 0 until width) this.appendByteValue((value >> (8 * i)) & 255)
+}
+
+private fun ByteBuffer.ggufText(text: string): void {
+    this.le(text.size, 8)
+    this.appendText(text)
+}
+
+private fun ByteBuffer.ggufKey(key: string, kind: int): void {
+    this.ggufText(key)
+    this.le(kind, 4)
+}
+
+private fun ByteBuffer.ggufPad(): void {
+    while (this.size() % 32 != 0) this.le(0, 1)
+}
+
+private fun ByteBuffer.tensor(name: string, kind: int, offset: int, dim0: int, dim1: int): void {
+    this.ggufText(name)
+    this.le(2, 4)
+    this.le(dim0, 8)
+    this.le(dim1, 8)
+    this.le(kind, 4)
+    this.le(offset, 8)
+}
+
+private fun fixture(variant: string): string {
+    val b = bytes("")
+    b.appendText(if (variant == "bad magic") "GUFF" else "GGUF")
+    b.le(if (variant == "bad version") 1 else 3, 4)
+    b.le(if (variant == "bad count") -1 else 2, 8)
+    b.le(8, 8)
+    b.ggufKey("general.alignment", 4)
+    b.le(if (variant == "bad alignment") 33 else 32, 4)
+    b.ggufKey(if (variant == "duplicate key") "general.alignment" else "general.architecture", 8)
+    if (variant == "bad string") b.le(9223372036854775807, 8)
+    else b.ggufText("synthetic")
+    b.ggufKey("signed", 3)
+    b.le(-5, 2)
+    b.ggufKey("wide", 10)
+    b.le(-1, 8)
+    b.ggufKey("boolean", 7)
+    b.le(if (variant == "bad bool") 2 else 1, 1)
+    b.ggufKey("strings", 9)
+    b.le(if (variant == "nested array") 9 else 8, 4)
+    b.le(if (variant == "bad array count") -1 else 2, 8)
+    b.ggufText("one")
+    b.ggufText("two")
+    b.ggufKey("ints", 9)
+    b.le(1, 4)
+    b.le(2, 8)
+    b.le(-5, 1)
+    b.le(7, 1)
+    b.ggufKey("floats", 9)
+    b.le(6, 4)
+    b.le(2, 8)
+    b.le(int(f32ToBits(f32(0.5))), 4)
+    b.le(int(f32ToBits(f32(-2.0))), 4)
+
+    b.tensor("a", if (variant == "unknown type") 999 else GGML_TYPE_Q8_0, 0,
+        if (variant == "partial block") 31 else 32, if (variant == "overflow") 9223372036854775807 else 1)
+    b.tensor(if (variant == "duplicate tensor") "a" else "b", GGML_TYPE_F32,
+        if (variant == "overlap") 32 else if (variant == "unaligned tensor") 63 else 64, 1, 1)
+    b.ggufPad()
+
+    b.appendText("\x00\x3c\x80\x7f")
+    for (i in 0 until 30) b.le(1, 1)
+    b.ggufPad()
+    b.le(int(f32ToBits(f32(1.0))), if (variant == "truncated data") 3 else 4)
+    b.toText()
+}
+
+private trusted fun byteAt(address: int): int = ablaUnsafeLoadU8(nativePointerFromAddress(address))
+
+private fun layoutCheck(): bool {
+    if (ggmlRowBytes(GGML_TYPE_Q4_K, 256) != 144 || ggmlRowBytes(GGML_TYPE_Q5_K, 256) != 176 ||
+        ggmlRowBytes(GGML_TYPE_Q6_K, 256) != 210 || ggmlRowBytes(GGML_TYPE_NVFP4, 64) != 36 ||
+        ggmlRowBytes(GGML_TYPE_F32, 9223372036854775807) != 0 ||
+        ggmlRowBytes(GGML_TYPE_Q8_0, 33) != 0 || ggmlRowBytes(-1, 1) != 0) return false
+
+    val packed = bytes("\x00\x3c\x80\x7f")
+    for (i in 0 until 30) packed.le(1, 1)
+    val q8 = oracleQ8_0(packed.toText())
+    if (q8.size != 32 || q8[0] != f32(-128.0) || q8[1] != f32(127.0) || q8[31] != f32(1.0)) return false
+    val k = bytes("\x00\x3c\x00\x38")
+    // Scale 1, minimum 2 for groups 0–3. Group 4 uses the high
+    // scale/min bits from those slots and its own packed low bits.
+    k.le(65, 1)
+    for (i in 0 until 3) k.le(1, 1)
+    k.le(130, 1)
+    for (i in 0 until 3) k.le(2, 1)
+    k.le(0x31, 1)
+    for (i in 0 until 3) k.le(0x21, 1)
+    val q5 = bytes(k.toText())
+    for (i in 0 until 32) q5.le(0x11, 1)
+    for (i in 0 until 128) {
+        k.le(0x73, 1)
+        q5.le(0x73, 1)
+    }
+    val four = oracleQ4K(k.toText())
+    val five = oracleQ5K(q5.toText())
+    if (four.size != 256 || four[0] != f32(2.0) || four[32] != f32(6.0) ||
+        four[128] != f32(33.5) || five.size != 256 || five[0] != f32(18.0) ||
+        five[128] != f32(305.5) || five[32] != f32(6.0)) return false
+
+    val six = bytes("")
+    for (i in 0 until 64) six.le(0x51, 1)
+    for (i in 0 until 64) six.le(0xa7, 1)
+    for (i in 0 until 32) six.le(0xe4, 1)
+    for (i in 0 until 32) six.le(0x1b, 1)
+    for (i in 0 until 16) six.le(if (i % 2 == 0) 2 else 254, 1)
+    six.le(0x3800, 2)
+    val q6 = oracleQ6K(six.toText())
+    if (q6.size != 256 || q6[0] != f32(-31.0) || q6[16] != f32(31.0) ||
+        q6[32] != f32(-15.0) || q6[64] != f32(5.0) || q6[96] != f32(21.0) ||
+        q6[128] != f32(23.0) || q6[255] != f32(22.0)) return false
+    val nv = bytes("\x38\x40\x01\x7f")
+    for (i in 0 until 32) nv.le(0x72, 1)
+    val nvfp4 = oracleNvfp4(nv.toText())
+    nvfp4.size == 64 && nvfp4[0] == f32(1.0) && nvfp4[8] == f32(6.0) &&
+        nvfp4[16] == f32(2.0) && nvfp4[32] == f32(0.001953125) && nvfp4[48] == f32(0.0)
+}
+
+private fun validateFixture(filePath: string): bool {
+    val file = ggufOpen(filePath)
+    if (file == null) {
+        println(ggufLastError())
+        return false
+    }
+    if (file.version() != 3 || file.tensorCount() != 2 || file.metadataKeys().size != 8 ||
+        !file.has("wide") || file.getInt("wide") != null || file.getInt("signed") != -5 ||
+        file.getBool("boolean") != true || file.getString("general.architecture") != "synthetic" ||
+        file.getString("ints") != null || file.getFloat("missing") != null) return false
+    val words = file.getStringArray("strings") ?? []
+    val numbers = file.getIntArray("ints") ?? []
+    val floats = file.getFloatArray("floats") ?? []
+    if (words.size != 2 || words[1] != "two" || numbers.size != 2 || numbers[0] != -5 ||
+        floats.size != 2 || floats[0] != 0.5 || floats[1] != -2.0) return false
+    val tensor = file.tensor("a")
+    if (tensor == null || tensor.bytes != 34 || tensor.dims.size != 2 || tensor.dims[0] != 32) return false
+    val address = file.tensorAddress(tensor)
+    val forged = GgufTensorInfo("a", GGML_TYPE_Q8_0, [32, 1], 0, 34)
+    if (address == 0 || byteAt(address + 2) != 128 || file.tensorAddress(forged) != 0 ||
+        file.tensorAt(-1).bytes != 0 || file.tensorAt(2).bytes != 0) return false
+    file.close()
+    file.close()
+    file.tensorAddress(tensor) == 0 && file.getString("general.architecture") == null
+}
+
+fun main: int {
+    val filePath = processArgument(0)
+    if (!layoutCheck()) {
+        println("quant layout check failed")
+        return 1
+    }
+    if (!path(filePath).writeText(fixture("")) || !validateFixture(filePath)) {
+        println("valid fixture failed")
+        return 2
+    }
+    val bad = ["bad magic", "bad version", "bad count", "bad alignment", "duplicate key", "bad string",
+        "bad bool", "nested array", "bad array count", "unknown type", "partial block", "overflow",
+        "duplicate tensor", "overlap", "unaligned tensor", "truncated data"]
+    for (variant in bad) {
+        if (!path(filePath).writeText(fixture(variant))) return 3
+        if (ggufOpen(filePath) != null || ggufLastError() == "") {
+            println("malformed fixture accepted: $variant")
+            return 4
+        }
+    }
+    println("GGUF synthetic reader and quant layout checks passed")
+    0
+}

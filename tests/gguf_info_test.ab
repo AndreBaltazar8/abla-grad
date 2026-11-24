@@ -1,0 +1,4 @@
+import "../src/cli/info.ab"
+import "abla/process"
+
+fun main: int = cmdInfo([processArgument(0)])

@@ -1,0 +1,30 @@
+import "../gguf/reader.ab"
+import "../gguf/quant.ab"
+import "abla/io"
+
+// Prints the GGUF version, metadata keys, and counts by stored tensor type.
+fun cmdInfo(args: array<string>): int {
+    if (args.size != 1) {
+        println("usage: abla-grad info <model.gguf>")
+        return 2
+    }
+    val file = ggufOpen(args[0])
+    if (file == null) {
+        println(ggufLastError())
+        return 1
+    }
+
+    println("GGUF v${file.version()}")
+    val keys = file.metadataKeys()
+    println("metadata (${keys.size})")
+    for (key in keys) println("  $key")
+    val counts: Map<int, int> = Map()
+    for (i in 0 until file.tensorCount()) {
+        val type = file.tensorAt(i).type
+        counts.set(type, (counts.get(type) ?? 0) + 1)
+    }
+    println("tensors (${file.tensorCount()})")
+    for (type in counts.keys()) println("  ${ggmlTypeName(type)}: ${counts.get(type) ?? 0}")
+    file.close()
+    0
+}

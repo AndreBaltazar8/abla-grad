@@ -1,0 +1,106 @@
+// Scalar test oracle. Inputs are checked before reading a block.
+import "abla/float"
+
+private fun quantOracleHalf(low: int, high: int): f32 {
+    val bits = low | (high << 8)
+    val sign = (bits & 32768) << 16
+    val exponent = (bits >> 10) & 31
+    var mantissa = bits & 1023
+    if (exponent == 0) {
+        if (mantissa == 0) return f32FromBits(u32(sign))
+        var normalized = 113
+        while (mantissa < 1024) {
+            mantissa = mantissa << 1
+            normalized -= 1
+        }
+        return f32FromBits(u32(sign | (normalized << 23) | ((mantissa & 1023) << 13)))
+    }
+    val biased = if (exponent == 31) 255 else exponent + 112
+    f32FromBits(u32(sign | (biased << 23) | (mantissa << 13)))
+}
+
+private fun quantOracleByteSign(byte: int): int = if (byte >= 128) byte - 256 else byte
+
+// Decodes a single Q8_0 block, or returns an empty array if the size is wrong.
+fun oracleQ8_0(bytes: string): array<f32> {
+    if (bytes.size != 34) return []
+    val scale = quantOracleHalf(bytes[0], bytes[1])
+    val out: array<f32> = []
+    for (i in 0 until 32) out.append(scale * f32FromInt(quantOracleByteSign(bytes[2 + i])))
+    out
+}
+
+// Decodes the common 6-bit scale/min pair of Q4_K and Q5_K for group g.
+private fun quantOracleKScale(bytes: string, g: int): int {
+    if (g < 4) return bytes[4 + g] & 63
+    (bytes[8 + g] & 15) | ((bytes[g] >> 6) << 4)
+}
+
+private fun quantOracleKMin(bytes: string, g: int): int {
+    if (g < 4) return bytes[8 + g] & 63
+    (bytes[8 + g] >> 4) | ((bytes[4 + g] >> 6) << 4)
+}
+
+private fun quantOracleKWithMin(bytes: string, highBits: bool): array<f32> {
+    val start = if (highBits) 48 else 16
+    if (bytes.size != start + 128) return []
+    val scale = quantOracleHalf(bytes[0], bytes[1])
+    val minimum = quantOracleHalf(bytes[2], bytes[3])
+    val out: array<f32> = []
+    for (group in 0 until 8) {
+        val d = scale * f32FromInt(quantOracleKScale(bytes, group))
+        val m = minimum * f32FromInt(quantOracleKMin(bytes, group))
+        for (lane in 0 until 32) {
+            val packed = bytes[start + (group / 2) * 32 + lane]
+            var q = (packed >> ((group % 2) * 4)) & 15
+            if (highBits) q = q | ((bytes[16 + lane] >> group) & 1) << 4
+            out.append(d * f32FromInt(q) - m)
+        }
+    }
+    out
+}
+
+// Decodes one Q4_K block, or returns an empty array if the size is wrong.
+fun oracleQ4K(bytes: string): array<f32> = quantOracleKWithMin(bytes, false)
+
+// Decodes one Q5_K block, or returns an empty array if the size is wrong.
+fun oracleQ5K(bytes: string): array<f32> = quantOracleKWithMin(bytes, true)
+
+// Decodes one Q6_K block, or returns an empty array if the size is wrong.
+fun oracleQ6K(bytes: string): array<f32> {
+    if (bytes.size != 210) return []
+    val d = quantOracleHalf(bytes[208], bytes[209])
+    val out: array<f32> = []
+    for (i in 0 until 256) {
+        val slab = i / 128
+        val group = (i % 128) / 32
+        val lane = i % 32
+        val low = (bytes[slab * 64 + (group % 2) * 32 + lane] >> ((group / 2) * 4)) & 15
+        val high = (bytes[128 + slab * 32 + lane] >> (group * 2)) & 3
+        val scale = quantOracleByteSign(bytes[192 + i / 16])
+        out.append(d * f32FromInt(scale) * f32FromInt((low | (high << 4)) - 32))
+    }
+    out
+}
+
+private fun quantOracleUe4m3(byte: int): f32 {
+    if (byte == 0 || byte == 127) return f32FromInt(0)
+    val exponent = (byte >> 3) & 15
+    val mantissa = byte & 7
+    if (exponent == 0) return f32FromInt(mantissa) / f32FromInt(512)
+    f32FromInt(8 + mantissa) * f32FromInt(1 << exponent) / f32FromInt(1024)
+}
+
+// Decodes one NVFP4 block, or returns an empty array if the size is wrong.
+fun oracleNvfp4(bytes: string): array<f32> {
+    if (bytes.size != 36) return []
+    val e2m1 = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12]
+    val out: array<f32> = []
+    for (i in 0 until 64) {
+        val group = i / 16
+        val packed = bytes[4 + group * 8 + i % 8]
+        val code = (packed >> (((i % 16) / 8) * 4)) & 15
+        out.append(quantOracleUe4m3(bytes[group]) * f32FromInt(e2m1[code]) * f32(0.5))
+    }
+    out
+}
