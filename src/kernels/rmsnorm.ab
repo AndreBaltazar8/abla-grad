@@ -1,14 +1,6 @@
 val kernelRmsnorm = """
-extern "C" __global__ void rmsnorm(const float *x, const float *w, float *y,
-                                    unsigned n, float eps) {
-    __shared__ float sums[128];
+static __device__ __forceinline__ float rmsnorm_factor(float sum, unsigned n, float eps, float *sums) {
     unsigned lane = threadIdx.x;
-    unsigned long long base = static_cast<unsigned long long>(blockIdx.x) * n;
-    float sum = 0.0f;
-    for (unsigned long long i = lane; i < n; i += blockDim.x) {
-        float v = x[base + i];
-        sum = fmaf(v, v, sum);
-    }
     sums[lane] = sum;
     __syncthreads();
     if (lane < 32) {
@@ -23,7 +15,47 @@ extern "C" __global__ void rmsnorm(const float *x, const float *w, float *y,
         if (lane == 0) sums[0] = rsqrtf(sum / float(n) + eps);
     }
     __syncthreads();
-    float factor = sums[0];
+    return sums[0];
+}
+
+static __device__ __forceinline__ void rmsnorm_2304(const float *x, const float *w,
+    float *y, float eps, float *sums) {
+    const unsigned lane = threadIdx.x;
+    float activation[18];
+    float sum = 0.0f;
+    #pragma unroll
+    for (unsigned i = 0; i < 18; ++i) {
+        activation[i] = x[lane + i * 128];
+        sum = fmaf(activation[i], activation[i], sum);
+    }
+    const float factor = rmsnorm_factor(sum, 2304, eps, sums);
+    if (w) {
+        #pragma unroll
+        for (unsigned i = 0; i < 18; ++i) {
+            unsigned j = lane + i * 128;
+            y[j] = (activation[i] * factor) * w[j];
+        }
+    } else {
+        #pragma unroll
+        for (unsigned i = 0; i < 18; ++i) y[lane + i * 128] = activation[i] * factor;
+    }
+}
+
+extern "C" __global__ void rmsnorm(const float *x, const float *w, float *y,
+                                    unsigned n, float eps) {
+    __shared__ float sums[128];
+    unsigned lane = threadIdx.x;
+    unsigned long long base = static_cast<unsigned long long>(blockIdx.x) * n;
+    if (n == 2304) {
+        rmsnorm_2304(x + base, w, y + base, eps, sums);
+        return;
+    }
+    float sum = 0.0f;
+    for (unsigned long long i = lane; i < n; i += blockDim.x) {
+        float v = x[base + i];
+        sum = fmaf(v, v, sum);
+    }
+    float factor = rmsnorm_factor(sum, n, eps, sums);
     for (unsigned long long i = lane; i < n; i += blockDim.x) {
         float value = x[base + i] * factor;
         y[base + i] = w ? value * w[i] : value;

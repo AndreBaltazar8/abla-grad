@@ -4,9 +4,8 @@ import "abla/float"
 import "abla/math"
 import "abla/unsafe/memory/raw"
 
-trusted fun testRmsnorm(backend: Backend, weighted: bool): bool {
+trusted fun testRmsnorm(backend: Backend, weighted: bool, n: int = 259): bool {
     val vectors = 3
-    val n = 259
     val eps = f32(0.00001)
     val inputs: array<f32> = []
     val weights: array<f32> = []
@@ -44,5 +43,7 @@ trusted fun testRmsnorm(backend: Backend, weighted: bool): bool {
     true
 }
 
-fun verify(backend: Backend): bool = testRmsnorm(backend, true) && testRmsnorm(backend, false)
+fun verify(backend: Backend): bool =
+    testRmsnorm(backend, true) && testRmsnorm(backend, false) &&
+    testRmsnorm(backend, true, 2304) && testRmsnorm(backend, false, 2304)
 fun main: int = runCudaKernelTest("rmsnorm (weighted and weightless, in place)", verify)
