@@ -1,0 +1,29 @@
+CPU versus CUDA raw-logit reference
+llama.cpp 33aeb17f85869279e3821f746bc645357139bc2c
+Models and checksums are in tools/oracle/models.txt.
+CUDA 12.9.86, RTX 4090 (sm_89), driver 580.95.05.
+Both arms consume the same IDs one at a time, context 512, F16 KV,
+flash attention auto, four host threads. CPU uses zero GPU layers.
+CUDA offloads 17/17 Llama layers and 49/49 Inkling layers.
+KL is KL(softmax(CPU) || softmax(CUDA)), in nats.
+Reproduce with tools/oracle/measure-noise.sh OUTPUT_DIRECTORY.
+
+model	prompt	positions	max_abs_logit	max_kl_cpu_cuda	mean_kl_cpu_cuda	matching_argmax
+llama-3.2-1b-instruct	01	5	0.541469812	0.00489896872	0.00239720106	5
+llama-3.2-1b-instruct	02	6	0.640243053	0.00390322351	0.00226317459	6
+llama-3.2-1b-instruct	03	14	1.1265105	0.0180656044	0.00534974334	12
+llama-3.2-1b-instruct	04	241	0.872897387	0.0141506281	0.000486269653	241
+inkling-2-mini	01	4	0.468595862	0.000316254856	0.000128991915	4
+inkling-2-mini	02	5	0.429792762	0.000357815671	0.000225290701	5
+inkling-2-mini	03	15	1.5118922	0.0171275429	0.00344587509	14
+inkling-2-mini	04	300	9.86542177	0.00424164767	0.000243182162	300
+
+Llama: 264/266 argmax matches, max absolute logit difference 1.12651050,
+max KL 0.0180656044. Inkling: 323/324 argmax matches, max absolute logit
+difference 9.86542177, max KL 0.0171275429.
+
+Inkling's highest absolute difference was prompt 04, zero-based position
+219, candidate ID 33043. Its CPU and CUDA logits were -6.43721342 and
+-16.30263519. The best logits on that row were 26.16419220 and 27.49708176,
+so the differing candidate received negligible probability in both arms.
+The raw max and KL capture different parts of the observed noise.

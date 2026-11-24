@@ -1,0 +1,3 @@
+# These cases intentionally contain mixed line endings or empty TSV fields.
+03.txt -text whitespace=cr-at-eol
+*.tsv -text whitespace=-blank-at-eol

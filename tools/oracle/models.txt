@@ -1,0 +1,4 @@
+# model <name> <file> <revision> <bytes> <sha256> <url>
+llama.cpp 33aeb17f85869279e3821f746bc645357139bc2c https://github.com/ggml-org/llama.cpp.git
+model llama-3.2-1b-instruct Llama-3.2-1B-Instruct-Q4_K_M.gguf b69aef112e9f895e6f98d7ae0949f72ff09aa401 807694368 3f5a22426976ab26cfe84dba63c1d08391717abb1af893e10f1b2968d862dcc1 https://huggingface.co/unsloth/Llama-3.2-1B-Instruct-GGUF/resolve/b69aef112e9f895e6f98d7ae0949f72ff09aa401/Llama-3.2-1B-Instruct-Q4_K_M.gguf
+model inkling-2-mini Inkling-2-Mini-UD-Q4_K_M.gguf 8078d149286eec7193795413b9e0643da6d11fa1 16610544608 78fcedcf93c5d1bfe83e225513b71392bb52259be0eaa5f8899c856a2e5834ae https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/8078d149286eec7193795413b9e0643da6d11fa1/Mainline_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file
