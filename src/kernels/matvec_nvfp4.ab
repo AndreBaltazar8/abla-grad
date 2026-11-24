@@ -1,7 +1,7 @@
 // GGML NVFP4 rows have 36-byte blocks of 64 weights. Four UE4M3 scales
 // precede four groups of eight packed E2M1 bytes. A lane reads four bytes
 // from one group and accumulates its eight products in FP32.
-val kernelMatvecNvfp4 = """
+val kernelNvfp4DotSource = """
 static __device__ __forceinline__ float nvfp4_half_scale(unsigned code) {
     // GGML gives 0x7f a zero scale and ignores the high bit otherwise.
     if (code == 0x7fu) return 0.0f;
@@ -45,7 +45,9 @@ static __device__ __forceinline__ float nvfp4_dot(const unsigned char *row,
     }
     return sum;
 }
+"""
 
+val kernelMatvecNvfp4 = kernelNvfp4DotSource + "\n\n" + """
 extern "C" __global__ void matvec_nvfp4(const unsigned char *w, const float *x,
                                         float *y, unsigned rows, unsigned cols) {
     unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
