@@ -1,0 +1,101 @@
+// `abla-grad compare-tensors <oracle-dir> <our-dir> [--tol 0.02] [--visits N]`: the named intermediate vectors of the first token (`abla-grad logits
+// --dump` and tools/oracle/dump-tensors.sh write the same names), in graph order; prints max |difference| and the relative L2 error of each and the first
+// one beyond the tolerance, which is where a wrong kernel or a wrong graph step shows up.
+import "abla/io"
+import "abla/fs"
+import "abla/math"
+import "abla/float"
+import "abla/float/text"
+import "abla/integer"
+import "../model/dump.ab"
+
+class TensorDiff(val maxAbs: f64, val relative: f64, val size: int)
+
+private fun diffVectors(a: array<f32>, b: array<f32>): TensorDiff {
+    var maxAbs = 0.0
+    var sumDiff = 0.0
+    var sumRef = 0.0
+    for (index in 0 until a.size) {
+        val x = f32ToF64(a[index])
+        val y = f32ToF64(b[index])
+        val d = if (x > y) x - y else y - x
+        if (d > maxAbs) maxAbs = d
+        sumDiff = sumDiff + d * d
+        sumRef = sumRef + x * x
+    }
+    TensorDiff(maxAbs, if (sumRef > 0.0) sqrt(sumDiff / sumRef) else sqrt(sumDiff), a.size)
+}
+
+fun cmdCompareTensors(args: array<string>): int {
+    var tolerance = 0.02
+    var visits = 48
+    val dirs: array<string> = []
+    var index = 0
+    while (index < args.size) {
+        if (args[index] == "--tol" && index + 1 < args.size) {
+            tolerance = parseDecimalOr(args[index + 1], 0.02)
+            index = index + 2
+        } else if (args[index] == "--visits" && index + 1 < args.size) {
+            visits = args[index + 1].parseInt() ?? 48
+            index = index + 2
+        } else {
+            dirs.append(args[index])
+            index = index + 1
+        }
+    }
+    if (dirs.size != 2) {
+        println("usage: abla-grad compare-tensors <oracle-dir> <our-dir> [--tol 0.02] [--visits 48]")
+        return 2
+    }
+    val names: array<string> = []
+    for (visit in 0 until visits) {
+        for (kind in ["Qcur", "Kcur", "Vcur", "ffn_inp", "ffn_moe_situ", "ffn_out", "l_out"]) names.append("$kind-$visit")
+    }
+    names.append("result_norm")
+    names.append("result_output")
+    var compared = 0
+    var firstBad = ""
+    for (name in names) {
+        val ours = Path("${dirs[1]}/$name.f32")
+        if (!ours.exists()) continue
+        val reference = readFloatFile("${dirs[0]}/$name.f32")
+        val mine = readFloatFile("${dirs[1]}/$name.f32")
+        if (reference == null || mine == null) {
+            println("$name: cannot read one of the files")
+            continue
+        }
+        if (reference.size != mine.size) {
+            println("$name: sizes differ (${reference.size} oracle, ${mine.size} ours)")
+            if (firstBad == "") firstBad = name
+            continue
+        }
+        val diff = diffVectors(reference, mine)
+        compared = compared + 1
+        val flag = if (diff.relative > tolerance) "  <-- beyond $tolerance" else ""
+        println("$name: ${diff.size} values, max abs ${diff.maxAbs}, relative L2 ${diff.relative}$flag")
+        if (diff.relative > tolerance && firstBad == "") firstBad = name
+    }
+    if (compared == 0) {
+        println("compare-tensors: no common tensors found")
+        return 2
+    }
+    if (firstBad == "") {
+        println("compare-tensors: $compared tensors within $tolerance")
+        return 0
+    }
+    println("compare-tensors: the first tensor beyond $tolerance is $firstBad")
+    1
+}
+
+private fun parseDecimalOr(text: string, fallback: f64): f64 {
+    val whole = text.parseInt()
+    if (whole != null) return f64FromInt(whole)
+    val dot = text.indexOf(".")
+    if (dot <= 0) return fallback
+    val integerPart = text.slice(0, dot).parseInt() ?? 0
+    val fraction = text.slice(dot + 1, text.size)
+    val digits = fraction.parseInt() ?? 0
+    var scale = 1.0
+    for (i in 0 until fraction.size) scale = scale * 10.0
+    f64FromInt(integerPart) + f64FromInt(digits) / scale
+}

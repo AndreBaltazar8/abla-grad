@@ -1,0 +1,33 @@
+// Raw little-endian f32 vector files: what tools/oracle/dump-tensors.sh writes (one file per named tensor) and what `abla-grad logits --dump` writes with the
+// same names, so `abla-grad compare-tensors` can find the first layer where a run leaves the oracle.
+import "abla/bytes"
+import "abla/float"
+import "abla/fs"
+
+private fun dumpU32At(text: string, at: int): int =
+    text[at] | (text[at + 1] << 8) | (text[at + 2] << 16) | (text[at + 3] << 24)
+
+fun readFloatFile(path: string): array<f32>? {
+    val result = Path(path).readTextResult()
+    if (!result.succeeded || result.text.size % 4 != 0) return null
+    val values: array<f32> = []
+    var at = 0
+    while (at < result.text.size) {
+        values.append(f32FromBits(u32(dumpU32At(result.text, at))))
+        at = at + 4
+    }
+    values
+}
+
+fun writeFloatFile(path: string, values: array<f32>): bool {
+    var out = byteBuffer()
+    for (value in values) {
+        val bits = int(f32ToBits(value))
+        val a = out.appendByteValue(bits & 255)
+        val b = out.appendByteValue((bits >> 8) & 255)
+        val c = out.appendByteValue((bits >> 16) & 255)
+        val d = out.appendByteValue((bits >> 24) & 255)
+        if (!(a && b && c && d)) return false
+    }
+    Path(path).writeText(out.toText())
+}

@@ -4,6 +4,7 @@ import "cli/compare.ab"
 import "cli/info.ab"
 import "cli/logits.ab"
 import "cli/tokenize.ab"
+import "cli/compare_tensors.ab"
 
 // Commands: compare, info; tokenize and logits arrive with the tokenizer (ablac-90) and the model graph.
 fun main: int {
@@ -14,6 +15,7 @@ fun main: int {
     if (command == "info") return cmdInfo(args)
     if (command == "logits") return cmdLogits(args)
     if (command == "tokenize") return cmdTokenize(args)
+    if (command == "compare-tensors") return cmdCompareTensors(args)
     println("abla-grad: commands: compare <oracle.grdl> <ours.grdl> [--tolerances file]\n       abla-grad info <model.gguf>   (tokenize, logits to come; see README.md)")
     if (command == "") 0 else 2
 }

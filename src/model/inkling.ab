@@ -11,6 +11,7 @@ import "../gguf/reader.ab"
 import "../gguf/quant.ab"
 import "inkling_config.ab"
 import "weights.ab"
+import "dump.ab"
 
 private var inklingError = ""
 
@@ -104,7 +105,9 @@ resource class InklingModel(
     val vCache: DeviceBuffer,
     val history: DeviceBuffer,
     val blocks: DeviceBuffer,
-    val bank: DeviceBuffer
+    val bank: DeviceBuffer,
+    // When not empty, `forward` at position 0 writes named intermediate vectors (the oracle's names) into this directory.
+    var dumpDir: string = ""
 )
 
 private fun historyBytesPerVisit(c: InklingConfig): int = (c.nConv - 1) * (2 * c.nHeadKv * c.headDim + 2 * c.nEmbd) * 4
@@ -287,6 +290,9 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     }
     if (!ok) return -1
 
+    this.dump(backend, pos, "Qcur-$visit", q, qDim)
+    this.dump(backend, pos, "Kcur-$visit", k, kvDim)
+    this.dump(backend, pos, "Vcur-$visit", v, kvDim)
     // relative-position bias table with the sinks folded in, then attention
     val sinks = this.so("sinks")
     val table = this.so("table")
@@ -319,6 +325,7 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     }
     val ffnInp = this.so("ffnInp")
     ok = ok && this.copy(backend, x, ffnInp, n)
+    this.dump(backend, pos, "ffn_inp-$visit", ffnInp, n)
 
     // MoE
     ok = ok && this.mix(backend, blocks, x, "blk.$ip.ffn_res_query.weight", 1, x)
@@ -351,13 +358,16 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     ok = ok && opMatvecIndexed(backend, guKind, this.arena, guRef.offset, this.scratch, x, this.scratch, this.so("gu"), 2 * nFf, n,
         this.scratch, ids, c.nExpertUsed, guRowBytes * 2 * nFf, 0, this.arena, guScales.offset, this.has("blk.$ip.ffn_gate_up_exps.scale"))
     ok = ok && opSitu(backend, this.scratch, this.so("gu"), this.scratch, this.so("act"), c.nExpertUsed, nFf, c.situBeta, c.situLinear)
+    this.dump(backend, pos, "ffn_moe_situ-$visit", this.so("act"), c.nExpertUsed * nFf)
     ok = ok && opMatvecIndexed(backend, downKind, this.arena, downRef.offset, this.scratch, this.so("act"), this.scratch, this.so("down"), n, nFf,
         this.scratch, ids, c.nExpertUsed, downRowBytes * n, nFf, this.arena, downScales.offset, this.has("blk.$ip.ffn_down_exps.scale"))
     ok = ok && opMoeCombine(backend, this.scratch, this.so("down"), this.scratch, weights, this.scratch, this.so("moe"), n, c.nExpertUsed)
     val ffnPost = this.w("blk.$ip.ffn_post_conv.weight")
     ok = ok && opConvStep(backend, this.scratch, this.so("moe"), this.history, fHistory, this.arena, ffnPost.offset, this.scratch, 0, false,
         this.scratch, x, n, c.nConv, 1, plainScale)
+    this.dump(backend, pos, "ffn_out-$visit", x, n)
     ok = ok && opAdd(backend, this.scratch, ffnInp, this.scratch, x, this.scratch, x, n)
+    this.dump(backend, pos, "l_out-$visit", x, n)
     if (!ok) {
         inklingError = "a launch failed in layer $ip (visit $visit)"
         return -1
@@ -434,6 +444,7 @@ fun InklingModel.forward(var backend: Backend, token: int, pos: int): bool {
     // output: depth mix, norm, lm head, softcap
     ok = this.mix(backend, blocks, x, "output_res_query.weight", 1, x)
     ok = ok && this.norm(backend, "output_norm.weight", x, x)
+    this.dump(backend, pos, "result_norm", x, n)
     val output = this.w("output.weight")
     val outputKind = weightKind(output.type)
     if (outputKind == "") {
@@ -442,6 +453,7 @@ fun InklingModel.forward(var backend: Backend, token: int, pos: int): bool {
     }
     ok = ok && opMatvec(backend, outputKind, this.arena, output.offset, this.scratch, x, this.scratch, this.so("logits"), output.rows, output.cols)
     if (c.softcap != 0.0) ok = ok && opSoftcap(backend, this.scratch, this.so("logits"), c.softcap, c.nVocabPadded)
+    this.dump(backend, pos, "result_output", this.so("logits"), c.nVocab)
     if (!ok) inklingError = "the output projection failed"
     ok
 }
@@ -461,4 +473,28 @@ trusted fun InklingModel.readLogits(var backend: Backend): array<f32>? {
     for (index in 0 until count) logits.append(f32FromBits(u32(ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * index)))))
     host.close()
     logits
+}
+
+// ---- debugging dumps ----
+// Writes `count` floats from scratch offset `offset` to `<dumpDir>/<name>.f32` (position 0 only; a no-op when dumping is off).
+private fun InklingModel.dump(var backend: Backend, pos: int, name: string, offset: int, count: int): void {
+    if (this.dumpDir == "" || pos != 0) return
+    val values = this.readScratch(backend, offset, count)
+    if (values == null || !writeFloatFile("${this.dumpDir}/$name.f32", values)) {
+        inklingError = "could not dump $name"
+    }
+}
+
+trusted fun InklingModel.readScratch(var backend: Backend, offset: int, count: int): array<f32>? {
+    val bytes = count * 4
+    val host = nativeByteBuffer(bytes + 8)
+    if (!backend.download(this.scratch, offset, nativePointerAddress(host.address), bytes)) {
+        host.close()
+        return null
+    }
+    val address = nativePointerAddress(host.address)
+    val values: array<f32> = []
+    for (index in 0 until count) values.append(f32FromBits(u32(ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * index)))))
+    host.close()
+    values
 }
