@@ -91,6 +91,15 @@ private trusted fun cudaCompilePtx(source: string, name: string, architecture: s
 private trusted noescape extern:"c" fun cuCtxPushCurrent_v2(context: i64*): i32
 private trusted noescape extern:"c" fun cuCtxPopCurrent_v2(context: i64*): i32
 private trusted noescape extern:"c" fun cuMemGetInfo_v2(freeBytes: i64*, totalBytes: i64*): i32
+private trusted noescape extern:"c" fun cuStreamCreate(stream: i64*, flags: u32): i32
+private trusted noescape extern:"c" fun cuStreamDestroy_v2(stream: i64*): i32
+private trusted noescape extern:"c" fun cuStreamSynchronize(stream: i64*): i32
+private trusted noescape extern:"c" fun cuStreamBeginCapture_v2(stream: i64*, mode: i32): i32
+private trusted noescape extern:"c" fun cuStreamEndCapture(stream: i64*, graph: i64*): i32
+private trusted noescape extern:"c" fun cuGraphInstantiateWithFlags(exec: i64*, graph: i64*, flags: u64): i32
+private trusted noescape extern:"c" fun cuGraphLaunch(exec: i64*, stream: i64*): i32
+private trusted noescape extern:"c" fun cuGraphExecDestroy(exec: i64*): i32
+private trusted noescape extern:"c" fun cuGraphDestroy(graph: i64*): i32
 
 private trusted noescape extern:"c" fun nvrtcVersion(major: i64*, minor: i64*): i32
 
@@ -335,7 +344,11 @@ class CudaBackend(
     var context: int,
     val architecture: string,
     var liveBuffers: int = 0,
-    val functions: array<CudaFunction> = []
+    val functions: array<CudaFunction> = [],
+    // The stream every launch runs on (created at first use) and the recording state (docs: Backend.beginRecording).
+    var stream: int = 0,
+    var recording: bool = false,
+    var recordedLaunches: int = 0
 ) : Backend {
     fun name(): string = "cuda"
 
@@ -354,6 +367,71 @@ class CudaBackend(
     }
 
     // Close after the last DeviceBuffer has been dropped.
+    // The stream is created lazily (the context must be current). A blocking stream: it synchronizes with the legacy default stream, which the synchronous
+    // copies (upload, download) use, so copies and launches stay ordered.
+    trusted fun ensureStream(): bool {
+        if (this.stream != 0) return true
+        val handle = nativePointerCell(nativeNullPointer())
+        if (!cudaStatus(cuStreamCreate(handle.address, 0), "cuStreamCreate")) return false
+        this.stream = nativePointerAddress(handle.load())
+        true
+    }
+
+    trusted fun beginRecording(): bool {
+        if (this.recording) {
+            cudaError = "a recording is already in progress"
+            return false
+        }
+        if (!this.pushContext()) return false
+        var ok = this.ensureStream()
+        // relaxed: loading a kernel's module during the recording is allowed (the first launch of a kernel compiles or loads it)
+        ok = ok && cudaStatus(cuStreamBeginCapture_v2(nativePointerFromAddress(this.stream), 2), "cuStreamBeginCapture")
+        this.popContext()
+        if (ok) {
+            this.recording = true
+            this.recordedLaunches = 0
+        }
+        ok
+    }
+
+    trusted fun endRecording(): Recording? {
+        if (!this.recording) {
+            cudaError = "no recording in progress"
+            return null
+        }
+        this.recording = false
+        if (!this.pushContext()) return null
+        val graph = nativePointerCell(nativeNullPointer())
+        var recorded: Recording? = null
+        if (cudaStatus(cuStreamEndCapture(nativePointerFromAddress(this.stream), graph.address), "cuStreamEndCapture")) {
+            val exec = nativePointerCell(nativeNullPointer())
+            if (cudaStatus(cuGraphInstantiateWithFlags(exec.address, graph.load(), u64(0)), "cuGraphInstantiate")) {
+                recorded = Recording(this, nativePointerAddress(exec.load()), this.recordedLaunches)
+            }
+            cuGraphDestroy(graph.load())
+        }
+        this.popContext()
+        recorded
+    }
+
+    trusted fun replay(recording: Recording): bool {
+        if (this.recording) {
+            cudaError = "cannot replay while recording"
+            return false
+        }
+        if (!this.pushContext()) return false
+        val ok = this.ensureStream() &&
+            cudaStatus(cuGraphLaunch(nativePointerFromAddress(recording.handle), nativePointerFromAddress(this.stream)), "cuGraphLaunch")
+        this.popContext()
+        ok
+    }
+
+    trusted fun releaseRecording(handle: int): void {
+        if (!this.pushContext()) return
+        cudaStatus(cuGraphExecDestroy(nativePointerFromAddress(handle)), "cuGraphExecDestroy")
+        this.popContext()
+    }
+
     trusted fun close(): bool {
         if (this.context == 0) return true
         if (this.liveBuffers != 0) {
@@ -393,6 +471,10 @@ class CudaBackend(
     }
 
     trusted fun upload(destination: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool {
+        if (this.recording) {
+            cudaError = "copies and synchronization are not allowed while recording"
+            return false
+        }
         if (!this.copyRange(destination, offset, hostAddress, bytes)) return false
         if (bytes == 0) return true
         if (!this.pushContext()) return false
@@ -403,6 +485,10 @@ class CudaBackend(
     }
 
     trusted fun download(source: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool {
+        if (this.recording) {
+            cudaError = "copies and synchronization are not allowed while recording"
+            return false
+        }
         if (!this.copyRange(source, offset, hostAddress, bytes)) return false
         if (bytes == 0) return this.synchronize()
         if (!this.pushContext()) return false
@@ -452,6 +538,10 @@ class CudaBackend(
             return false
         }
         if (!this.pushContext()) return false
+        if (!this.ensureStream()) {
+            this.popContext()
+            return false
+        }
         val function = this.loadKernel(spec)
         var ok = false
         if (function != null) {
@@ -466,14 +556,19 @@ class CudaBackend(
             val gridX = u32((problem[0] + spec.itemsPerBlock - 1) / spec.itemsPerBlock)
             val gridY = u32(if (spec.problemDimensions == 2) problem[1] else 1)
             ok = cudaStatus(cuLaunchKernel(nativePointerFromAddress(function.handle),
-                gridX, gridY, 1, u32(spec.blockX), 1, 1, 0, nativeNullPointer(),
+                gridX, gridY, 1, u32(spec.blockX), 1, 1, 0, nativePointerFromAddress(this.stream),
                 pointers.address, nativeNullPointer()), "cuLaunchKernel")
         }
+        if (ok && this.recording) this.recordedLaunches += 1
         this.popContext()
         ok
     }
 
     trusted fun synchronize(): bool {
+        if (this.recording) {
+            cudaError = "copies and synchronization are not allowed while recording"
+            return false
+        }
         if (!this.pushContext()) return false
         val ok = cudaStatus(cuCtxSynchronize(), "cuCtxSynchronize")
         this.popContext()

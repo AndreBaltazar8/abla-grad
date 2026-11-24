@@ -73,6 +73,23 @@ interface Backend {
     fun synchronize(): bool
     // Bytes of device memory still free.
     fun freeMemory(): int
+    // Start recording launches instead of running them (copies and synchronize are not allowed meanwhile); false when the backend cannot.
+    fun beginRecording(): bool
+    // Stop recording; the sequence, or null when the recording failed.
+    fun endRecording(): Recording?
+    // Queue the whole recorded sequence (asynchronous, ordered with launches).
+    fun replay(recording: Recording): bool
+    // Called by Recording.drop only.
+    fun releaseRecording(handle: int): void
     // Called by DeviceBuffer.drop only.
     fun release(handle: int, bytes: int): void
+}
+
+// A recorded sequence of launches that can be replayed with one call (a CUDA graph; for other backends a list of launches). Recording captures what `launch`
+// is asked to do between `beginRecording` and `endRecording`: nothing runs while recording. Everything a replay needs that changes from run to run
+// (a token, a position) must live in device memory the kernels read, not in kernel parameters, since parameters are frozen at recording time.
+resource class Recording(val owner: Backend, val handle: int, val launches: int) {
+    fun drop(): void {
+        this.owner.releaseRecording(this.handle)
+    }
 }

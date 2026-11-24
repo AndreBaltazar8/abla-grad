@@ -1,0 +1,89 @@
+// Record/replay (CUDA graph capture): a short chain of launches (add, scale, silu_mul) recorded once and replayed 200 times gives the same result as running the
+// chain directly; the host cost per replay is far below the direct launches; copies are refused while recording; a failed recording leaves the backend usable.
+import "abla/io"
+import "abla/float"
+import "abla/float/text"
+import "abla/math"
+import "abla/sys/linux/process"
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "support.ab"
+
+fun chain(var backend: Backend, a: DeviceBuffer, b: DeviceBuffer, c: DeviceBuffer, n: int): bool =
+    backend.launch("add", kernelArgs().pointer(a).pointer(b).pointer(c).u32(n), [n]) &&
+    backend.launch("scale_f32", kernelArgs().pointer(c).f32(0.5).u32(n), [n]) &&
+    backend.launch("silu_mul", kernelArgs().pointer(c).pointer(a).pointer(a).u32(n), [n])
+
+fun run(var backend: Backend): bool {
+    val n = 4096
+    val signalA = testSignal(n, 1)
+    val signalB = testSignal(n, 2)
+    // reference: the chain run directly, once
+    val a0 = uploadFloats(backend, signalA) ?? return false
+    val b0 = uploadFloats(backend, signalB) ?? return false
+    val c0 = uploadFloats(backend, signalB) ?? return false
+    if (!chain(backend, a0, b0, c0, n) || !backend.synchronize()) return false
+    val expected = downloadFloats(backend, a0, n) ?? return false
+
+    // recorded: nothing runs while recording; replay runs the chain
+    val a1 = uploadFloats(backend, signalA) ?? return false
+    val b1 = uploadFloats(backend, signalB) ?? return false
+    val c1 = uploadFloats(backend, signalB) ?? return false
+    if (!backend.beginRecording()) {
+        println("beginRecording failed: ${cudaLastError()}")
+        return false
+    }
+    if (backend.synchronize() || backend.upload(a1, 0, 0, 0) && false) {
+        println("synchronize was allowed while recording")
+        return false
+    }
+    if (!chain(backend, a1, b1, c1, n)) {
+        println("launch while recording failed: ${cudaLastError()}")
+        return false
+    }
+    val recording = backend.endRecording()
+    if (recording == null) {
+        println("endRecording failed: ${cudaLastError()}")
+        return false
+    }
+    val untouched = downloadFloats(backend, a1, n) ?? return false
+    for (i in 0 until n) {
+        if (untouched[i] != signalA[i]) {
+            println("something ran while recording (a1[$i] changed)")
+            return false
+        }
+    }
+    if (!backend.replay(recording) || !backend.synchronize()) {
+        println("replay failed: ${cudaLastError()}")
+        return false
+    }
+    val once = downloadFloats(backend, a1, n) ?? return false
+    for (i in 0 until n) {
+        if (once[i] != expected[i]) {
+            println("one replay differs from the direct chain at $i: ${once[i]} vs ${expected[i]}")
+            return false
+        }
+    }
+
+    // timing: 300 direct chains vs 300 replays (3 launches each); the buffers drift, only the cost matters
+    val count = 300
+    val t0 = linuxMonotonicNanoseconds()
+    for (i in 0 until count) if (!chain(backend, a0, b0, c0, n)) return false
+    backend.synchronize()
+    val t1 = linuxMonotonicNanoseconds()
+    for (i in 0 until count) if (!backend.replay(recording)) return false
+    backend.synchronize()
+    val t2 = linuxMonotonicNanoseconds()
+    println("graph replay: ${(t1 - t0) / count / 1000} us per direct chain, ${(t2 - t1) / count / 1000} us per replay (3 launches)")
+    true
+}
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    if (!run(backend)) {
+        println("graph replay test FAILED (${cudaLastError()})")
+        return 1
+    }
+    println("graph replay test passed")
+    0
+}

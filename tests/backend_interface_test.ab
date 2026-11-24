@@ -17,6 +17,11 @@ class RecordingBackend(var launchedWords: int, var live: int, var lastKernel: st
         args.kinds.size == args.words.size
     }
     fun synchronize(): bool = true
+    fun beginRecording(): bool = false
+    fun endRecording(): Recording? = null
+    fun replay(recording: Recording): bool = false
+    fun releaseRecording(handle: int): void {
+    }
     fun freeMemory(): int = 0
     fun release(handle: int, bytes: int): void {
         this.live = this.live - 1
