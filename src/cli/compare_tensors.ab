@@ -7,6 +7,7 @@ import "abla/math"
 import "abla/float"
 import "abla/float/text"
 import "abla/integer"
+import "abla/text"
 import "../model/dump.ab"
 
 class TensorDiff(val maxAbs: f64, val relative: f64, val size: int)
