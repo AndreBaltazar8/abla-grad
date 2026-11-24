@@ -1,0 +1,57 @@
+// attention_rel_split_step + attention_rel_merge against attention_decode_rel_step (global and sliding-window, several positions and split counts).
+import "abla/io"
+import "abla/float"
+import "abla/float/text"
+import "abla/math"
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "support.ab"
+
+fun check(var backend: Backend, pos: int, window: int, nSplit: int): bool {
+    val nHead = 6
+    val nKvHead = 2
+    val dim = 128
+    val maxCtx = 700
+    val extent = 600
+    val q = uploadFloats(backend, testSignal(nHead * dim, 31)) ?? return false
+    val k = uploadFloats(backend, testSignal(nKvHead * maxCtx * dim, 32)) ?? return false
+    val v = uploadFloats(backend, testSignal(nKvHead * maxCtx * dim, 33)) ?? return false
+    val table = uploadFloats(backend, testSignal(nHead * (extent + 1), 34)) ?? return false
+    val expected = uploadFloats(backend, testSignal(nHead * dim, 35)) ?? return false
+    val got = uploadFloats(backend, testSignal(nHead * dim, 36)) ?? return false
+    val part = uploadFloats(backend, testSignal(nHead * nSplit * (dim + 2), 37)) ?? return false
+    val step = uploadWords(backend, [0, pos, 0, 0]) ?? return false
+    val scale: f32 = 0.088388
+    if (!backend.launch("attention_decode_rel_step", kernelArgs().pointer(q).pointer(k).pointer(v).pointer(table).pointer(expected).pointer(step)
+            .u32(nHead).u32(nKvHead).u32(dim).u32(window).u32(extent).u32(maxCtx).f32(scale), [nHead])) return false
+    if (!backend.launch("attention_rel_split_step", kernelArgs().pointer(q).pointer(k).pointer(v).pointer(table).pointer(part).pointer(step)
+            .u32(nHead).u32(nKvHead).u32(dim).u32(window).u32(extent).u32(maxCtx).f32(scale).u32(nSplit), [nHead * nSplit])) return false
+    if (!backend.launch("attention_rel_merge", kernelArgs().pointer(part).pointer(got).u32(nHead).u32(dim).u32(nSplit), [nHead])) return false
+    val e = downloadFloats(backend, expected, nHead * dim) ?? return false
+    val g = downloadFloats(backend, got, nHead * dim) ?? return false
+    for (i in 0 until nHead * dim) {
+        val a = f32ToF64(e[i])
+        val b = f32ToF64(g[i])
+        if (!(fabs(a - b) <= 0.00001 + fabs(a) * 0.00002)) {
+            println("pos $pos window $window splits $nSplit: output $i expected $a got $b")
+            return false
+        }
+    }
+    true
+}
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    for (nSplit in [1, 8, 13]) {
+        for (pos in [0, 1, 7, 8, 63, 300, 512]) {
+            for (window in [0, 128]) {
+                if (!check(backend, pos, window, nSplit)) {
+                    println("attention split test FAILED (${cudaLastError()})")
+                    return 1
+                }
+            }
+        }
+    }
+    println("attention split test passed")
+    0
+}

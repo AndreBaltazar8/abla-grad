@@ -42,12 +42,16 @@ fun cmdLogits(args: array<string>): int {
     var maxCtx = 0
     var dumpDir = ""
     var useStep = false
+    var noSplit = false
     val positional: array<string> = []
     var index = 0
     while (index < args.size) {
         if (args[index] == "-o" && index + 1 < args.size) {
             out = args[index + 1]
             index = index + 2
+        } else if (args[index] == "--no-split") {
+            noSplit = true
+            index = index + 1
         } else if (args[index] == "--step") {
             useStep = true
             index = index + 1
@@ -94,6 +98,7 @@ fun cmdLogits(args: array<string>): int {
         var model = inklingLoad(backend, file, config, context) ?? return inklingLoadFailed()
         model.dumpDir = dumpDir
         model.useStep = useStep
+        model.splitAttention = !noSplit
         if (!model.reset(backend)) {
             println("logits: could not clear the convolution state (${cudaLastError()})")
             return 1

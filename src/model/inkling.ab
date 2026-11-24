@@ -15,6 +15,9 @@ import "dump.ab"
 
 private var inklingError = ""
 
+// Blocks per head in the split decode attention (position-parallel; the recorded graph keeps this fixed).
+val ATTENTION_SPLITS = 8
+
 fun inklingLastError(): string = inklingError
 
 // ---- scratch layout: named f32 vectors inside one device buffer (byte offsets) ----
@@ -46,6 +49,7 @@ fun inklingScratch(c: InklingConfig): ScratchMap {
     at = scratchAdd(offsets, "vDyn", c.nConv * c.nHeadKv, at)
     at = scratchAdd(offsets, "sinks", c.nHead, at)
     at = scratchAdd(offsets, "table", c.nHead * (c.extent + 1), at)
+    at = scratchAdd(offsets, "attPart", c.nHead * ATTENTION_SPLITS * (c.headDim + 2), at)
     at = scratchAdd(offsets, "att", qDim, at)
     at = scratchAdd(offsets, "gate", qDim, at)
     at = scratchAdd(offsets, "oproj", n, at)
@@ -110,6 +114,8 @@ resource class InklingModel(
     val step: DeviceBuffer,
     // Use the step-buffer kernels (token and position come from `step`, uploaded by `forward`); required for `inklingCapture`.
     var useStep: bool = false,
+    // Split-position decode attention in step mode (--no-split restores the one-block-per-head kernel for A/B runs).
+    var splitAttention: bool = true,
     // When not empty, `forward` at position 0 writes named intermediate vectors (the oracle's names) into this directory.
     var dumpDir: string = ""
 )
@@ -317,8 +323,15 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     if (this.useStep) {
         ok = ok && opKvStoreStep(backend, this.scratch, k, this.scratch, v, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
             this.step, c.nHeadKv, c.headDim, this.maxCtx)
-        ok = ok && opAttentionDecodeRelStep(backend, this.scratch, q, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
-            this.scratch, table, this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, if (isSwa) c.nSwa else 0, extent, this.maxCtx, scale)
+        val window = if (isSwa) c.nSwa else 0
+        if (this.splitAttention) {
+            ok = ok && opAttentionRelSplitStep(backend, this.scratch, q, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
+                this.scratch, table, this.scratch, this.so("attPart"), this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent,
+                this.maxCtx, scale, ATTENTION_SPLITS)
+        } else {
+            ok = ok && opAttentionDecodeRelStep(backend, this.scratch, q, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
+                this.scratch, table, this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent, this.maxCtx, scale)
+        }
     } else {
         ok = ok && opKvStore(backend, this.scratch, k, this.scratch, v, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
             pos, c.nHeadKv, c.headDim, this.maxCtx)

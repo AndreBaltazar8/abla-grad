@@ -3,6 +3,7 @@ import "../kernels/matvec_f32.ab"
 import "../kernels/elementwise.ab"
 import "../kernels/inkling_small.ab"
 import "../kernels/step.ab"
+import "../kernels/attention_split.ab"
 import "../kernels/matvec_k.ab"
 import "../kernels/matvec_nvfp4.ab"
 import "../kernels/matvec_q8_0.ab"
@@ -293,6 +294,18 @@ private fun cudaKvStoreStepShape(args: KernelArgs, problem: array<int>): bool = 
 private fun cudaScaleTauShape(args: KernelArgs, problem: array<int>): bool = args.words[4] == problem[0]
 private fun cudaStepAdvanceShape(args: KernelArgs, problem: array<int>): bool = problem[0] == 1
 
+// ---- split-position attention (ablac-60-2; sources in src/kernels/attention_split.ab) ----
+private val cudaArgsAttentionSplit = [
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
+    KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_F32, KERNEL_ARG_U32
+]
+private val cudaArgsAttentionMerge = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32]
+private fun cudaAttentionSplitShape(args: KernelArgs, problem: array<int>): bool =
+    cudaAttentionHeadShape(args.words[6], args.words[7], args.words[8], problem[0] / args.words[13]) &&
+        args.words[13] > 0 && args.words[13] <= 64 && problem[0] == args.words[6] * args.words[13] && args.words[11] > 0
+private fun cudaAttentionMergeShape(args: KernelArgs, problem: array<int>): bool =
+    args.words[2] == problem[0] && args.words[3] > 0 && args.words[3] <= 256 && args.words[4] > 0 && args.words[4] <= 64
+
 private val cudaKernels = [
     CudaKernelSpec("matvec_f32", kernelMatvecF32, 4, 128, cudaMatvecArguments, cudaF32Shape),
     CudaKernelSpec("matvec_q4_k", kernelMatvecK, 4, 128, cudaMatvecArguments, cudaKQuantShape),
@@ -346,7 +359,9 @@ private val cudaKernels = [
     CudaKernelSpec("kv_store_step", kernelKvStoreStep, 256, 256, cudaArgsKvStoreStep, cudaKvStoreStepShape),
     CudaKernelSpec("scale_tau", kernelScaleTau, 256, 256, cudaArgsScaleTau, cudaScaleTauShape),
     CudaKernelSpec("step_advance", kernelStepAdvance, 1, 1, cudaArgsStepAdvance, cudaStepAdvanceShape),
-    CudaKernelSpec("step_record", kernelStepRecord, 1, 1, cudaArgsStepRecord, cudaStepAdvanceShape)
+    CudaKernelSpec("step_record", kernelStepRecord, 1, 1, cudaArgsStepRecord, cudaStepAdvanceShape),
+    CudaKernelSpec("attention_rel_split_step", kernelAttentionSplit, 1, 256, cudaArgsAttentionSplit, cudaAttentionSplitShape),
+    CudaKernelSpec("attention_rel_merge", kernelAttentionSplit, 1, 256, cudaArgsAttentionMerge, cudaAttentionMergeShape)
 ]
 
 private fun cudaKernelSpec(name: string): CudaKernelSpec? {
