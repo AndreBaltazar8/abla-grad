@@ -1,0 +1,46 @@
+// Host orchestration cost of one Inkling token, with no device: a Backend that accepts every call and does nothing, so what is measured is the Abla side
+// (weight lookups by name, scratch offsets, KernelArgs building, string formatting, launch bookkeeping). Usage: host_overhead <inkling.gguf> [tokens]
+import "abla/io"
+import "abla/process/arguments"
+import "abla/integer"
+import "abla/sys/linux/process"
+import "../../src/backend/backend.ab"
+import "../../src/gguf/reader.ab"
+import "../../src/model/inkling.ab"
+import "../../src/model/inkling_config.ab"
+
+class NullBackend(var launches: int, var next: int) : Backend {
+    fun name(): string = "null"
+    fun allocate(bytes: int): DeviceBuffer? {
+        this.next = this.next + bytes + 4096
+        DeviceBuffer(this, this.next, bytes)
+    }
+    fun upload(destination: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool = true
+    fun download(source: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool = true
+    fun launch(kernel: string, args: KernelArgs, problem: array<int>): bool {
+        this.launches = this.launches + 1
+        true
+    }
+    fun synchronize(): bool = true
+    fun freeMemory(): int = 0
+    fun release(handle: int, bytes: int): void {
+    }
+}
+
+fun main: int {
+    val file = ggufOpen(processArgument(0)) ?? return 1
+    val config = inklingConfigFrom(file) ?? return 1
+    val tokens = if (processArgumentCount() > 1) (processArgument(1).parseInt() ?? 20) else 20
+    var backend = NullBackend(0, 4096)
+    val model = inklingLoad(backend, file, config, tokens + 8) ?? return 1
+    val start = linuxMonotonicMilliseconds()
+    for (pos in 0 until tokens) {
+        if (!model.forward(backend, 1000 + pos, pos)) {
+            println("forward failed: ${inklingLastError()}")
+            return 1
+        }
+    }
+    val elapsed = linuxMonotonicMilliseconds() - start
+    println("host only: $tokens tokens in $elapsed ms (${elapsed * 1000 / tokens} us/token), ${backend.launches / tokens} launches/token")
+    0
+}

@@ -1,0 +1,28 @@
+// What one launch costs through CudaBackend: N launches of the tiny `add` kernel (n = 256), then one synchronize; wall time per launch is the host path
+// (registry lookup, validation, context push/pop, argument packing, cuLaunchKernel) plus whatever the GPU queue adds.
+import "abla/io"
+import "abla/process/arguments"
+import "abla/integer"
+import "abla/sys/linux/process"
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "../kernels/support.ab"
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    val a = uploadFloats(backend, testSignal(256, 1)) ?? return 1
+    val b = uploadFloats(backend, testSignal(256, 2)) ?? return 1
+    val out = uploadFloats(backend, testSignal(256, 3)) ?? return 1
+    // warm up (compiles / loads the kernel)
+    if (!backend.launch("add", kernelArgs().pointer(a).pointer(b).pointer(out).u32(256), [256]) || !backend.synchronize()) return 1
+    val count = if (processArgumentCount() > 0) (processArgument(0).parseInt() ?? 5000) else 5000
+    val start = linuxMonotonicNanoseconds()
+    for (i in 0 until count) {
+        if (!backend.launch("add", kernelArgs().pointer(a).pointer(b).pointer(out).u32(256), [256])) return 1
+    }
+    val queued = linuxMonotonicNanoseconds()
+    backend.synchronize()
+    val done = linuxMonotonicNanoseconds()
+    println("$count launches: host side ${(queued - start) / count} ns each, until the GPU finished ${(done - start) / count} ns each")
+    0
+}
