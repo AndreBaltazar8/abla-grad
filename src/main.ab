@@ -1,0 +1,6 @@
+import "abla/io"
+
+fun main: int {
+    println("abla-grad: see README.md; subcommands (logits, compare, info) arrive with the model graph")
+    0
+}
