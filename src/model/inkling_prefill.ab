@@ -268,8 +268,16 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     var blocks = nBlocks
     var ok = opCopy(backend, ws.buffer, x, ws.buffer, inpSA, tokens * n)
 
-    // attention inputs
-    if (ip > 0) {
+    // attention inputs. A sliding-window layer outside the loop's later passes feeds the same normalized vector to q, k, v: one mix row, one norm.
+    val sharedInput = isSwa && loopPass == 0
+    if (sharedInput) {
+        var source = x
+        if (ip > 0) {
+            ok = ok && this.mixRows(backend, ws, ws.blocks, blocks, x, "blk.$ip.attn_res_query.weight", 1, mixed, n, tokens)
+            source = mixed
+        }
+        ok = ok && this.normRows(backend, ws, "blk.$ip.attn_norm.weight", source, normed, tokens)
+    } else if (ip > 0) {
         val nq = if (isSwa) 1 else 3
         ok = ok && this.mixRows(backend, ws, ws.blocks, blocks, x, "blk.$ip.attn_res_query.weight", nq, mixed, nq * n, tokens)
         for (j in 0 until 3) {
@@ -278,7 +286,7 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     } else {
         for (j in 0 until 3) ok = ok && opCopy(backend, ws.buffer, x, ws.buffer, inputs + j * ws.chunk * nb, tokens * n)
     }
-    if (loopPass > 0) {
+    if (!sharedInput && loopPass > 0) {
         var j = 0
         for (which in ["q", "k", "v"]) {
             ok = ok && this.controlRows(backend, ws, ip, which, inputs + j * ws.chunk * nb, ws.o("msgs") + j * nb, 4 * n, ws.o("ctrlOut"), tokens)
@@ -286,7 +294,8 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
             j = j + 1
         }
     }
-    if (isSwa) {
+    if (sharedInput) {
+    } else if (isSwa) {
         for (j in 0 until 3) {
             ok = ok && this.normRows(backend, ws, "blk.$ip.attn_norm.weight", inputs + j * ws.chunk * nb, normed + j * ws.chunk * nb, tokens)
         }
@@ -296,8 +305,8 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
         ok = ok && this.normRows(backend, ws, "blk.$ip.attn_v_inp_norm.weight", inputs + 2 * ws.chunk * nb, normed + 2 * ws.chunk * nb, tokens)
     }
     val normedQ = normed
-    val normedK = normed + ws.chunk * nb
-    val normedV = normed + 2 * ws.chunk * nb
+    val normedK = if (sharedInput) normed else normed + ws.chunk * nb
+    val normedV = if (sharedInput) normed else normed + 2 * ws.chunk * nb
     if (!ok) return -1
 
     // projections

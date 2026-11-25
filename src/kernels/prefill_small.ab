@@ -36,40 +36,35 @@ extern "C" __global__ void depth_mix_batch(const float *bank, unsigned bankStrid
     unsigned q = blockIdx.x;
     unsigned t = blockIdx.y;
     if (q >= nQuery || t >= tokens || nBank + 1 > 64) return;
-    __shared__ float partialA[256];
-    __shared__ float partialB[256];
     __shared__ float scores[64];
     __shared__ float inverse[64];
     const float *tokenBank = bank + static_cast<unsigned long long>(t) * bankStride;
     const float *tokenCur = cur + static_cast<unsigned long long>(t) * curStride;
-    unsigned states = nBank + 1;
+    const unsigned states = nBank + 1;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned warp = threadIdx.x >> 5;
     const float *query = queries + static_cast<unsigned long long>(q) * n;
-    for (unsigned s = 0; s < states; ++s) {
+    // warp w handles states w, w + 8, ...: sum of squares and the dot with the query by lanes and shuffles
+    for (unsigned s = warp; s < states; s += blockDim.x / 32) {
         const float *state = s < nBank ? tokenBank + static_cast<unsigned long long>(s) * n : tokenCur;
         float sumSquares = 0.0f;
         float dot = 0.0f;
-        for (unsigned j = threadIdx.x; j < n; j += blockDim.x) {
+        for (unsigned j = lane; j < n; j += 32) {
             float v = state[j];
             sumSquares += v * v;
             dot += v * query[j];
         }
-        partialA[threadIdx.x] = sumSquares;
-        partialB[threadIdx.x] = dot;
-        __syncthreads();
-        for (unsigned width = blockDim.x / 2; width; width /= 2) {
-            if (threadIdx.x < width) {
-                partialA[threadIdx.x] += partialA[threadIdx.x + width];
-                partialB[threadIdx.x] += partialB[threadIdx.x + width];
-            }
-            __syncthreads();
+        for (unsigned width = 16; width; width >>= 1) {
+            sumSquares += __shfl_xor_sync(0xffffffffu, sumSquares, width);
+            dot += __shfl_xor_sync(0xffffffffu, dot, width);
         }
-        if (threadIdx.x == 0) {
-            float inv = rsqrtf(partialA[0] / float(n) + eps);
+        if (lane == 0) {
+            float inv = rsqrtf(sumSquares / float(n) + eps);
             inverse[s] = inv;
-            scores[s] = partialB[0] * inv / sqrtf(float(n));
+            scores[s] = dot * inv / sqrtf(float(n));
         }
-        __syncthreads();
     }
+    __syncthreads();
     if (threadIdx.x == 0) {
         float maximum = scores[0];
         for (unsigned s = 1; s < states; ++s) maximum = fmaxf(maximum, scores[s]);
