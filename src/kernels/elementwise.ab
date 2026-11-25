@@ -1,3 +1,4 @@
+import "kv_layout.ab"
 // The small elementwise / row kernels (docs/kernels.md). One CUDA C source string per kernel; names and parameter lists are the contract.
 // Geometry (for the backend registry): the elementwise kernels use blocks of 256 threads, 256 problem items per block; l2clip one block of 128
 // threads per row; argmax a single block of 1024 threads.
@@ -76,14 +77,14 @@ extern "C" __global__ void control_mix(const float *cur, const float *message, c
 """
 
 // k and v are [kvHead][headDim]; the caches are [kvHead][maxCtx][headDim] (the pointers already point at the layer's slab).
-val kernelKvStore = """
+val kernelKvStore = kvAddressing + "\n" + """
 extern "C" __global__ void kv_store(const float *k, const float *v, float *kCache, float *vCache, unsigned pos,
                                     unsigned nKvHead, unsigned headDim, unsigned maxCtx) {
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nKvHead * headDim) return;
     unsigned head = i / headDim;
     unsigned d = i % headDim;
-    unsigned long long at = ((unsigned long long)head * maxCtx + pos) * headDim + d;
+    unsigned long long at = ((unsigned long long)head * KV_STRIDE(maxCtx) + KV_SLOT(pos)) * headDim + d;
     kCache[at] = k[i];
     vCache[at] = v[i];
 }

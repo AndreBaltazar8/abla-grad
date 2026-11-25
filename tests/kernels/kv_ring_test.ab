@@ -1,0 +1,63 @@
+// Five speculative writes cross the physical end of the sliding cache.
+// For every accepted count, replace the next slot and compare the entire
+// attention output against the full cache, including a second KV head.
+import "abla/io"
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "../../src/kernels/kv_layout.ab"
+import "support.ab"
+
+private fun store(var backend: Backend, suffix: string, src: DeviceBuffer, key: DeviceBuffer, value: DeviceBuffer,
+    pos: int, count: int, ctx: int): bool {
+    val args = kernelArgs().pointer(src).pointer(src).pointer(key).pointer(value)
+        .u32(pos).u32(2).u32(32).u32(ctx).u32(count)
+    backend.launch("kv_store_batch" + suffix, args, [64, count])
+}
+
+private fun attend(var backend: Backend, suffix: string, query: DeviceBuffer, key: DeviceBuffer, value: DeviceBuffer,
+    table: DeviceBuffer, out: DeviceBuffer, step: DeviceBuffer, ctx: int): bool {
+    val args = kernelArgs().pointer(query).pointer(key).pointer(value).pointer(table).pointer(out).pointer(step)
+        .u32(2).u32(2).u32(32).u32(1024).u32(1024).u32(ctx).f32(0.125)
+    backend.launch("attention_decode_rel_step" + suffix, args, [2])
+}
+
+private fun check(var backend: Backend): bool {
+    val p = INKLING_KV_RING - 2
+    val ctx = p + 8
+    val fullK = backend.allocate(64 * ctx * 4) ?? return false
+    val fullV = backend.allocate(fullK.bytes) ?? return false
+    val ringK = backend.allocate(64 * INKLING_KV_RING * 4) ?? return false
+    val ringV = backend.allocate(ringK.bytes) ?? return false
+    val prefix = uploadFloats(backend, testSignal(p * 64, 13)) ?? return false
+    val trial = uploadFloats(backend, testSignal(5 * 64, 53)) ?? return false
+    val next = uploadFloats(backend, testSignal(64, 71)) ?? return false
+    val table = uploadFloats(backend, testSignal(2 * 1025, 19)) ?? return false
+    val reference = backend.allocate(256) ?? return false
+    val actual = backend.allocate(256) ?? return false
+    if (!store(backend, "", prefix, fullK, fullV, 0, p, ctx) ||
+        !store(backend, "_ring", prefix, ringK, ringV, 0, p, ctx)) return false
+    for (accepted in 0 until 5) {
+        val pos = p + accepted + 1
+        val step = uploadWords(backend, [0, pos, 0, 0]) ?? return false
+        if (!store(backend, "", trial, fullK, fullV, p, 5, ctx) ||
+            !store(backend, "_ring", trial, ringK, ringV, p, 5, ctx) ||
+            !store(backend, "", next, fullK, fullV, pos, 1, ctx) ||
+            !store(backend, "_ring", next, ringK, ringV, pos, 1, ctx) ||
+            !attend(backend, "", next, fullK, fullV, table, reference, step, ctx) ||
+            !attend(backend, "_ring", next, ringK, ringV, table, actual, step, ctx)) return false
+        val wanted = downloadWords(backend, reference, 64) ?? return false
+        val got = downloadWords(backend, actual, 64) ?? return false
+        for (i in 0 until 64) if (wanted[i] != got[i]) {
+            eprintln("SWA cache mismatch after accepting $accepted proposals, output $i")
+            return false
+        }
+    }
+    true
+}
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    if (!check(backend)) { eprintln(cudaLastError()); return 1 }
+    println("sliding KV matches the full cache after each accepted length across a wrap")
+    0
+}

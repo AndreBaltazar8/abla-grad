@@ -1,6 +1,7 @@
+import "kv_layout.ab"
 // One block per query head. Eight warps accumulate disjoint position
 // sequences with online softmax; shared memory merges their partials.
-val kernelAttentionDecode = """
+val kernelAttentionDecode = kvAddressing + "\n" + """
 template <bool Relative>
 static __device__ __forceinline__ void attention(
     const float *q, const float *k, const float *v, const float *table,
@@ -10,7 +11,7 @@ static __device__ __forceinline__ void attention(
     const unsigned warp = threadIdx.x / 32;
     const unsigned lane = threadIdx.x % 32;
     const unsigned kvHead = head / (nHead / nKvHead);
-    const unsigned long long cacheBase = static_cast<unsigned long long>(kvHead) * maxCtx * dim;
+    const unsigned long long cacheBase = static_cast<unsigned long long>(kvHead) * KV_STRIDE(maxCtx) * dim;
     const unsigned long long headBase = static_cast<unsigned long long>(head) * dim;
     const float *query = q + headBase;
     __shared__ float warpMax[8];
@@ -23,7 +24,7 @@ static __device__ __forceinline__ void attention(
     float m = -__int_as_float(0x7f800000);
     float total = 0.0f;
     for (unsigned long long j = static_cast<unsigned long long>(first) + warp; j <= last; j += 8) {
-        unsigned long long base = cacheBase + j * dim;
+        unsigned long long base = cacheBase + KV_SLOT(j) * dim;
         float score = 0.0f;
         #pragma unroll
         for (unsigned i = 0; i < 8; ++i) {

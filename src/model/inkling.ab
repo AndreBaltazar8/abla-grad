@@ -1,3 +1,4 @@
+import "../kernels/kv_layout.ab"
 // The Inkling-2 decoder (docs/inkling-graph.md is the spec; llama.cpp's inkling2.cpp at the oracle's commit the source). One token at a time:
 // `forward(token, pos)` runs every layer visit (looped core included) and leaves the logits in the scratch buffer. Weights stay in one device arena
 // in their stored types; activations are f32; the state per layer visit is a KV cache and four short-convolution histories.
@@ -112,6 +113,7 @@ resource class InklingModel(
     val scratchMap: ScratchMap,
     val maxCtx: int,
     val visits: int,
+    val cacheOffsets: array<int>, // one byte offset per visit, followed by the total allocation
     val arena: DeviceBuffer,
     val scratch: DeviceBuffer,
     val kCache: DeviceBuffer,
@@ -140,9 +142,21 @@ resource class InklingModel(
     var dumpDir: string = ""
 )
 
+fun InklingModel.ringVisit(visit: int): bool =
+    this.cacheOffsets[visit + 1] - this.cacheOffsets[visit] < this.config.nHeadKv * this.maxCtx * this.config.headDim * 4
+
+// Can the next query at pos still read its earliest sliding-window key?
+// writtenEnd is an exclusive upper bound including uncommitted verify rows.
+fun InklingModel.canRestoreKv(pos: int, writtenEnd: int): bool {
+    if (this.kCache.bytes == this.visits * this.config.nHeadKv * this.maxCtx * this.config.headDim * 4) return true
+    val firstKey = if (pos + 1 > this.config.nSwa) pos + 1 - this.config.nSwa else 0
+    writtenEnd <= firstKey + INKLING_KV_RING
+}
+
 private fun historyBytesPerVisit(c: InklingConfig): int = (c.nConv - 1) * (2 * c.nHeadKv * c.headDim + 2 * c.nEmbd) * 4
 
-fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: int): InklingModel? {
+// A caller that verifies unusually wide speculative batches can reserve linear caches for rollback.
+fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: int, maxVerifyRows: int = 5): InklingModel? {
     inklingError = ""
     val plan = planWeights(file, inklingNames(file, c))
     if (plan == null) {
@@ -157,7 +171,18 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
     val map = inklingScratch(c)
     val visits = inklingVisits(c)
     val scratch = backend.allocate(map.total)
-    val kvBytes = visits * c.nHeadKv * maxCtx * c.headDim * 4
+    val cacheOffsets = [0]
+    val core = c.loopEnd - c.loopStart
+    for (visit in 0 until visits) {
+        val ip = if (!c.looped || visit < c.loopStart) visit
+            else if (visit < c.loopStart + core * c.loopCount) c.loopStart + (visit - c.loopStart) % core
+            else visit - core * (c.loopCount - 1)
+        val sliding = plan.refs.get("blk.$ip.attn_q_inp_norm.weight") == null
+        val slots = if (sliding && maxCtx > INKLING_KV_RING && c.nSwa > 0 && c.nSwa <= INKLING_KV_RING - INKLING_KV_SEGMENT &&
+            maxVerifyRows <= INKLING_KV_RING - c.nSwa) INKLING_KV_RING else maxCtx
+        cacheOffsets.append(cacheOffsets[visit] + slots * c.nHeadKv * c.headDim * 4)
+    }
+    val kvBytes = cacheOffsets[visits]
     val kCache = backend.allocate(kvBytes)
     val vCache = backend.allocate(kvBytes)
     val history = backend.allocate(visits * historyBytesPerVisit(c))
@@ -169,7 +194,7 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
         inklingError = "device memory for the activations, KV caches and convolution histories is not available"
         return null
     }
-    InklingModel(c, plan, map, maxCtx, visits, move(arena), move(scratch), move(kCache), move(vCache), move(history), move(blocks), move(bank), move(step), move(taps))
+    InklingModel(c, plan, map, maxCtx, visits, cacheOffsets, move(arena), move(scratch), move(kCache), move(vCache), move(history), move(blocks), move(bank), move(step), move(taps))
 }
 
 // Zeroes the convolution histories (a fresh sequence).
@@ -381,27 +406,28 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     this.dump(backend, pos, "Qcur-$slot", q, qDim)
     this.dump(backend, pos, "Kcur-$slot", k, kvDim)
     this.dump(backend, pos, "Vcur-$slot", v, kvDim)
-    val layerCacheBytes = c.nHeadKv * this.maxCtx * c.headDim * 4
+    val cache = this.cacheOffsets[visit]
+    val ring = this.ringVisit(visit)
     val scale = f64ToF32(1.0 / sqrt(f64FromInt(c.headDim)))
     val att = this.so("att")
     if (this.useStep) {
-        ok = ok && opKvStoreStep(backend, this.scratch, k, this.scratch, v, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
-            this.step, c.nHeadKv, c.headDim, this.maxCtx)
+        ok = ok && opKvStoreStep(backend, this.scratch, k, this.scratch, v, this.kCache, cache, this.vCache, cache,
+            this.step, c.nHeadKv, c.headDim, this.maxCtx, ring)
         val window = if (isSwa) c.nSwa else 0
         if (this.splitAttention) {
-            ok = ok && opAttentionRelSplitStep(backend, this.scratch, q, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
+            ok = ok && opAttentionRelSplitStep(backend, this.scratch, q, this.kCache, cache, this.vCache, cache,
                 this.scratch, table, this.scratch, this.so("attPart"), this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent,
-                this.maxCtx, scale, this.attentionSplits, this.scratch, this.so("gate"), true)
+                this.maxCtx, scale, this.attentionSplits, this.scratch, this.so("gate"), true, ring)
         } else {
-            ok = ok && opAttentionDecodeRelStep(backend, this.scratch, q, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
-                this.scratch, table, this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent, this.maxCtx, scale)
+            ok = ok && opAttentionDecodeRelStep(backend, this.scratch, q, this.kCache, cache, this.vCache, cache,
+                this.scratch, table, this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent, this.maxCtx, scale, ring)
         }
     } else {
-        ok = ok && opKvStore(backend, this.scratch, k, this.scratch, v, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
-            pos, c.nHeadKv, c.headDim, this.maxCtx)
+        ok = ok && opKvStore(backend, this.scratch, k, this.scratch, v, this.kCache, cache, this.vCache, cache,
+            pos, c.nHeadKv, c.headDim, this.maxCtx, ring)
         val first = if (isSwa && pos - c.nSwa + 1 > 0) pos - c.nSwa + 1 else 0
-        ok = ok && opAttentionDecodeRel(backend, this.scratch, q, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
-            this.scratch, table, this.scratch, att, c.nHead, c.nHeadKv, c.headDim, first, pos, pos, extent, this.maxCtx, scale)
+        ok = ok && opAttentionDecodeRel(backend, this.scratch, q, this.kCache, cache, this.vCache, cache,
+            this.scratch, table, this.scratch, att, c.nHead, c.nHeadKv, c.headDim, first, pos, pos, extent, this.maxCtx, scale, ring)
     }
     // the split attention already applied the output gate (sigmoid_mul fused into its merge)
     if (!(this.useStep && this.splitAttention)) ok = ok && opSigmoidMul(backend, this.scratch, att, this.scratch, this.so("gate"), this.scratch, att, qDim)

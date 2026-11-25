@@ -78,6 +78,8 @@ tool at `http://127.0.0.1:8080/v1`; any API key works.
 - One request at a time (the rest wait in the listen queue). The KV cache and speculation state stay between requests: a request whose prompt starts with
   the previous conversation only processes the tokens after it (`usage.prompt_tokens_details.cached_tokens` tells how many were reused). Each request is
   logged on stderr with prompt, reused and generated tokens, time to first token and tok/s.
+- `--ctx 32768` fits the Q4_K_M target and Q8_0 drafter on the RTX 4090. At this capacity the target uses 2.47 GiB for K and V. Prefill uses a smaller chunk if its initial 512-token workspace cannot fit.
+- A repeated prompt can rewind to its final token while the sliding cache still contains its window. If generation evicts that window, the server refills the prompt and reports zero cached tokens. Extending the latest conversation can still reuse the most recent batch snapshot.
 - `tools/test-serve.sh` (under `tools/gpu-lock.sh`) checks the shapes, a tool-call round trip, prefix reuse and that greedy output equals `generate`.
 
 ## Lossless packing for the Inkling target

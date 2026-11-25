@@ -284,9 +284,7 @@ fun cmdServe(args: array<string>): int {
     var session = specSessionCreate(backend, model, draftFile, SPEC_DEFAULT_PROPOSALS) ?? return serveFail("setting up speculation failed: ${speculateLastError()} ${cudaLastError()}; try a smaller --ctx")
     session.exactWindow = 192
     // the prompt feed needs a prefill workspace of its own on every request: check now that one fits, so a too large --ctx fails here and not on every request
-    val probe = prefillWorkspace(backend, config, 512, false)
-    if (probe == null) return serveFail("device memory for the prefill workspace is not available at context $context (${backend.freeMemory() / 1048576} MiB free); use a smaller --ctx")
-    eprintln("serve: ready with ${backend.freeMemory() / 1048576} MiB of device memory to spare")
+    if (!serveCheckWorkspace(backend, config, context)) return 1
     var listener = tcpListenAddress(ipv4SocketAddress("127.0.0.1", port), 16)
     if (listener.descriptor < 0) {
         eprintln("serve: cannot listen on 127.0.0.1:$port")
@@ -325,4 +323,15 @@ fun cmdServe(args: array<string>): int {
     }
     listener.close()
     0
+}
+
+// Release the probe before the listener starts. Each request allocates its own feed workspace.
+private fun serveCheckWorkspace(var backend: Backend, config: InklingConfig, context: int): bool {
+    val probe = specSeedWorkspace(backend, config)
+    if (probe == null) {
+        eprintln("serve: device memory for the prefill workspace is not available at context $context (${backend.freeMemory() / 1048576} MiB free); use a smaller --ctx")
+        return false
+    }
+    eprintln("serve: prefill chunk ${probe.chunk}, ${backend.freeMemory() / 1048576} MiB of device memory to spare")
+    true
 }

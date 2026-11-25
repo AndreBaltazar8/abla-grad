@@ -1,3 +1,4 @@
+import "inkling_config.ab"
 // Greedy speculative decoding of an Inkling model with the DSpark drafter (docs/spec-cycle.md): one recorded graph per cycle (draft, 3-row verification,
 // greedy acceptance, history commit) and, when `adaptive`, the plain decode graph whenever it is faster for the text at hand. Used by `generate` and
 // `spec-check`. Greedy only: a proposal is accepted when it is the target's argmax, so the output is the plain greedy output up to numerical near-ties.
@@ -196,7 +197,7 @@ fun SpecSession.turn(
     // feed: older positions through the batched prefill when there are many, the last SPEC_EXACT_WINDOW in step mode (exact taps)
     var seeded = start
     if (length - 1 - start > this.exactWindow) {
-        val seedWs = prefillWorkspace(backend, config, 512, false)
+        val seedWs = specSeedWorkspace(backend, config)
         if (seedWs == null) {
             speculateError = inklingPrefillLastError()
             return false
@@ -307,6 +308,18 @@ fun SpecSession.turn(
             return false
         }
         position = now
+        // The final verify cycle can write up to n rejected slots past now.
+        // Once one overwrites a key from the old prompt, reuse() must refill.
+        val writtenEnd = now + (if (arm == 0) 0 else arm + 1)
+        if (this.promptPos > 0 && !model.canRestoreKv(this.promptPos, writtenEnd)) {
+            if (!model.canRestoreKv(this.promptPos, now)) this.promptPos = 0
+            else {
+                // Only the speculative tail straddles the boundary. The final cycle's
+                // accepted length gives the exact highest slot that was written.
+                val accepted = model.readStepWord(backend, 3)
+                if (accepted == null || !model.canRestoreKv(this.promptPos, writtenEnd - accepted)) this.promptPos = 0
+            }
+        }
         val seconds = f64FromInt(monotonicNanoseconds() - t0) / 1000000000.0
         if (arm == 0) stats.plainTokens = stats.plainTokens + (position - before) else stats.cycleTokens = stats.cycleTokens + (position - before)
         // hand the new tokens to the caller: log[logged .. position)
@@ -484,6 +497,17 @@ private fun recordCycle(
     val recording = backend.endRecording()
     if (!ok) return null
     recording
+}
+
+// Long serving contexts keep target/drafter caches and graphs resident while seeding.
+fun specSeedWorkspace(var backend: Backend, config: InklingConfig): PrefillWorkspace? {
+    var chunk = 512
+    while (chunk >= 1) {
+        val workspace = prefillWorkspace(backend, config, chunk, false)
+        if (workspace != null) return move(workspace)
+        chunk = chunk / 2
+    }
+    null
 }
 
 private fun replayOptional(var backend: Backend, recording: Recording?): bool {

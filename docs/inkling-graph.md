@@ -31,6 +31,8 @@ rows 0..n_ff-1 gate, n_ff..2n_ff-1 up); `ffn_down_exps` {n_ff_exp, n_embd, n_exp
 {n_embd, 4}, and for ctrl in (Q,K,V,FFN): `ctrl_down` {2*n_embd, rank}, `ctrl_gain` {rank, n_embd}, `ctrl_forget` {rank, n_embd}.
 In the loop variant the core layers' weights are shared by every pass; each pass (cache slot) has its own KV cache and conv state.
 
+The eight full-attention visits retain K and V through the logical context limit. At contexts above 1,536, the 40 sliding-window visits each retain 1,536 slots per head. Each key keeps its logical position for masking and relative bias. Only its physical K/V address wraps. Batched attention writes at most 512 consecutive keys before reading the corresponding queries, leaving the complete 1,024-key window available even when verification commits zero rows. For larger prefill chunks, only KV store and attention are segmented at 512-row tile boundaries.
+
 ## Primitives
 - `rmsnorm(x, w, eps)`: x / sqrt(mean(x^2)+eps) * w; the weightless form (w absent) is the same without `* w`.
 - `l2clip(x, scale?, t)` per row of length `hd` (or n_rel): `x' = x * scale` if scale (per channel), then `x' * t / max(|x'|_2, t)`.

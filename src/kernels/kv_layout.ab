@@ -1,0 +1,16 @@
+// Inkling SWA retains a complete live window and enough write-ahead for one
+// attention segment. A multiple of 32 preserves the prefill TC query tiles.
+val INKLING_KV_SEGMENT = 512
+val INKLING_KV_RING = 1024 + INKLING_KV_SEGMENT
+
+// The full-cache specialization is the identity. All context checks, relative
+// distances and attention iteration use logical positions in both variants.
+val kvAddressing = """
+#ifdef INKLING_RING_SLOTS
+#define KV_STRIDE(ctx) INKLING_RING_SLOTS
+#define KV_SLOT(position) ((position) % INKLING_RING_SLOTS)
+#else
+#define KV_STRIDE(ctx) (ctx)
+#define KV_SLOT(position) (position)
+#endif
+"""

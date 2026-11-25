@@ -1,3 +1,4 @@
+import "../kernels/kv_layout.ab"
 import "backend.ab"
 import "../kernels/matvec_f32.ab"
 import "../kernels/elementwise.ab"
@@ -773,10 +774,31 @@ private val cudaDsparkKernels = [
         [KERNEL_ARG_POINTER, KERNEL_ARG_U32], cudaDsparkZeroShape)
 ]
 
+// Reuse each linear kernel's argument contract and launch geometry. The ring
+// specialization changes only the physical K/V slot and per-head stride.
+private fun cudaRingSpecs(): array<CudaKernelSpec> {
+    val result: array<CudaKernelSpec> = []
+    val names = ["kv_store", "kv_store_step", "kv_store_batch", "kv_store_batch_ptr",
+        "attention_decode_rel", "attention_decode_rel_step", "attention_rel_split_step",
+        "attention_prefill_rel", "attention_prefill_tc", "attention_prefill_tc_split"]
+    for (list in [cudaKernels, cudaPrefillKernels]) for (spec in list) {
+        for (base in names) if (spec.name == base) {
+            val name = spec.name + "_ring"
+            val source = "#define INKLING_RING_SLOTS ${INKLING_KV_RING}u\n#define ${spec.name} ${name}\n" + spec.source
+            result.append(CudaKernelSpec(name, source, spec.itemsPerBlock, spec.blockX, spec.argumentKinds,
+                spec.validate, spec.problemDimensions, spec.nullablePointer))
+        }
+    }
+    result
+}
+
+private val cudaRingKernels = cudaRingSpecs()
+
 private fun cudaKernelSpec(name: string): CudaKernelSpec? {
     for (spec in cudaKernels) if (spec.name == name) return spec
     for (spec in cudaPrefillKernels) if (spec.name == name) return spec
     for (spec in cudaDsparkKernels) if (spec.name == name) return spec
+    for (spec in cudaRingKernels) if (spec.name == name) return spec
     null
 }
 

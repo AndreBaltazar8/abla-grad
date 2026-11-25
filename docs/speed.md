@@ -514,3 +514,13 @@ Each speculative cycle commits an anchor plus its accepted proposals. The accept
 The fixed-four figures divide elapsed generation time by the recorded cycle count and include drafting, verification and commit. Raw logs and the 512 output IDs per arm are under `~/archive/abla-grad-r5-ed/` (`ab-*`, `postctrl-*` and `endcycle-*`).
 
 The combination ships as the recorded default for the supported BF16 drafter. It won every release pair. The short step and chunk-256 gates and both long gates passed. Target step logits matched the original reference at all 6,248 positions. The two- and four-proposal speculation gates passed on 01–05. Both target files passed `verify-check` at accepted lengths zero through four and produced zero R3/R5 argmax differences on forty windows of 05. The production shortlist test covers a partial warp, an excluded correction and a rounded softcap tie across blocks.
+
+## Sliding-window KV at 32k context on the RTX 4090
+
+The Q4_K_M target has eight full-attention visits and forty sliding-window visits. At a context limit of 32,768, their FP32 K and V allocations total 2,650,800,128 bytes (2.47 GiB). The full-length baseline allocated 12,884,901,888 bytes (12 GiB). The 1,536-slot sliding caches accommodate a 1,024-token live window plus up to 512 positions written before attention.
+
+With the Q8_0 DSpark drafter loaded, `serve --ctx 32768` processed a 16,787-token chat prompt and returned eight tokens. A second identical request reused 16,786 prompt tokens. Time to first token was 16.22 s cold and 0.16 s warm. The largest process allocation observed in half-second samples was 21,694 MiB. These figures come from two requests to one server. A separate target-only `prefill-bench` processed 32,760 positions in 7.40 s (4,430 tok/s, one timed run at chunk 512).
+
+Both long step-mode GRDLs (05 and 06, 5,924 positions) matched the full-cache files byte for byte. At the physical wrap, 20 windows each at verification widths three and five matched plain decode on all 160 row argmaxes. The scalar decode test also compared every output bit of two KV heads for zero through four accepted proposals. Locked runs, prompts and output files are under `~/archive/abla-grad-ring-1250/`.
+
+Two matched plain graph tg128 runs per depth used the original target, the same prompt IDs and opposite run order. At d15 the linear baseline measured 138.52/138.71 tok/s and the ring build 138.24/136.91. At d512 they measured 132.85/129.38 and 132.48/132.96. On the 1,624-token Alice prompt they measured 126.34/121.62 and 126.19/123.28. All six pairs produced identical generated IDs. These pairs establish the memory saving without a repeatable decode gain at these depths.

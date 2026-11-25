@@ -1,10 +1,11 @@
+import "kv_layout.ab"
 // Split-position decode attention with the relative-position table and sink (ablac-60-2). attention_decode_rel_step runs one block per head, so
 // 24 blocks walk the whole context one position per warp step and the per-token cost grows with the position. Here the positions of one head are
 // divided over `nSplit` blocks (grid = head * nSplit + split); each block leaves an unnormalised partial (m, total, acc[dim]) and `attention_rel_merge`
 // combines the partials of a head (with the sink, whose logit is 0) into the output. nSplit is fixed per launch so the recorded graph stays static;
 // blocks whose share of positions is empty write an empty partial.
 // Partial layout per (head, split): acc[dim], then m, then total (dim + 2 floats).
-val kernelAttentionSplit = """
+val kernelAttentionSplit = kvAddressing + "\n" + """
 extern "C" __global__ void attention_rel_split_step(
     const float *q, const float *k, const float *v, const float *table, float *part,
     const unsigned *step, unsigned nHead, unsigned nKvHead, unsigned dim,
@@ -17,7 +18,7 @@ extern "C" __global__ void attention_rel_split_step(
     const unsigned warp = threadIdx.x / 32;
     const unsigned lane = threadIdx.x % 32;
     const unsigned kvHead = head / (nHead / nKvHead);
-    const unsigned long long cacheBase = static_cast<unsigned long long>(kvHead) * maxCtx * dim;
+    const unsigned long long cacheBase = static_cast<unsigned long long>(kvHead) * KV_STRIDE(maxCtx) * dim;
     const unsigned long long headBase = static_cast<unsigned long long>(head) * dim;
     const float *query = q + headBase;
     __shared__ float warpMax[8];
@@ -32,7 +33,7 @@ extern "C" __global__ void attention_rel_split_step(
     float total = 0.0f;
     const unsigned stride = 8 * nSplit;
     for (unsigned long long j = static_cast<unsigned long long>(first) + split * 8 + warp; j <= pos; j += stride) {
-        unsigned long long base = cacheBase + j * dim;
+        unsigned long long base = cacheBase + KV_SLOT(j) * dim;
         float score = 0.0f;
         #pragma unroll
         for (unsigned i = 0; i < 8; ++i) {
