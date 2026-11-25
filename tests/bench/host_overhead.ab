@@ -11,6 +11,7 @@ import "../../src/model/inkling_config.ab"
 
 class NullBackend(var launches: int, var next: int) : Backend {
     fun name(): string = "null"
+    fun supportsFp8Kv(): bool = false
     fun allocate(bytes: int): DeviceBuffer? {
         this.next = this.next + bytes + 4096
         DeviceBuffer(this, this.next, bytes)

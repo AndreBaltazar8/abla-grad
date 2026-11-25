@@ -26,12 +26,12 @@ private trusted fun writeRow(address: int, bytes: int): bool {
 
 trusted fun main: int {
     if (processArgumentCount() != 4) {
-        eprintln("usage: context-logits <model.gguf> <ids> <auto|f16|q8|global32|global16|global8> <chunk> > rows.f32")
+        eprintln("usage: context-logits <model.gguf> <ids> <auto|f16|q8|global32|global16|global8|fp8> <chunk> > rows.f32")
         return 2
     }
     val mode = processArgument(2)
     val bits = if (mode == "global32") 32 else if (mode == "global16") 16 else if (mode == "global8") 8 else 0
-    if (bits == 0 && mode != "auto" && mode != "f16" && mode != "q8") return 2
+    if (bits == 0 && mode != "auto" && mode != "f16" && mode != "q8" && mode != "fp8") return 2
     val file = ggufOpen(processArgument(0)) ?? return 1
     val config = inklingConfigFrom(file) ?? return 1
     val result = Path(processArgument(1)).readTextResult()
@@ -43,7 +43,7 @@ trusted fun main: int {
     }
     if (ids.size == 0) return 2
     var backend = cudaBackend() ?? return 1
-    val model = inklingLoad(backend, file, config, ids.size, 5, mode == "f16", mode == "q8", bits) ?? return 1
+    val model = inklingLoad(backend, file, config, ids.size, 5, mode == "f16", mode == "q8", bits, mode == "fp8") ?? return 1
     val chunk = processArgument(3).parseInt() ?? return 2
     if (chunk < 1 || chunk > 512) return 2
     val ws = prefillWorkspace(backend, config, chunk, true) ?? return 1

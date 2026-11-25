@@ -5,6 +5,7 @@ import "../src/backend/backend.ab"
 
 class RecordingBackend(var launchedWords: int, var live: int, var lastKernel: string) : Backend {
     fun name(): string = "recording"
+    fun supportsFp8Kv(): bool = false
     fun allocate(bytes: int): DeviceBuffer? {
         this.live = this.live + 1
         DeviceBuffer(this, 4096, bytes)

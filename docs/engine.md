@@ -14,7 +14,8 @@ sinks and gates, short causal convolution, depth mixing and SiTU experts.
 Loop passes share weights and keep independent KV and convolution state.
 The pinned model visits 48 layers, with eight global and forty sliding visits.
 
-Global KV switches from F16 to block Q8 at 8,192 allocated positions. The
+Global KV switches from F16 to block Q8 at 8,192 allocated positions. On
+Ada, E4M3 replaces block Q8 from 65,536 positions. The
 grouped decode kernel shares KV across three query heads. Sliding attention
 sees 1,024 keys and uses a 1,536-slot ring for long contexts, switching from
 F32 to F16 at 8,192 allocated positions. Physical ring offsets wrap;

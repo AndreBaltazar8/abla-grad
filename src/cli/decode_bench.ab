@@ -1,4 +1,4 @@
-// `abla-grad decode-bench <model.gguf> <ids-file> [--n N] [--mode direct|graph] [--ctx N] [--batch-seed] [--f16-kv] [--global-kv 8|16|32] [--splits N] [--global-splits N] [--no-grouped-attention] [--log file]`: greedy decode speed of an Inkling model, tg128-style.
+// `abla-grad decode-bench <model.gguf> <ids-file> [--n N] [--mode direct|graph] [--ctx N] [--batch-seed] [--f16-kv] [--global-kv 8|16|32|fp8] [--splits N] [--global-splits N] [--no-grouped-attention] [--log file]`: greedy decode speed of an Inkling model, tg128-style.
 // Seeding is untimed. By default it steps through the IDs. --batch-seed prefills the prefix in chunks of 512. The timed region generates N tokens:
 // `direct` launches every kernel from the host each token and reads the argmax back; `graph` replays one recorded token N times with the argmax,
 // the token log and the position all on the device. Prints tok/s and the generated ids (to --log if given).
@@ -56,6 +56,7 @@ fun cmdDecodeBench(args: array<string>): int {
     var halfKv = false
     var batchSeed = false
     var globalBits = 0
+    var fp8 = false
     var globalSplits = 0
     var grouped = true
     var launches = false
@@ -86,7 +87,8 @@ fun cmdDecodeBench(args: array<string>): int {
             if (globalSplits < 1 || globalSplits > ATTENTION_SPLITS_MAX) return 2
             index += 2
         } else if (args[index] == "--global-kv" && index + 1 < args.size) {
-            globalBits = args[index + 1].parseInt() ?? 0
+            fp8 = args[index + 1] == "fp8"
+            globalBits = if (fp8) 8 else args[index + 1].parseInt() ?? 0
             if (globalBits != 8 && globalBits != 16 && globalBits != 32) return 2
             index = index + 2
         } else if (args[index] == "--skip" && index + 1 < args.size) {
@@ -122,7 +124,7 @@ fun cmdDecodeBench(args: array<string>): int {
         }
     }
     if (positional.size != 2 || count <= 0 || (mode != "direct" && mode != "graph")) {
-        println("usage: abla-grad decode-bench <model.gguf> <ids-file> [--n N] [--mode direct|graph] [--ctx N] [--batch-seed] [--f16-kv] [--global-kv 8|16|32] [--splits N] [--global-splits N] [--no-grouped-attention] [--log file]")
+        println("usage: abla-grad decode-bench <model.gguf> <ids-file> [--n N] [--mode direct|graph] [--ctx N] [--batch-seed] [--f16-kv] [--global-kv 8|16|32|fp8] [--splits N] [--global-splits N] [--no-grouped-attention] [--log file]")
         return 2
     }
     val ids = readPromptIds(positional[1])
@@ -146,7 +148,7 @@ fun cmdDecodeBench(args: array<string>): int {
     }
     var backend = cudaBackend() ?? return 2
     val context = if (maxCtx > 0) maxCtx else ids.size + count + 8
-    var model = inklingLoad(backend, file, config, context, 5, halfKv, false, globalBits) ?? return 1
+    var model = inklingLoad(backend, file, config, context, 5, halfKv, false, globalBits, fp8) ?? return 1
     if (!model.reset(backend)) return 1
     model.useStep = true
     model.splitAttention = !noSplit

@@ -6,6 +6,7 @@ import "../src/ops.ab"
 
 class Recorder(var kernels: array<string>, var kindsSeen: array<string>, var problems: array<int>, var live: int) : Backend {
     fun name(): string = "recorder"
+    fun supportsFp8Kv(): bool = false
     fun allocate(bytes: int): DeviceBuffer? {
         this.live = this.live + 1
         DeviceBuffer(this, 65536, bytes)

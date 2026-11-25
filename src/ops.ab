@@ -91,9 +91,9 @@ fun opRope(
 fun opKvStore(
     var backend: Backend, k: DeviceBuffer, kOffset: int, v: DeviceBuffer, vOffset: int,
     kCache: DeviceBuffer, kCacheOffset: int, vCache: DeviceBuffer, vCacheOffset: int,
-    pos: int, nKvHead: int, headDim: int, maxCtx: int, ring: bool = false, half: bool = false, q8: bool = false
+    pos: int, nKvHead: int, headDim: int, maxCtx: int, ring: bool = false, half: bool = false, q8: bool = false, fp8: bool = false
 ): bool = backend.launch(
-    "kv_store" + kvKernelSuffix(ring, half, q8),
+    "kv_store" + kvKernelSuffix(ring, half, q8, fp8),
     kernelArgs().pointer(k, kOffset).pointer(v, vOffset).pointer(kCache, kCacheOffset).pointer(vCache, vCacheOffset)
         .u32(pos).u32(nKvHead).u32(headDim).u32(maxCtx),
     [nKvHead * headDim]
@@ -216,9 +216,9 @@ fun opRelTable(
 fun opAttentionDecodeRel(
     var backend: Backend, q: DeviceBuffer, qOffset: int, kCache: DeviceBuffer, kCacheOffset: int, vCache: DeviceBuffer, vCacheOffset: int,
     table: DeviceBuffer, tableOffset: int, out: DeviceBuffer, outOffset: int,
-    nHead: int, nKvHead: int, headDim: int, first: int, last: int, pos: int, extent: int, maxCtx: int, scale: f32, ring: bool = false, half: bool = false, q8: bool = false
+    nHead: int, nKvHead: int, headDim: int, first: int, last: int, pos: int, extent: int, maxCtx: int, scale: f32, ring: bool = false, half: bool = false, q8: bool = false, fp8: bool = false
 ): bool = backend.launch(
-    "attention_decode_rel" + kvKernelSuffix(ring, half, q8),
+    "attention_decode_rel" + kvKernelSuffix(ring, half, q8, fp8),
     kernelArgs().pointer(q, qOffset).pointer(kCache, kCacheOffset).pointer(vCache, vCacheOffset).pointer(table, tableOffset)
         .pointer(out, outOffset).u32(nHead).u32(nKvHead).u32(headDim).u32(first).u32(last).u32(pos).u32(extent).u32(maxCtx).f32(scale),
     [nHead]
@@ -265,9 +265,9 @@ fun opControlMix(
 fun opKvStoreStep(
     var backend: Backend, k: DeviceBuffer, kOffset: int, v: DeviceBuffer, vOffset: int,
     kCache: DeviceBuffer, kCacheOffset: int, vCache: DeviceBuffer, vCacheOffset: int,
-    step: DeviceBuffer, nKvHead: int, headDim: int, maxCtx: int, ring: bool = false, half: bool = false, q8: bool = false
+    step: DeviceBuffer, nKvHead: int, headDim: int, maxCtx: int, ring: bool = false, half: bool = false, q8: bool = false, fp8: bool = false
 ): bool = backend.launch(
-    "kv_store_step" + kvKernelSuffix(ring, half, q8),
+    "kv_store_step" + kvKernelSuffix(ring, half, q8, fp8),
     kernelArgs().pointer(k, kOffset).pointer(v, vOffset).pointer(kCache, kCacheOffset).pointer(vCache, vCacheOffset)
         .pointer(step, 0).u32(nKvHead).u32(headDim).u32(maxCtx),
     [nKvHead * headDim]
@@ -289,9 +289,9 @@ fun opGatherRowStep(
 fun opAttentionDecodeRelStep(
     var backend: Backend, q: DeviceBuffer, qOffset: int, kCache: DeviceBuffer, kCacheOffset: int, vCache: DeviceBuffer, vCacheOffset: int,
     table: DeviceBuffer, tableOffset: int, out: DeviceBuffer, outOffset: int, step: DeviceBuffer,
-    nHead: int, nKvHead: int, headDim: int, window: int, extent: int, maxCtx: int, scale: f32, ring: bool = false, half: bool = false, q8: bool = false
+    nHead: int, nKvHead: int, headDim: int, window: int, extent: int, maxCtx: int, scale: f32, ring: bool = false, half: bool = false, q8: bool = false, fp8: bool = false
 ): bool = backend.launch(
-    "attention_decode_rel_step" + kvKernelSuffix(ring, half, q8),
+    "attention_decode_rel_step" + kvKernelSuffix(ring, half, q8, fp8),
     kernelArgs().pointer(q, qOffset).pointer(kCache, kCacheOffset).pointer(vCache, vCacheOffset).pointer(table, tableOffset)
         .pointer(out, outOffset).pointer(step, 0).u32(nHead).u32(nKvHead).u32(headDim).u32(window).u32(extent).u32(maxCtx).f32(scale),
     [nHead]
@@ -306,10 +306,10 @@ fun opAttentionRelSplitStep(
     var backend: Backend, q: DeviceBuffer, qOffset: int, kCache: DeviceBuffer, kCacheOffset: int, vCache: DeviceBuffer, vCacheOffset: int,
     table: DeviceBuffer, tableOffset: int, part: DeviceBuffer, partOffset: int, out: DeviceBuffer, outOffset: int, step: DeviceBuffer,
     nHead: int, nKvHead: int, headDim: int, window: int, extent: int, maxCtx: int, scale: f32, nSplit: int,
-    gate: DeviceBuffer, gateOffset: int, useGate: bool, ring: bool = false, half: bool = false, q8: bool = false, grouped: bool = false
+    gate: DeviceBuffer, gateOffset: int, useGate: bool, ring: bool = false, half: bool = false, q8: bool = false, grouped: bool = false, fp8: bool = false
 ): bool {
     val ok = backend.launch(
-        (if (grouped) "attention_rel_grouped_step" else "attention_rel_split_step") + kvKernelSuffix(ring, half, q8),
+        (if (grouped) "attention_rel_grouped_step" else "attention_rel_split_step") + kvKernelSuffix(ring, half, q8, fp8),
         kernelArgs().pointer(q, qOffset).pointer(kCache, kCacheOffset).pointer(vCache, vCacheOffset).pointer(table, tableOffset)
             .pointer(part, partOffset).pointer(step, 0).u32(nHead).u32(nKvHead).u32(headDim).u32(window).u32(extent).u32(maxCtx).f32(scale).u32(nSplit),
         [(if (grouped) nKvHead else nHead) * nSplit]

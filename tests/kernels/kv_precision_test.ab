@@ -40,8 +40,25 @@ private fun check(var backend: Backend): bool {
     true
 }
 
+// Check the on-device E4M3 bytes, including nearest-even ties and saturation.
+private fun checkFp8(var backend: Backend): bool {
+    val samples: array<f32> = [0.0, -1.0, 1.0625, 1.1875, 0.001953125, 448.0, -500.0, -0.125]
+    val codes = [0, 0xb8, 0x38, 0x3a, 1, 0x7e, 0xfe, 0xa0]
+    val row: array<f32> = []
+    for (d in 0 until 128) row.append(samples[d % 8])
+    val input = uploadFloats(backend, row) ?? return false
+    val k = backend.allocate(128) ?? return false
+    val v = backend.allocate(128) ?? return false
+    if (!backend.launch("kv_store_batch_fp8", kernelArgs().pointer(input).pointer(input).pointer(k).pointer(v)
+        .u32(0).u32(1).u32(128).u32(1).u32(1), [128, 1])) return false
+    val words = downloadWords(backend, k, 32) ?? return false
+    for (d in 0 until 128) if (((words[d / 4] >> (8 * (d % 4))) & 255) != codes[d % 8]) return false
+    true
+}
+
 fun main: int {
     var backend = cudaBackend() ?? return 1
+    if (backend.supportsFp8Kv() && !checkFp8(backend)) { eprintln("E4M3 cache bytes differ"); return 1 }
     if (!check(backend)) { eprintln(cudaLastError()); return 1 }
     println("KV precision fixture passed")
     0

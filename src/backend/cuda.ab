@@ -756,6 +756,8 @@ private val cudaPrefillKernels = [
     CudaKernelSpec("attention_prefill_tc", kernelPrefillAttentionTc, 1, 64, cudaArgsAttentionTc, cudaPrefillAttentionTcShape, 2),
     CudaKernelSpec("attention_prefill_tc_q8_gqa3", "#define INKLING_Q8_KV\n#define INKLING_PREFILL_GQA3\n#define attention_prefill_tc attention_prefill_tc_q8_gqa3\n" +
         kernelPrefillAttentionTc, 3, 192, cudaArgsAttentionTc, cudaPrefillAttentionGqa3Shape, 2),
+    CudaKernelSpec("attention_prefill_tc_fp8_gqa3", "#define INKLING_FP8_KV\n#define INKLING_PREFILL_GQA3\n#define attention_prefill_tc attention_prefill_tc_fp8_gqa3\n" +
+        kernelPrefillAttentionTc, 3, 192, cudaArgsAttentionTc, cudaPrefillAttentionGqa3Shape, 2),
     CudaKernelSpec("matmul_f32_split", kernelPrefillMatmul, 128, 256, cudaArgsMatmulSplit, cudaPrefillSplitF32Shape, 2),
     CudaKernelSpec("matmul_bf16_split", kernelPrefillMatmul, 128, 256, cudaArgsMatmulSplit, cudaPrefillSplitF32Shape, 2),
     CudaKernelSpec("sum_slices", kernelPrefillMatmul, 256, 256, cudaArgsSumSlices, cudaPrefillSumSlicesShape),
@@ -850,7 +852,7 @@ private val cudaDsparkKernels = [
 // specialization changes only the physical K/V slot and per-head stride.
 private fun cudaKvVariant(spec: CudaKernelSpec, suffix: string, slots: int, half: bool): CudaKernelSpec {
     val name = spec.name + suffix
-    val layout = (if (suffix == "_q8") "#define INKLING_Q8_KV\n" else "") + (if (half) "#define INKLING_HALF_KV\n" else "") +
+    val layout = (if (suffix == "_q8") "#define INKLING_Q8_KV\n" else if (suffix == "_fp8") "#define INKLING_FP8_KV\n" else "") + (if (half) "#define INKLING_HALF_KV\n" else "") +
         (if (slots > 0) "#define INKLING_RING_SLOTS ${slots}u\n" else "")
     val source = layout + "#define ${spec.name} ${name}\n" + spec.source
     CudaKernelSpec(name, source, spec.itemsPerBlock, spec.blockX, spec.argumentKinds, spec.validate, spec.problemDimensions, spec.nullablePointer)
@@ -865,11 +867,13 @@ private fun cudaRingSpecs(): array<CudaKernelSpec> {
             result.append(cudaKvVariant(spec, "_ring", INKLING_KV_RING, false))
             result.append(cudaKvVariant(spec, "_f16", 0, true))
             result.append(cudaKvVariant(spec, "_q8", 0, false))
+            result.append(cudaKvVariant(spec, "_fp8", 0, false))
             result.append(cudaKvVariant(spec, "_ring_f16", INKLING_KV_RING, true))
         }
         if (spec.name == "attention_rel_grouped_step") {
             result.append(cudaKvVariant(spec, "_f16", 0, true))
             result.append(cudaKvVariant(spec, "_q8", 0, false))
+            result.append(cudaKvVariant(spec, "_fp8", 0, false))
         }
         if (spec.name == "attention_decode" || spec.name == "dspark_attention_step" || spec.name == "dspark_kv_step") {
             result.append(cudaKvVariant(spec, "_f16", 0, true))
@@ -929,6 +933,7 @@ class CudaBackend(
     var currentBranch: int = 0
 ) : Backend {
     fun name(): string = "cuda"
+    fun supportsFp8Kv(): bool = this.architecture == "compute_89"
 
     trusted fun pushContext(): bool {
         if (this.context == 0) {

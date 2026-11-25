@@ -68,6 +68,7 @@ resource class DeviceBuffer(val owner: Backend, val handle: int, val bytes: int)
 
 interface Backend {
     fun name(): string
+    fun supportsFp8Kv(): bool
     // Device memory, uninitialised; null when the device is out of memory.
     fun allocate(bytes: int): DeviceBuffer?
     // Copies `bytes` from host memory at `hostAddress` to `destination` at `offset`. Ordered with launches.

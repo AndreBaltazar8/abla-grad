@@ -10,13 +10,44 @@ val INKLING_GROUPED_CONTEXT = 8192
 val INKLING_HALF_KV_CONTEXT = 65536
 val INKLING_Q8_KV_CONTEXT = 98304
 
-fun kvKernelSuffix(ring: bool, half: bool, q8: bool = false): string =
-    if (q8) "_q8" else if (half && ring) "_ring_f16" else if (half) "_f16" else if (ring) "_ring" else ""
+fun kvKernelSuffix(ring: bool, half: bool, q8: bool = false, fp8: bool = false): string =
+    if (fp8) "_fp8" else if (q8) "_q8" else if (half && ring) "_ring_f16" else if (half) "_f16" else if (ring) "_ring" else ""
 
 val kvAddressing = """
 #ifndef INKLING_KV_LAYOUT_DEFINED
 #define INKLING_KV_LAYOUT_DEFINED
-#ifdef INKLING_Q8_KV
+#if defined(INKLING_FP8_KV)
+typedef unsigned char kv_element;
+// Ada converts two E4M3 bytes to two FP16 values in one instruction.
+static __device__ __forceinline__ float kv_read_fp8(unsigned short pair) {
+    unsigned halves;
+    float f;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(halves) : "h"(pair));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"((unsigned short)halves));
+    return f;
+}
+static __device__ __forceinline__ float kv_load(const kv_element *base, unsigned long long i) {
+    return kv_read_fp8(base[i]);
+}
+static __device__ __forceinline__ void kv_put(kv_element *base, unsigned long long i, float x) {
+    unsigned short code;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %1;" : "=h"(code) : "f"(x));
+    base[i] = (unsigned char)code;
+}
+static __device__ __forceinline__ float4 kv_load4(const kv_element *base, unsigned long long i) {
+    const unsigned bytes = *reinterpret_cast<const unsigned *>(base + i);
+    unsigned lo, hi;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(lo) : "h"((unsigned short)bytes));
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(hi) : "h"((unsigned short)(bytes >> 16)));
+    float4 f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f.x) : "h"((unsigned short)lo));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f.y) : "h"((unsigned short)(lo >> 16)));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f.z) : "h"((unsigned short)hi));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f.w) : "h"((unsigned short)(hi >> 16)));
+    return f;
+}
+#define KV_HEAD(ptr,offset) ((ptr) + (offset))
+#elif defined(INKLING_Q8_KV)
 // A warp owns 32 consecutive feature channels in every store. Its block
 // has an FP32 scale and 32 signed bytes, aligned to a four-byte boundary.
 typedef unsigned char kv_element;

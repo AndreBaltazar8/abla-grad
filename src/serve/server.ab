@@ -305,7 +305,7 @@ fun cmdServe(args: array<string>): int {
     var backend = cudaBackend() ?? return serveFail("no CUDA device: ${cudaLastError()}")
     val freeBefore = backend.freeMemory()
     if (context == 0) {
-        // the model's context is context + SPEC_CONTEXT_SLACK; its cache is F16/Q8 from SERVE_LONG_FROM on
+        // The allocation includes SPEC_CONTEXT_SLACK above the advertised context.
         val longRoom = (freeBefore - SERVE_LONG_FIXED_BYTES) / SERVE_LONG_BYTES_PER_POSITION - SPEC_CONTEXT_SLACK
         if (longRoom + SPEC_CONTEXT_SLACK >= SERVE_LONG_FROM) {
             context = longRoom
