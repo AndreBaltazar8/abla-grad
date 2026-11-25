@@ -1,0 +1,81 @@
+// Useful FLOPS for the same grouped NVFP4 ABI and payload on both kernels.
+// Quantization is timed separately. Shapes mirror dense and 512-token prefill.
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "../kernels/device_test_support.ab"
+import "abla/float"
+import "abla/float/text"
+import "abla/io"
+import "abla/process/time"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+trusted fun storeWord(base: int, index: int, value: int): void =
+    ablaUnsafeStoreU32(nativePointerFromAddress(base + index * 4), value)
+
+fun benchLaunch(backend: Backend, name: string, args: KernelArgs, problem: array<int>, flops: f64): bool {
+    for (i in 0 until 4) if (!backend.launch(name, args, problem)) return false
+    if (!backend.synchronize()) return false
+    val count = 50
+    val start = monotonicNanoseconds()
+    for (i in 0 until count) if (!backend.launch(name, args, problem)) return false
+    if (!backend.synchronize()) return false
+    val ns = f64FromInt(monotonicNanoseconds() - start) / f64FromInt(count)
+    if (flops > 0.0) println("$name: ${ns / 1000.0} us, ${flops / (ns * 1000.0)} TFLOPS")
+    else println("$name: ${ns / 1000.0} us")
+    true
+}
+
+trusted fun benchShape(backend: Backend, cols: int, experts: int, pairsPerExpert: int, inputs: int): bool {
+    val rows = 2304
+    val pairs = experts * pairsPerExpert
+    val stride = rows * (cols / 64) * 36
+    val tilesPerExpert = (pairsPerExpert + 63) / 64
+    val tiles = experts * tilesPerExpert
+    val w = backend.allocate(experts * stride)
+    val x = backend.allocate(inputs * cols * 4)
+    val qx = backend.allocate(inputs * cols)
+    val sx = backend.allocate(inputs * cols / 32 * 4)
+    val map = backend.allocate(pairs * 4)
+    val plan = backend.allocate((experts + 2 + 2 * tiles) * 4)
+    val y = backend.allocate(pairs * rows * 4)
+    if (w == null || x == null || qx == null || sx == null || map == null || plan == null || y == null) return false
+    val host = nativeByteBuffer(stride)
+    val wa = nativePointerAddress(host.address)
+    for (i in 0 until stride / 4) storeWord(wa, i, if (i % 9 == 0) 0x443c4038 else (i * 2654435761 + (i / 9) * 40503) & 0xffffffff)
+    for (expert in 0 until experts) if (!backend.upload(w, expert * stride, wa, stride)) return false
+    val activations = nativeByteBuffer(x.bytes)
+    val xa = nativePointerAddress(activations.address)
+    for (i in 0 until x.bytes / 4) testStoreFloat(xa, i, f32FromInt((i * 19 + i / 37 * 11) % 127 - 63) / 64.0)
+    val hostMap = nativeByteBuffer(map.bytes)
+    val ma = nativePointerAddress(hostMap.address)
+    for (i in 0 until pairs) storeWord(ma, i, if (inputs == pairs) i else (i * 73 + i / pairsPerExpert) % inputs)
+    val hostPlan = nativeByteBuffer(plan.bytes)
+    val pa = nativePointerAddress(hostPlan.address)
+    for (i in 0 until experts + 1) storeWord(pa, i, i * pairsPerExpert)
+    storeWord(pa, experts + 1, tiles)
+    for (i in 0 until tiles) {
+        storeWord(pa, experts + 2 + 2 * i, i / tilesPerExpert)
+        storeWord(pa, experts + 3 + 2 * i, i % tilesPerExpert * 64)
+    }
+    if (!backend.upload(x, 0, xa, x.bytes) || !backend.upload(map, 0, ma, map.bytes) || !backend.upload(plan, 0, pa, plan.bytes)) return false
+    val f16Args = kernelArgs().pointer(w).pointer(x).pointer(map).pointer(y).u64(0).pointer(plan).u32(rows).u32(cols).u32(experts).u64(stride)
+    val i8Args = kernelArgs().pointer(w).pointer(qx).pointer(map).pointer(y).u64(0).pointer(plan).u32(rows).u32(cols).u32(experts).u64(stride).pointer(sx)
+    val flops = 2.0 * f64FromInt(rows) * f64FromInt(cols) * f64FromInt(pairs)
+    println("rows=$rows cols=$cols pairs=$pairs experts=$experts xRows=$inputs")
+    val ok = benchLaunch(backend, "quantize_rows_i8", kernelArgs().pointer(x).pointer(qx).pointer(sx).u32(inputs).u32(cols), [cols / 4, inputs], 0.0) &&
+        benchLaunch(backend, "matmul_nvfp4_grouped", f16Args, [rows, tiles], flops) &&
+        benchLaunch(backend, "matmul_nvfp4_grouped_rd", f16Args, [rows, tiles], flops) &&
+        benchLaunch(backend, "matmul_nvfp4_grouped_i8", i8Args, [rows, tiles], flops)
+    ok
+}
+
+fun main: int {
+    val backend = cudaBackend()
+    if (backend == null) return 1
+    val ok = benchShape(backend, 2304, 1, 2048, 2048) &&
+        benchShape(backend, 2304, 128, 32, 512) &&
+        benchShape(backend, 1152, 128, 32, 4096)
+    if (!ok) eprintln(cudaLastError())
+    if (backend.close() && ok) 0 else 1
+}

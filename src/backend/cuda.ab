@@ -22,6 +22,7 @@ import "../kernels/rmsnorm.ab"
 import "../kernels/rope.ab"
 import "../kernels/attention_decode.ab"
 import "../kernels/prefill_matmul.ab"
+import "../kernels/prefill_nvfp4_i8.ab"
 import "../kernels/prefill_small.ab"
 import "../kernels/prefill_attention.ab"
 import "../kernels/dspark_small.ab"
@@ -434,6 +435,11 @@ private val cudaArgsMoeRouteBatch = [prefillArgP, prefillArgP, prefillArgU, pref
 private val cudaArgsMoeSort = [prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgP, prefillArgP, prefillArgP]
 private val cudaArgsMoeCombineBatch = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU]
 private val cudaArgsGrouped = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, KERNEL_ARG_U64]
+private val cudaArgsGroupedI8 = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP,
+    prefillArgU, prefillArgU, prefillArgU, KERNEL_ARG_U64, prefillArgP]
+private fun cudaPrefillQuantizeI8Shape(args: KernelArgs, problem: array<int>): bool =
+    args.words[3] == problem[1] && args.words[4] > 0 && args.words[4] % 64 == 0 && args.words[4] / 4 == problem[0] &&
+        args.words[0] % 4 == 0 && args.words[1] % 4 == 0 && args.words[2] % 4 == 0
 private val cudaArgsAttentionPrefill = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgF]
 private fun cudaPrefillGatherShape(args: KernelArgs, problem: array<int>): bool =
     args.words[3] == problem[0] && args.words[3] % 32 == 0 && args.words[4] == problem[1]
@@ -465,6 +471,8 @@ private fun cudaPrefillGroupedShape(args: KernelArgs, problem: array<int>, block
         args.words[8] > 0 && args.words[8] <= 256 && args.words[9] > 0
 private fun cudaPrefillGroupedNvfp4Shape(args: KernelArgs, problem: array<int>): bool =
     cudaPrefillGroupedShape(args, problem, 64) && args.words[9] % 4 == 0 && args.words[0] % 4 == 0
+private fun cudaPrefillGroupedI8Shape(args: KernelArgs, problem: array<int>): bool =
+    cudaPrefillGroupedNvfp4Shape(args, problem) && args.words[1] % 16 == 0 && args.words[10] % 4 == 0
 private fun cudaPrefillGroupedQ8Shape(args: KernelArgs, problem: array<int>): bool =
     cudaPrefillGroupedShape(args, problem, 32) && args.words[9] % 2 == 0 && args.words[0] % 2 == 0
 private fun cudaPrefillGroupedQ5Shape(args: KernelArgs, problem: array<int>): bool = args.words[9] % 16 == 0 && args.words[0] % 16 == 0 &&
@@ -620,6 +628,10 @@ private val cudaKernels = [
 
 // prefill kernels (ablac-4e; docs/prefill.md)
 private val cudaPrefillKernels = [
+    CudaKernelSpec("quantize_rows_i8", kernelPrefillQuantizeI8, 128, 128,
+        [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU], cudaPrefillQuantizeI8Shape, 2),
+    CudaKernelSpec("matmul_nvfp4_grouped_i8", kernelPrefillNvfp4I8, 128, 256,
+        cudaArgsGroupedI8, cudaPrefillGroupedI8Shape, 2, 4),
     CudaKernelSpec("matmul_q8_0", kernelPrefillMatmul, 128, 256, cudaArgsPrefillMatmul, cudaPrefillQ8Shape, 2),
     CudaKernelSpec("matmul_nvfp4", kernelPrefillMatmul, 128, 256, cudaArgsPrefillMatmul, cudaPrefillNvfp4Shape, 2),
     CudaKernelSpec("matmul_f32", kernelPrefillMatmul, 128, 256, cudaArgsPrefillMatmul, cudaPrefillMatmulF32Shape, 2),
