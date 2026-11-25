@@ -78,7 +78,7 @@ class ServeCounters(var requests: int = 0)
 class ServeRun(
     val fd: int, val streaming: bool, val id: string, val created: int, val name: string, val stop: array<string>, val callPrefix: string,
     var content: string = "", var reasoning: string = "", var pending: string = "", var stopMatched: bool = false, var firstToken: int = 0,
-    var connected: bool = true, var cancel: bool = false, val calls: array<Json> = []
+    var connected: bool = true, var cancel: bool = false, var firstRaw: int = 0, val calls: array<Json> = []
 ) {
     fun send(chunk: string): void {
         if (this.connected && !serveSend(this.fd, chunk)) {
@@ -183,6 +183,7 @@ private fun serveChat(
     val events: array<ServeEvent> = []
     var stats = SpecStats()
     val ok = session.turn(backend, model, maxTokens, stops, true, false, control, stats, { token ->
+        if (run.firstRaw == 0) run.firstRaw = monotonicNanoseconds()
         parser.feed(token, tokenizer.decode([token]), events)
         for (event in events) run.handle(event)
         if (run.cancel) control.cancel = true
@@ -208,8 +209,9 @@ private fun serveChat(
         serveWriteJson(connection, 200, serveCompletionBody(id, created, name, run.content, run.reasoning, run.calls, finish, tokens.size, stats.generated, kept))
     }
     connection.close()
+    val rawTtft = if (run.firstRaw > 0) f64FromInt(run.firstRaw - started) / 1000000000.0 else seconds
     val ttft = if (run.firstToken > 0) f64FromInt(run.firstToken - started) / 1000000000.0 else seconds
-    eprintln("[serve] ${tokens.size} prompt tokens (${kept} reused), ${stats.generated} generated, first token after ${ttft} s, ${f64FromInt(stats.generated) / (if (decodeSeconds > 0.0) decodeSeconds else 1.0)} tok/s, finish $finish${if (streaming) ", streamed" else ""}")
+    eprintln("[serve] ${tokens.size} prompt tokens (${kept} reused), ${stats.generated} generated, first output after ${ttft} s (first token ${rawTtft} s), ${f64FromInt(stats.generated) / (if (decodeSeconds > 0.0) decodeSeconds else 1.0)} tok/s, finish $finish${if (streaming) ", streamed" else ""}")
 }
 
 private fun serveFail(message: string): int {
