@@ -82,7 +82,7 @@ static __device__ __forceinline__ float pm_nvfp4_value(unsigned code) {
 }
 
 enum { PM_Q8_0 = 0, PM_NVFP4 = 1, PM_F32 = 2, PM_BF16 = 3, PM_Q5K = 4 };
-enum { PM_ROWS = 128, PM_TOKENS = 64, PM_STEP = 32, PM_PITCH = 40, PM_DEPTH = 4 };
+enum { PM_ROWS = 128, PM_TOKENS = 64, PM_STEP = 32, PM_PITCH = 40, PM_DEPTH = 3 };
 
 // Words fetched from global memory for 16 weights of one row (before dequantization).
 template <int FORMAT>
