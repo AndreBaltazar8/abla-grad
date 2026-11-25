@@ -279,11 +279,20 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
         ok = ok && backend.join()
     }
     if (isSwa) {
-        for (j in 0 until 3) ok = ok && this.norm(backend, "blk.$ip.attn_norm.weight", source[j], normed + j * nb)
+        ok = ok && backend.fork(2)
+        for (j in 0 until 3) {
+            ok = ok && backend.branch(j)
+            ok = ok && this.norm(backend, "blk.$ip.attn_norm.weight", source[j], normed + j * nb)
+        }
+        ok = ok && backend.join()
     } else {
+        ok = ok && backend.fork(2)
         ok = ok && this.norm(backend, "blk.$ip.attn_q_inp_norm.weight", source[0], normed)
+        ok = ok && backend.branch(1)
         ok = ok && this.norm(backend, "blk.$ip.attn_k_inp_norm.weight", source[1], normed + nb)
+        ok = ok && backend.branch(2)
         ok = ok && this.norm(backend, "blk.$ip.attn_v_inp_norm.weight", source[2], normed + 2 * nb)
+        ok = ok && backend.join()
     }
     if (!ok) return -1
 
@@ -310,7 +319,7 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     val table = this.so("table")
     val relBias = this.w("blk.$ip.attn_rel_bias.weight")
     val tauFloor = f64ToF32(f64FromInt(c.logFloor))
-    ok = backend.fork(3)
+    ok = backend.fork(4)
     // q (main line)
     ok = ok && this.matvec(backend, "blk.$ip.attn_q.weight", normed, q)
     ok = ok && opL2Clip(backend, this.scratch, q, this.arena, qClip.offset, true, this.scratch, q, c.nHead, c.headDim, c.qkClip)
@@ -340,6 +349,9 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     }
     ok = ok && this.matvec(backend, "blk.$ip.attn_sink_proj.weight", normed, sinks)
     ok = ok && opRelTable(backend, this.arena, relBias.offset, this.scratch, r, this.scratch, sinks, this.scratch, table, c.nRel, extent, c.nHead)
+    // the output gate (needs only `normed`; used after the attention)
+    ok = ok && backend.branch(4)
+    ok = ok && this.matvec(backend, "blk.$ip.attn_gate.weight", normed, this.so("gate"))
     // q's scale by tau (main line again, after the branches are launched)
     ok = ok && backend.branch(0)
     if (!isSwa && this.useStep) ok = ok && opScaleTau(backend, this.scratch, q, this.step, tauFloor, c.logAlpha, qDim)
@@ -376,7 +388,6 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
         ok = ok && opAttentionDecodeRel(backend, this.scratch, q, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
             this.scratch, table, this.scratch, att, c.nHead, c.nHeadKv, c.headDim, first, pos, pos, extent, this.maxCtx, scale)
     }
-    ok = ok && this.matvec(backend, "blk.$ip.attn_gate.weight", normed, this.so("gate"))
     ok = ok && opSigmoidMul(backend, this.scratch, att, this.scratch, this.so("gate"), this.scratch, att, qDim)
     val oproj = this.so("oproj")
     ok = ok && this.matvec(backend, "blk.$ip.attn_output.weight", att, oproj)
