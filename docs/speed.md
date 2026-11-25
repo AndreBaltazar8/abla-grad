@@ -11,6 +11,7 @@ Method: ours = `abla-grad decode-bench <gguf> <ids> --n 128 --mode graph` (greed
 | abla-grad a02be45 | 96.5 | 95.7 | 81.5 | 73.8 |
 | abla-grad + split attention, 8 blocks/head (4c1ee1f) | | 98.9 | 96.1 | 93.7 |
 | abla-grad, 16 blocks/head (default now) | | 98.7 | | 95.7 |
+| abla-grad parallel controllers (85b7bee, fixture 06) | 105.39 | 105.63 | 103.77 | 102.27 |
 
 | Depth 0, tok/s | pp512 | tg1024 |
 |---|---:|---:|
@@ -58,6 +59,7 @@ used one graph run per cell, F32 KV, and greedy continuation of a
 natural-text prefix (fixture 06). Its context was
 `depth + generation + 1` rounded up to 256. Depth counts cached
 tokens before the seed. All timings exclude prefill and use E-cores 24–27.
+Supplemental abla-grad tg1024 runs reached 102.68 at d15 and 101.19 at d300.
 
 The 1,624-position natural-text gate qualified the sliding-window path
 on fixture 05. Among its 1,624 rows, abla-grad exceeded KL 0.04 on 28,
