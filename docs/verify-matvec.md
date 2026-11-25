@@ -58,3 +58,13 @@ graph-compatible grid has capacity 24 at every R, so it issues some empty
 blocks when the union is smaller. The existing single kernel launches a
 grid of eight experts. A 64/128/256/512-thread sweep kept 128 threads as the
 best overall geometry across the overlap patterns.
+
+The Q5_K (2304 × 2304) and Q8_0 (2304 × 1152) expert projections use
+the same union layout in layers 20–23. With eight slots per vector and
+17 distinct experts across three vectors, their R=3 kernel times were
+72.54 µs and 22.17 µs, respectively. Three existing single-vector calls
+would take 93.40 µs and 26.38 µs at their measured per-call times.
+
+Replacing the grouped tile kernels in the recorded cycle reduced cycle
+time from 18.1 to 17.4 ms on prompt 03 and from 19.4 to 17.7 ms on
+prompt 05. The verification argmax check passed.
