@@ -141,12 +141,12 @@ fun speculativeGenerate(
         val before = position
         val t0 = monotonicNanoseconds()
         if (arm == 0) {
-            if (!model.replayMany(backend, plain, if (sweeping || probing || warm) SPEC_BATCH_TOKENS else SPEC_BATCH_TOKENS_RUN)) {
+            if (!model.replayMany(backend, plain, specBound(if (sweeping || probing || warm) SPEC_BATCH_TOKENS else SPEC_BATCH_TOKENS_RUN, maxTokens - produced))) {
                 speculateError = inklingLastError()
                 return false
             }
         } else {
-            val batchCycles = if (sweeping || probing || warm) SPEC_BATCH_CYCLES else SPEC_BATCH_CYCLES_RUN
+            val batchCycles = specBound(if (sweeping || probing || warm) SPEC_BATCH_CYCLES else SPEC_BATCH_CYCLES_RUN, (maxTokens - produced + 2) / 3)
             for (b in 0 until batchCycles) {
                 val replayed = if (arm == 1) backend.replay(cycle2) else if (arm == 2) replayOptional(backend, cycle3)
                     else replayOptional(backend, cycle4)
@@ -261,3 +261,6 @@ private fun replayOptional(var backend: Backend, recording: Recording?): bool {
     if (recording == null) return false
     backend.replay(recording)
 }
+
+// A batch never runs further than the tokens still wanted need (a cycle yields about 3), but at least one replay.
+private fun specBound(batch: int, wanted: int): int = if (wanted < 1) 1 else if (wanted < batch) wanted else batch
