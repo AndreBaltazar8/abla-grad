@@ -287,24 +287,14 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     }
     if (!ok) return -1
 
-    // projections
+    // projections, short convolutions, clips: four independent chains (q; k; v; the relative-position table with the sinks) that only read `normed`; in a
+    // recording they run as parallel branches (no-ops otherwise)
     val q = this.so("q")
     val kRaw = this.so("kRaw")
     val vRaw = this.so("vRaw")
     val k = this.so("k")
     val v = this.so("v")
     val r = this.so("r")
-    ok = this.matvec(backend, "blk.$ip.attn_q.weight", normed, q)
-    ok = ok && this.matvec(backend, "blk.$ip.attn_k.weight", normed + nb, kRaw)
-    ok = ok && this.matvec(backend, "blk.$ip.attn_v.weight", normed + 2 * nb, vRaw)
-    ok = ok && this.matvec(backend, "blk.$ip.attn_rel.weight", normed, r)
-    if (!isSwa) {
-        ok = ok && this.matvec(backend, "blk.$ip.attn_k_conv_proj.weight", normed + nb, this.so("kDyn"))
-        ok = ok && this.matvec(backend, "blk.$ip.attn_v_conv_proj.weight", normed + 2 * nb, this.so("vDyn"))
-    }
-    if (!ok) return -1
-
-    // short convolutions on K and V (state per visit)
     val historyBase = visit * historyBytesPerVisit(c)
     val kHistory = historyBase
     val vHistory = historyBase + (c.nConv - 1) * kvDim * 4
@@ -314,40 +304,56 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     val plainScale = f64ToF32(1.0 / sqrt(f64FromInt(c.nConv + 1)))
     val kConv = this.w("blk.$ip.attn_k_conv.weight")
     val vConv = this.w("blk.$ip.attn_v_conv.weight")
-    ok = opConvStep(backend, this.scratch, kRaw, this.history, kHistory, this.arena, kConv.offset, this.scratch, this.so("kDyn"), !isSwa,
-        this.scratch, k, kvDim, c.nConv, c.nHeadKv, dynScale)
-    ok = ok && opConvStep(backend, this.scratch, vRaw, this.history, vHistory, this.arena, vConv.offset, this.scratch, this.so("vDyn"), !isSwa,
-        this.scratch, v, kvDim, c.nConv, c.nHeadKv, dynScale)
-
-    // clip / normalize
     val qClip = this.w("blk.$ip.attn_q_clip.weight")
     val relClip = this.w("blk.$ip.attn_rel_clip.weight")
+    val sinks = this.so("sinks")
+    val table = this.so("table")
+    val relBias = this.w("blk.$ip.attn_rel_bias.weight")
+    val tauFloor = f64ToF32(f64FromInt(c.logFloor))
+    ok = backend.fork(3)
+    // q (main line)
+    ok = ok && this.matvec(backend, "blk.$ip.attn_q.weight", normed, q)
     ok = ok && opL2Clip(backend, this.scratch, q, this.arena, qClip.offset, true, this.scratch, q, c.nHead, c.headDim, c.qkClip)
+    // k
+    ok = ok && backend.branch(1)
+    ok = ok && this.matvec(backend, "blk.$ip.attn_k.weight", normed + nb, kRaw)
+    if (!isSwa) ok = ok && this.matvec(backend, "blk.$ip.attn_k_conv_proj.weight", normed + nb, this.so("kDyn"))
+    ok = ok && opConvStep(backend, this.scratch, kRaw, this.history, kHistory, this.arena, kConv.offset, this.scratch, this.so("kDyn"), !isSwa,
+        this.scratch, k, kvDim, c.nConv, c.nHeadKv, dynScale)
     ok = ok && opL2Clip(backend, this.scratch, k, this.arena, 0, false, this.scratch, k, c.nHeadKv, c.headDim, c.qkClip)
+    // v
+    ok = ok && backend.branch(2)
+    ok = ok && this.matvec(backend, "blk.$ip.attn_v.weight", normed + 2 * nb, vRaw)
+    if (!isSwa) ok = ok && this.matvec(backend, "blk.$ip.attn_v_conv_proj.weight", normed + 2 * nb, this.so("vDyn"))
+    ok = ok && opConvStep(backend, this.scratch, vRaw, this.history, vHistory, this.arena, vConv.offset, this.scratch, this.so("vDyn"), !isSwa,
+        this.scratch, v, kvDim, c.nConv, c.nHeadKv, dynScale)
     ok = ok && opRmsNormPlain(backend, this.scratch, v, this.scratch, v, c.headDim, c.rmsEps, c.nHeadKv)
+    // relative-position bias table with the sinks folded in
+    ok = ok && backend.branch(3)
+    ok = ok && this.matvec(backend, "blk.$ip.attn_rel.weight", normed, r)
     ok = ok && opL2Clip(backend, this.scratch, r, this.arena, relClip.offset, true, this.scratch, r, c.nHead, c.nRel, c.relClip)
-    if (!isSwa) {
-        if (this.useStep) {
-            ok = ok && opScaleTau(backend, this.scratch, q, this.step, f64ToF32(f64FromInt(c.logFloor)), c.logAlpha, qDim)
-            ok = ok && opScaleTau(backend, this.scratch, r, this.step, f64ToF32(f64FromInt(c.logFloor)), c.logAlpha, c.nRel * c.nHead)
-        } else {
-            val ratio = (f64FromInt(pos) + 1.0) / f64FromInt(c.logFloor)
-            val tau = f64ToF32(1.0 + f32ToF64(c.logAlpha) * log(if (ratio > 1.0) ratio else 1.0))
-            ok = ok && opScale(backend, this.scratch, q, tau, qDim)
-            ok = ok && opScale(backend, this.scratch, r, tau, c.nRel * c.nHead)
-        }
+    if (!isSwa && this.useStep) ok = ok && opScaleTau(backend, this.scratch, r, this.step, tauFloor, c.logAlpha, c.nRel * c.nHead)
+    if (!isSwa && !this.useStep) {
+        val ratio = (f64FromInt(pos) + 1.0) / f64FromInt(c.logFloor)
+        val tau = f64ToF32(1.0 + f32ToF64(c.logAlpha) * log(if (ratio > 1.0) ratio else 1.0))
+        ok = ok && opScale(backend, this.scratch, r, tau, c.nRel * c.nHead)
     }
+    ok = ok && this.matvec(backend, "blk.$ip.attn_sink_proj.weight", normed, sinks)
+    ok = ok && opRelTable(backend, this.arena, relBias.offset, this.scratch, r, this.scratch, sinks, this.scratch, table, c.nRel, extent, c.nHead)
+    // q's scale by tau (main line again, after the branches are launched)
+    ok = ok && backend.branch(0)
+    if (!isSwa && this.useStep) ok = ok && opScaleTau(backend, this.scratch, q, this.step, tauFloor, c.logAlpha, qDim)
+    if (!isSwa && !this.useStep) {
+        val ratio = (f64FromInt(pos) + 1.0) / f64FromInt(c.logFloor)
+        val tau = f64ToF32(1.0 + f32ToF64(c.logAlpha) * log(if (ratio > 1.0) ratio else 1.0))
+        ok = ok && opScale(backend, this.scratch, q, tau, qDim)
+    }
+    ok = ok && backend.join()
     if (!ok) return -1
 
     this.dump(backend, pos, "Qcur-$slot", q, qDim)
     this.dump(backend, pos, "Kcur-$slot", k, kvDim)
     this.dump(backend, pos, "Vcur-$slot", v, kvDim)
-    // relative-position bias table with the sinks folded in, then attention
-    val sinks = this.so("sinks")
-    val table = this.so("table")
-    val relBias = this.w("blk.$ip.attn_rel_bias.weight")
-    ok = this.matvec(backend, "blk.$ip.attn_sink_proj.weight", normed, sinks)
-    ok = ok && opRelTable(backend, this.arena, relBias.offset, this.scratch, r, this.scratch, sinks, this.scratch, table, c.nRel, extent, c.nHead)
     val layerCacheBytes = c.nHeadKv * this.maxCtx * c.headDim * 4
     val scale = f64ToF32(1.0 / sqrt(f64FromInt(c.headDim)))
     val att = this.so("att")
