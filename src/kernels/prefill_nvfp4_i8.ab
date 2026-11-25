@@ -30,6 +30,10 @@ extern "C" __global__ void quantize_rows_i8(const float *x, unsigned *qx, float 
 """
 
 private val prefillNvfp4I8Body = """
+#ifndef I8_LAUNCH_BOUNDS
+#define I8_LAUNCH_BOUNDS __launch_bounds__(256)
+#endif
+
 #ifndef I8_Q5
 #define I8_Q5 0
 #endif
@@ -74,7 +78,7 @@ static __device__ __forceinline__ void i8_mma(int (&d)[4], const unsigned (&a)[2
         : "r"(a[0]), "r"(a[1]), "r"(b), "r"(zero));
 }
 
-extern "C" __global__ void __launch_bounds__(256) I8_KERNEL(
+extern "C" __global__ void I8_LAUNCH_BOUNDS I8_KERNEL(
 #if I8_X5
     const unsigned char *wq, const unsigned *xq, const float *sq, float *yq, unsigned nq,
     const unsigned char *wk, const unsigned *xk, const float *sk, float *yk, unsigned nk,
@@ -313,7 +317,7 @@ extern "C" __global__ void __launch_bounds__(256) I8_KERNEL(
 }
 """
 
-val kernelPrefillNvfp4I8 = "#define I8_KERNEL matmul_nvfp4_grouped_i8\n" + prefillNvfp4I8Body
+val kernelPrefillNvfp4I8 = "#define I8_LAUNCH_BOUNDS __launch_bounds__(256, 3)\n#define I8_KERNEL matmul_nvfp4_grouped_i8\n" + prefillNvfp4I8Body
 
 val kernelPrefillQ8I8 = "#define I8_Q8 1\n#define I8_DENSE 1\n#define I8_KERNEL matmul_q8_0_i8\n" + prefillNvfp4I8Body
 val kernelPrefillQ8GroupedI8 = "#define I8_Q8 1\n#define I8_KERNEL matmul_q8_0_grouped_i8\n" + prefillNvfp4I8Body
