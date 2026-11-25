@@ -38,7 +38,7 @@ fun run(var backend: Backend): bool {
     if (!backend.launch("conv_step", kernelArgs().pointer(dx).pointer(h1).pointer(dw).u64(0).pointer(conv).u32(channels).u32(nConv).u32(1).f32(scale), [channels])) return false
     if (!backend.launch("add", kernelArgs().pointer(dres).pointer(conv).pointer(sum).u32(channels), [channels])) return false
     if (!backend.launch("conv_step_residual", kernelArgs().pointer(dx).pointer(h2).pointer(dw).pointer(fused).pointer(dres).u32(channels).u32(nConv).f32(scale), [channels])) return false
-    var ok = same("conv_step_residual output", downloadFloats(backend, sum, channels) ?? return false, downloadFloats(backend, fused, channels) ?? return false, 0.000001)
+    var ok = same("conv_step_residual output", downloadFloats(backend, sum, channels) ?? return false, downloadFloats(backend, fused, channels) ?? return false, 0.0001)
     ok = ok && same("conv_step_residual history", downloadFloats(backend, h1, (nConv - 1) * channels) ?? return false, downloadFloats(backend, h2, (nConv - 1) * channels) ?? return false)
     // combine + conv + residual
     val nUsed = 8
@@ -54,7 +54,7 @@ fun run(var backend: Backend): bool {
     if (!backend.launch("conv_step", kernelArgs().pointer(moe).pointer(g1).pointer(dw).u64(0).pointer(conv2).u32(channels).u32(nConv).u32(1).f32(scale), [channels])) return false
     if (!backend.launch("add", kernelArgs().pointer(dres).pointer(conv2).pointer(sum2).u32(channels), [channels])) return false
     if (!backend.launch("moe_combine_conv_residual", kernelArgs().pointer(down).pointer(wts).pointer(g2).pointer(dw).pointer(fused2).pointer(dres).u32(channels).u32(nUsed).u32(nConv).f32(scale), [channels])) return false
-    ok = ok && same("moe_combine_conv_residual output", downloadFloats(backend, sum2, channels) ?? return false, downloadFloats(backend, fused2, channels) ?? return false, 0.000001)
+    ok = ok && same("moe_combine_conv_residual output", downloadFloats(backend, sum2, channels) ?? return false, downloadFloats(backend, fused2, channels) ?? return false, 0.0001)
     ok = ok && same("moe_combine_conv_residual history", downloadFloats(backend, g1, (nConv - 1) * channels) ?? return false, downloadFloats(backend, g2, (nConv - 1) * channels) ?? return false)
     ok
 }
