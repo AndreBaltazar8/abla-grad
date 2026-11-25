@@ -17,12 +17,12 @@ fun groupedLaunch(backend: Backend, name: string, w: DeviceBuffer, x: DeviceBuff
     backend.launch(name, kernelArgs().pointer(w).pointer(x).pointer(xmap).pointer(y).pointer(scales).pointer(plan).u32(rows).u32(cols).u32(nExpert).u64(stride),
         [rows, maxTiles])
 
-trusted fun testGrouped(backend: Backend, kind: string, elements: int, blockBytes: int, decode: (string) -> array<f32>, tile: int, identityMap: bool): bool {
+trusted fun testGrouped(backend: Backend, kind: string, elements: int, blockBytes: int, decode: (string) -> array<f32>, tile: int, identityMap: bool, direct: bool = false, blockCount: int = 0): bool {
     val nExpert = 6
     val k = 2
     val tokens = 50
     val rows = 70
-    val blocks = if (elements == 256) 1 else 3
+    val blocks = if (blockCount > 0) blockCount else if (elements == 256) 1 else 3
     val cols = blocks * elements
     val rowBytes = blocks * blockBytes
     val stride = rows * rowBytes + 32
@@ -82,7 +82,7 @@ trusted fun testGrouped(backend: Backend, kind: string, elements: int, blockByte
     if (!backend.upload(dw, 0, wa, weights.capacity) || !backend.upload(dx, 0, xa, x.capacity) || !backend.upload(dids, 0, ia, ids.capacity) ||
         !backend.upload(dscales, 0, sa, scales.capacity) || !backend.upload(diota, 0, nativePointerAddress(iota.address), pairs * 4)) return false
     if (!backend.launch("moe_sort", kernelArgs().pointer(dids).u32(pairs).u32(k).u32(nExpert).u32(tile).pointer(dsorted).pointer(dslot).pointer(dplan), [1])) return false
-    val suffix = if (tile == 32) "32" else ""
+    val suffix = if (direct) "_rd" else if (tile == 32) "32" else ""
     // with the identity map the x rows are the sorted rows themselves: use the first `pairs` rows of x (tokens * k >= tokens, so only the first `tokens` exist)
     val launched = if (identityMap) groupedLaunch(backend, "matmul_${kind}_grouped${suffix}", dw, dx, diota, dy, dscales, dplan, rows, cols, nExpert, stride, maxTiles)
         else groupedLaunch(backend, "matmul_${kind}_grouped${suffix}", dw, dx, dsorted, dy, dscales, dplan, rows, cols, nExpert, stride, maxTiles)
@@ -123,6 +123,8 @@ trusted fun testGrouped(backend: Backend, kind: string, elements: int, blockByte
 }
 
 fun verify(backend: Backend): bool {
+    if (!testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, false, true, 4) || !testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, false, true, 8)) return false
+    if (!testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, false, true) || !testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, true, true)) return false
     for (tile in [64, 32]) {
         if (!testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, tile, false) || !testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, tile, true)) return false
         if (!testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, tile, false) || !testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, tile, true)) return false

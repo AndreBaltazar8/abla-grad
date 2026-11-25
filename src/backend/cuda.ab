@@ -513,6 +513,7 @@ private val cudaPrefillKernels = [
     CudaKernelSpec("sum_slices", kernelPrefillMatmul, 256, 256, cudaArgsSumSlices, cudaPrefillSumSlicesShape),
     CudaKernelSpec("matmul_q8_0_x5", kernelPrefillMatmul, 128, 256, cudaArgsMatmulX5, cudaPrefillX5Shape, 2),
     CudaKernelSpec("conv_history_rows", kernelPrefillConvHistoryRows, 256, 256, cudaArgsConvHistoryRows, cudaPrefillConvHistoryRowsShape),
+    CudaKernelSpec("matmul_nvfp4_grouped_rd", kernelPrefillMatmul, 128, 128, cudaArgsGrouped, cudaPrefillGroupedNvfp4Shape, 2, 4),
     CudaKernelSpec("matmul_f32_exact_split", kernelPrefillMatmulF32ExactSplit, 16, 256, cudaArgsMatmulSplit, cudaPrefillExactSplitShape, 2),
     CudaKernelSpec("matmul_f32_exact", kernelPrefillMatmulF32Exact, 16, 256, cudaArgsPrefillMatmul, cudaPrefillMatmulExactShape, 2),
     CudaKernelSpec("gather_rows_q8_0", kernelPrefillGatherQ8_0, 256, 256, cudaArgsGatherRows, cudaPrefillGatherShape, 2),

@@ -454,4 +454,154 @@ extern "C" __global__ void __launch_bounds__(128) matmul_q5_k_grouped32(const un
     const float *scales, const unsigned *plan, unsigned rows, unsigned cols, unsigned nExpert, unsigned long long expertStride) {
     pm_grouped<PM_Q5K, 32>(w, static_cast<unsigned long long>(cols / 256) * 176, rows, cols, x, xmap, y, scales, plan, nExpert, expertStride);
 }
+
+// ---- NVFP4 experts with the weights going straight into registers (no shared-memory round trip for W) ----
+// A warp owns 32 weight rows and all 64 tokens of the tile; the mma B fragment of a (row, 16-weight group) is two bytes of the packed group, so a lane reads
+// the bytes it needs, dequantizes them to f16 pairs (prmt lookup) and feeds the tensor core. Only X (f32 -> f16) passes through shared memory (shared by the four warps).
+// Per 64-k step a lane holds, for its four rows, the scale word and four 16-bit group slices (raw), prefetched one step ahead.
+static __device__ __forceinline__ unsigned pm_nvfp4_pair(unsigned v, unsigned scale2, unsigned &b1) {
+    const unsigned r = pm_prmt(0x42403c00u, 0x4a484644u, v & 0x7777u);   // high bytes of |n0|, |n2|, |n1|, |n3|
+    const unsigned b0 = pm_prmt(r, 0u, 0x2404u) | ((v << 12) & 0x8000u) | ((v << 20) & 0x80000000u);
+    b1 = pm_hmul2(pm_prmt(r, 0u, 0x3414u) | ((v << 8) & 0x8000u) | ((v << 16) & 0x80000000u), scale2);
+    return pm_hmul2(b0, scale2);
+}
+
+static __device__ __forceinline__ void pm_rd_fetch(const unsigned char *const (&row)[4], const bool (&valid)[4], unsigned step, unsigned quad, unsigned (&raw)[4][5]) {
+    #pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+        if (valid[nt]) {
+            const unsigned char *block = row[nt] + static_cast<unsigned long long>(step) * 36;
+            raw[nt][0] = *reinterpret_cast<const unsigned *>(block);
+            #pragma unroll
+            for (int g = 0; g < 4; ++g) raw[nt][1 + g] = *reinterpret_cast<const unsigned short *>(block + 4 + 8 * g + 2 * quad);
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 5; ++i) raw[nt][i] = 0;
+        }
+    }
+}
+
+static __device__ __forceinline__ void pm_rd_gemm(const unsigned char *w, unsigned long long rowBytes, unsigned rows, unsigned cols, const float *x, const unsigned *xmap,
+                                                  unsigned mBase, unsigned mCount, unsigned m0, unsigned n0, float *y, float outScale) {
+    __shared__ __align__(16) unsigned short xs[2][64 * 72];
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned warp = tid >> 5;
+    const unsigned group = lane >> 2;
+    const unsigned quad = lane & 3u;
+    const unsigned rowBase = n0 + warp * 32;
+    const unsigned steps = cols / 64;
+    const unsigned validTokens = mCount - m0 < 64u ? mCount - m0 : 64u;
+
+    const unsigned char *row[4];
+    bool valid[4];
+    #pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+        const unsigned r = rowBase + nt * 8 + group;
+        valid[nt] = r < rows;
+        row[nt] = w + static_cast<unsigned long long>(valid[nt] ? r : 0) * rowBytes;
+    }
+    const unsigned xToken = tid >> 1;
+    const unsigned xHalf = tid & 1u;
+    const bool xValid = m0 + xToken < mCount;
+    const float *xRow = nullptr;
+    if (xValid) {
+        unsigned source = mBase + m0 + xToken;
+        xRow = x + static_cast<unsigned long long>(xmap ? xmap[source] : source) * cols;
+    }
+    float acc[4][4][4];
+    #pragma unroll
+    for (int a = 0; a < 4; ++a)
+        #pragma unroll
+        for (int b = 0; b < 4; ++b)
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) acc[a][b][c] = 0.0f;
+
+    float4 xr[8];
+    unsigned raw[2][4][5];
+    #define PM_RD_XFETCH(step) { \
+        if (xValid) { \
+            const float4 *src = reinterpret_cast<const float4 *>(xRow + (step) * 64 + xHalf * 32); \
+            _Pragma("unroll") \
+            for (int i = 0; i < 8; ++i) xr[i] = src[i]; \
+        } else { \
+            _Pragma("unroll") \
+            for (int i = 0; i < 8; ++i) xr[i] = make_float4(0.f, 0.f, 0.f, 0.f); \
+        } \
+    }
+    #define PM_RD_XSTORE(stage) { \
+        uint4 *dst = reinterpret_cast<uint4 *>(&xs[stage][xToken * 72 + xHalf * 32]); \
+        _Pragma("unroll") \
+        for (int i = 0; i < 4; ++i) \
+            dst[i] = make_uint4(pm_pack(xr[2 * i].x, xr[2 * i].y), pm_pack(xr[2 * i].z, xr[2 * i].w), pm_pack(xr[2 * i + 1].x, xr[2 * i + 1].y), pm_pack(xr[2 * i + 1].z, xr[2 * i + 1].w)); \
+    }
+    // one 64-k step: four 16-weight groups, A from shared memory, B from the raw registers `buf`
+    #define PM_RD_COMPUTE(stage, buf) { \
+        _Pragma("unroll") \
+        for (int g = 0; g < 4; ++g) { \
+            unsigned a[4][4]; \
+            _Pragma("unroll") \
+            for (int mt = 0; mt < 4; ++mt) { \
+                if (mt * 16 < validTokens) { \
+                    unsigned arow = mt * 16 + (lane & 7u) + ((lane >> 3) & 1u) * 8u; \
+                    pm_ldmatrix(a[mt], &xs[stage][arow * 72 + g * 16 + (lane >> 4) * 8u]); \
+                } \
+            } \
+            _Pragma("unroll") \
+            for (int nt = 0; nt < 4; ++nt) { \
+                const float scale = pm_nvfp4_scale((raw[buf][nt][0] >> (g * 8)) & 255u); \
+                unsigned b1; \
+                const unsigned b0 = pm_nvfp4_pair(raw[buf][nt][1 + g], pm_pack(scale, scale), b1); \
+                _Pragma("unroll") \
+                for (int mt = 0; mt < 4; ++mt) { \
+                    if (mt * 16 < validTokens) pm_mma(acc[mt][nt], a[mt], b0, b1); \
+                } \
+            } \
+        } \
+    }
+    PM_RD_XFETCH(0);
+    pm_rd_fetch(row, valid, 0, quad, raw[0]);
+    PM_RD_XSTORE(0);
+    __syncthreads();
+    for (unsigned step = 0; step < steps; step += 2) {
+        // even step: stage 0, raw[0]
+        if (step + 1 < steps) { PM_RD_XFETCH(step + 1); pm_rd_fetch(row, valid, step + 1, quad, raw[1]); }
+        PM_RD_COMPUTE(0, 0);
+        if (step + 1 >= steps) break;
+        PM_RD_XSTORE(1);
+        __syncthreads();
+        // odd step: stage 1, raw[1]
+        if (step + 2 < steps) { PM_RD_XFETCH(step + 2); pm_rd_fetch(row, valid, step + 2, quad, raw[0]); }
+        PM_RD_COMPUTE(1, 1);
+        if (step + 2 >= steps) break;
+        PM_RD_XSTORE(0);
+        __syncthreads();
+    }
+    #undef PM_RD_XFETCH
+    #undef PM_RD_XSTORE
+    #undef PM_RD_COMPUTE
+    #pragma unroll
+    for (int mt = 0; mt < 4; ++mt) {
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            unsigned token = m0 + mt * 16 + group + half * 8;
+            if (token >= mCount) continue;
+            float *out = y + static_cast<unsigned long long>(mBase + token) * rows;
+            #pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                unsigned col = rowBase + nt * 8 + 2 * quad;
+                if (col < rows) *reinterpret_cast<float2 *>(out + col) = make_float2(acc[mt][nt][2 * half] * outScale, acc[mt][nt][2 * half + 1] * outScale);
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128) matmul_nvfp4_grouped_rd(const unsigned char *w, const float *x, const unsigned *xmap, float *y,
+    const float *scales, const unsigned *plan, unsigned rows, unsigned cols, unsigned nExpert, unsigned long long expertStride) {
+    if (blockIdx.y >= plan[nExpert + 1]) return;
+    const unsigned expert = plan[nExpert + 2 + 2 * blockIdx.y];
+    const unsigned first = plan[nExpert + 3 + 2 * blockIdx.y];
+    pm_rd_gemm(w + expert * expertStride, static_cast<unsigned long long>(cols / 64) * 36, rows, cols, x, xmap, plan[expert], plan[expert + 1] - plan[expert], first,
+               blockIdx.x * PM_ROWS, y, scales ? scales[expert] : 1.0f);
+}
 """

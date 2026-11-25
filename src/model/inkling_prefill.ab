@@ -18,6 +18,13 @@ private var prefillError = ""
 // Tokens per tile of the expert-grouped matmuls (64 or 32; the plan and the kernel must agree).
 private var prefillMoeTile = 64
 
+// NVFP4 experts through the register-direct kernel (64-token tiles only).
+private var prefillRegisterDirect = false
+
+fun setPrefillRegisterDirect(on: bool): void {
+    prefillRegisterDirect = on
+}
+
 // > 0 while `verify` runs: the convolution histories are left unchanged and the history after each of that many rows goes into the workspace's snapshots.
 private var prefillVerifyRows = 0
 
@@ -486,7 +493,7 @@ private fun InklingModel.grouped(var backend: Backend, ws: PrefillWorkspace, kin
     args.u32(cols)
     args.u32(nExpert)
     args.u64(stride)
-    backend.launch("matmul_${kind}_grouped${if (prefillMoeTile == 32) "32" else ""}", args, [rows, maxTiles])
+    backend.launch(if (kind == "nvfp4" && prefillRegisterDirect && prefillMoeTile == 64) "matmul_nvfp4_grouped_rd" else "matmul_${kind}_grouped${if (prefillMoeTile == 32) "32" else ""}", args, [rows, maxTiles])
 }
 
 // Runs `tokens` prompt tokens (positions startPos ..) through the model in chunks of at most ws.chunk. Afterwards the KV caches and convolution histories
