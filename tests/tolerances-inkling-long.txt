@@ -1,8 +1,12 @@
-# Long-prompt rule (tools/gate-inkling-long.sh): at most 50 of 1,624 rows over the .04 KL limit of tests/tolerances-inkling.txt, worst KL <= 1.1,
-# at most 3% argmax differences against llama.cpp 33aeb17 CUDA.
-# Where the numbers come from (prompt 05, natural text, 2026-11-25), rows over the .04 limit and worst KL:
-#   llama.cpp mainline CPU  vs mainline CUDA   42 of 1,624 rows (33 before 1024), worst KL .324, 1,597 / 1,624 argmax matches
-#   Unsloth b12649 CUDA     vs mainline CUDA   36 of 1,624 rows,           worst KL 1.021, 1,594 / 1,624 argmax matches
-#   abla-grad (direct and step paths, 28 rows) 28 of 1,624 rows,           worst KL .806, 1,590 / 1,624 argmax matches
-# (the short prompts stay under .04 everywhere; natural text has many near-tied positions). The 50-row limit is above the noise between two
-# independent llama.cpp runs (36-41); update with the CPU run's final numbers and prompt 06 (4,300 rows) when df's runs are complete.
+# Long-prompt rules (tools/gate-inkling-long.sh): rows over the .04 KL limit of tests/tolerances-inkling.txt, argmax differences and worst KL against
+# llama.cpp 33aeb17 CUDA, per natural-text prompt:
+#   05 (1,624 rows):  at most 50 rows over, at most 3% argmax differences, worst KL <= 1.1
+#   06 (4,300 rows):  at most 40 rows over, at most 3% argmax differences, worst KL <= 0.3
+# Where the numbers come from (2026-11-25). Rows over .04 (before 1024 / 1024-4095 / from 4096), argmax misses, worst KL:
+#   prompt 05: llama.cpp mainline CPU vs CUDA   42 (33 before 1024, 9 after), 27 misses, KL .324
+#              Unsloth b12649 CUDA vs mainline CUDA   36 (27 / 9), 30 misses, KL 1.021
+#              abla-grad                           28, 34 misses, KL .806
+#   prompt 06: llama.cpp mainline CPU vs CUDA   35 (15 / 18 / 2), 111 misses, KL .230
+#              Unsloth b12649 CUDA vs mainline CUDA   18 (6 / 11 / 1), 106 misses, KL .121
+#              abla-grad                           25 (13 / 11 / 1), 97 misses, KL .209
+# The short prompts stay under .04 everywhere; natural text has many near-tied positions. No cluster after 1,024 or 4,096 in abla-grad's rows.
