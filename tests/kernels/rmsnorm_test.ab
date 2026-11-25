@@ -2,6 +2,7 @@ import "../../src/backend/backend.ab"
 import "device_test_support.ab"
 import "abla/float"
 import "abla/math"
+import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 
 trusted fun testRmsnorm(backend: Backend, weighted: bool, n: int = 259): bool {
@@ -43,7 +44,45 @@ trusted fun testRmsnorm(backend: Backend, weighted: bool, n: int = 259): bool {
     true
 }
 
+trusted fun testRmsnormThree(backend: Backend, n: int): bool {
+    val inputs: array<f32> = []
+    val weights: array<f32> = []
+    for (i in 0 until 3 * n) {
+        inputs.append(f32FromInt((i * 13) % 41 - 20) / 16.0)
+        weights.append(f32FromInt((i * 23) % 71 - 33) / 32.0)
+    }
+    val input = testFloatBuffer(inputs)
+    val weight = testFloatBuffer(weights)
+    val output = nativeByteBuffer(3 * n * 4)
+    val reference = nativeByteBuffer(3 * n * 4)
+    val x = backend.allocate(input.capacity) ?? return false
+    val w = backend.allocate(weight.capacity) ?? return false
+    val out = backend.allocate(output.capacity) ?? return false
+    val ref = backend.allocate(reference.capacity) ?? return false
+    val stride = 4 * n
+    val eps = f32(0.00001)
+    if (!backend.upload(x, 0, nativePointerAddress(input.address), input.capacity) ||
+        !backend.upload(w, 0, nativePointerAddress(weight.address), weight.capacity)) return false
+    // Reorder the source offsets to check independent pointers and weight selection.
+    val inputRows = [2, 0, 1]
+    for (row in 0 until 3) {
+        if (!backend.launch("rmsnorm", kernelArgs().pointer(x, inputRows[row] * stride).pointer(w, row * stride)
+            .pointer(ref, row * stride).u32(n).f32(eps), [1])) return false
+    }
+    if (!backend.launch("rmsnorm_three", kernelArgs().pointer(x, 2 * stride).pointer(x).pointer(x, stride)
+        .pointer(w).pointer(w, stride).pointer(w, 2 * stride).pointer(out).u32(n).f32(eps), [3])) return false
+    val gotAddr = nativePointerAddress(output.address)
+    val refAddr = nativePointerAddress(reference.address)
+    if (!backend.download(out, 0, gotAddr, output.capacity) ||
+        !backend.download(ref, 0, refAddr, reference.capacity)) return false
+    for (index in 0 until 3 * n) {
+        if (f32ToBits(testLoadFloat(gotAddr, index)) != f32ToBits(testLoadFloat(refAddr, index))) return false
+    }
+    true
+}
+
 fun verify(backend: Backend): bool =
     testRmsnorm(backend, true) && testRmsnorm(backend, false) &&
-    testRmsnorm(backend, true, 2304) && testRmsnorm(backend, false, 2304)
+    testRmsnorm(backend, true, 2304) && testRmsnorm(backend, false, 2304) &&
+    testRmsnormThree(backend, 259) && testRmsnormThree(backend, 2304)
 fun main: int = runCudaKernelTest("rmsnorm (weighted and weightless, in place)", verify)

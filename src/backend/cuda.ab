@@ -167,6 +167,11 @@ private val cudaGatherStepArguments = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, K
 private val cudaRmsnormArguments = [
     KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_F32
 ]
+private val cudaRmsnormThreeArguments = [
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
+    KERNEL_ARG_U32, KERNEL_ARG_F32
+]
 private val cudaRopeArguments = [
     KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32,
     KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_F32, KERNEL_ARG_U32
@@ -199,6 +204,9 @@ private fun cudaKGatherShape(args: KernelArgs, problem: array<int>): bool =
 
 private fun cudaRmsnormShape(args: KernelArgs, problem: array<int>): bool =
     args.words[3] > 0 && args.words[4] > 0 && args.words[4] <= 0x7f7fffff
+
+private fun cudaRmsnormThreeShape(args: KernelArgs, problem: array<int>): bool =
+    problem[0] == 3 && args.words[7] > 0 && args.words[8] > 0 && args.words[8] <= 0x7f7fffff
 
 private fun cudaRopeShape(args: KernelArgs, problem: array<int>): bool {
     val ropeDim = args.words[4]
@@ -506,6 +514,7 @@ private val cudaKernels = [
     CudaKernelSpec("gather_row_q4_k", kernelMatvecK, 128, 128, cudaGatherArguments, cudaKGatherShape),
     CudaKernelSpec("gather_row_q6_k", kernelMatvecK, 128, 128, cudaGatherArguments, cudaKGatherShape),
     CudaKernelSpec("rmsnorm", kernelRmsnorm, 1, 128, cudaRmsnormArguments, cudaRmsnormShape, nullablePointer = 1),
+    CudaKernelSpec("rmsnorm_three", kernelRmsnorm, 1, 128, cudaRmsnormThreeArguments, cudaRmsnormThreeShape),
     CudaKernelSpec("rope", kernelRope, 128, 128, cudaRopeArguments, cudaRopeShape, nullablePointer = 1),
     CudaKernelSpec("attention_decode", kernelAttentionDecode, 1, 256, cudaAttentionArguments, cudaAttentionShape),
     CudaKernelSpec("attention_decode_rel", kernelAttentionDecode, 1, 256,

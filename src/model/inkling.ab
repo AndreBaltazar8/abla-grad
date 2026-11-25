@@ -280,21 +280,20 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
         }
         ok = ok && backend.join()
     }
-    if (isSwa) {
-        ok = ok && backend.fork(2)
-        for (j in 0 until 3) {
-            ok = ok && backend.branch(j)
-            ok = ok && this.norm(backend, "blk.$ip.attn_norm.weight", source[j], normed + j * nb)
-        }
-        ok = ok && backend.join()
+    // Sliding-window attention shares an input and a weight before the loop controller.
+    val sharedNorm = isSwa && loopPass == 0
+    val kNormed = if (sharedNorm) normed else normed + nb
+    val vNormed = if (sharedNorm) normed else normed + 2 * nb
+    if (sharedNorm) {
+        ok = ok && this.norm(backend, "blk.$ip.attn_norm.weight", source[0], normed)
     } else {
-        ok = ok && backend.fork(2)
-        ok = ok && this.norm(backend, "blk.$ip.attn_q_inp_norm.weight", source[0], normed)
-        ok = ok && backend.branch(1)
-        ok = ok && this.norm(backend, "blk.$ip.attn_k_inp_norm.weight", source[1], normed + nb)
-        ok = ok && backend.branch(2)
-        ok = ok && this.norm(backend, "blk.$ip.attn_v_inp_norm.weight", source[2], normed + 2 * nb)
-        ok = ok && backend.join()
+        val qName = if (isSwa) "blk.$ip.attn_norm.weight" else "blk.$ip.attn_q_inp_norm.weight"
+        val kName = if (isSwa) qName else "blk.$ip.attn_k_inp_norm.weight"
+        val vName = if (isSwa) qName else "blk.$ip.attn_v_inp_norm.weight"
+        val normArgs = kernelArgs().pointer(this.scratch, source[0]).pointer(this.scratch, source[1]).pointer(this.scratch, source[2])
+            .pointer(this.arena, this.w(qName).offset).pointer(this.arena, this.w(kName).offset).pointer(this.arena, this.w(vName).offset)
+            .pointer(this.scratch, normed).u32(n).f32(c.rmsEps)
+        ok = ok && backend.launch("rmsnorm_three", normArgs, [3])
     }
     if (!ok) return -1
 
@@ -327,15 +326,15 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     ok = ok && opL2Clip(backend, this.scratch, q, this.arena, qClip.offset, true, this.scratch, q, c.nHead, c.headDim, c.qkClip)
     // k
     ok = ok && backend.branch(1)
-    ok = ok && this.matvec(backend, "blk.$ip.attn_k.weight", normed + nb, kRaw)
-    if (!isSwa) ok = ok && this.matvec(backend, "blk.$ip.attn_k_conv_proj.weight", normed + nb, this.so("kDyn"))
+    ok = ok && this.matvec(backend, "blk.$ip.attn_k.weight", kNormed, kRaw)
+    if (!isSwa) ok = ok && this.matvec(backend, "blk.$ip.attn_k_conv_proj.weight", kNormed, this.so("kDyn"))
     ok = ok && opConvStep(backend, this.scratch, kRaw, this.history, kHistory, this.arena, kConv.offset, this.scratch, this.so("kDyn"), !isSwa,
         this.scratch, k, kvDim, c.nConv, c.nHeadKv, dynScale)
     ok = ok && opL2Clip(backend, this.scratch, k, this.arena, 0, false, this.scratch, k, c.nHeadKv, c.headDim, c.qkClip)
     // v
     ok = ok && backend.branch(2)
-    ok = ok && this.matvec(backend, "blk.$ip.attn_v.weight", normed + 2 * nb, vRaw)
-    if (!isSwa) ok = ok && this.matvec(backend, "blk.$ip.attn_v_conv_proj.weight", normed + 2 * nb, this.so("vDyn"))
+    ok = ok && this.matvec(backend, "blk.$ip.attn_v.weight", vNormed, vRaw)
+    if (!isSwa) ok = ok && this.matvec(backend, "blk.$ip.attn_v_conv_proj.weight", vNormed, this.so("vDyn"))
     ok = ok && opConvStep(backend, this.scratch, vRaw, this.history, vHistory, this.arena, vConv.offset, this.scratch, this.so("vDyn"), !isSwa,
         this.scratch, v, kvDim, c.nConv, c.nHeadKv, dynScale)
     ok = ok && opRmsNormPlain(backend, this.scratch, v, this.scratch, v, c.headDim, c.rmsEps, c.nHeadKv)
