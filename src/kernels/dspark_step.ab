@@ -63,6 +63,26 @@ extern "C" __global__ void dspark_rope_step(float *x, const unsigned *first, uns
 }
 """
 
+// Rotate contiguous context rows with their absolute positions.
+val kernelDsparkRopeBatch = """
+extern "C" __global__ void dspark_rope_batch(float *x, unsigned first, unsigned heads,
+    unsigned dim, unsigned rows, float freqBase) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned pairs = dim / 2;
+    if (i >= rows * heads * pairs) return;
+    const unsigned pair = i % pairs;
+    const unsigned vector = i / pairs;
+    const unsigned pos = first + vector / heads;
+    const float theta = float(pos) / powf(freqBase, float(pair) / float(pairs));
+    float s, c;
+    sincosf(theta, &s, &c);
+    float *row = x + vector * dim;
+    const float a = row[pair], b = row[pair + pairs];
+    row[pair] = a * c - b * s;
+    row[pair + pairs] = a * s + b * c;
+}
+"""
+
 val kernelDsparkKvStep = kvAddressing + "\n" + dsparkTapRange + """
 extern "C" __global__ void dspark_kv_step(const float *k, const float *v, kv_element *kc, kv_element *vc,
     const unsigned *step, const unsigned *cursor, unsigned headDim, unsigned kvDim,

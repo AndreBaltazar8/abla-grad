@@ -809,6 +809,8 @@ private val cudaDsparkKernels = [
         [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU], cudaDsparkCommitTapShape),
     CudaKernelSpec("dspark_rope_step", kernelDsparkRopeStep, 128, 128,
         [prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgF, prefillArgU], cudaDsparkRopeStepShape),
+    CudaKernelSpec("dspark_rope_batch", kernelDsparkRopeBatch, 128, 128,
+        [prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgF], cudaDsparkRopeStepShape),
     CudaKernelSpec("dspark_kv_step", kernelDsparkKvStep, 256, 256,
         [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP,
             prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgU], cudaDsparkKvStepShape, 2),

@@ -133,15 +133,8 @@ private fun DsparkDrafter.storeKv(var backend: Backend, layer: int, first: int, 
     val cache = this.cacheOffset(layer)
     val k = this.o("k")
     val v = this.o("v")
-    if (this.maxCtx >= INKLING_HALF_KV_CONTEXT)
-        return backend.launch("kv_store_batch" + this.cacheSuffix(layer), kernelArgs().pointer(this.scratch, k).pointer(this.scratch, v)
-            .pointer(this.kCache, cache).pointer(this.vCache, cache).u32(first).u32(DSPARK_KV_HEADS).u32(DSPARK_HEAD_DIM).u32(this.cacheCtx()).u32(rows), [dsparkKv, rows])
-    for (row in 0 until rows) {
-        val at = row * dsparkKv * 4
-        if (!opKvStore(backend, this.scratch, k + at, this.scratch, v + at, this.kCache, cache, this.vCache, cache,
-            first + row, DSPARK_KV_HEADS, DSPARK_HEAD_DIM, this.cacheCtx())) return false
-    }
-    true
+    backend.launch("kv_store_batch" + this.cacheSuffix(layer), kernelArgs().pointer(this.scratch, k).pointer(this.scratch, v)
+        .pointer(this.kCache, cache).pointer(this.vCache, cache).u32(first).u32(DSPARK_KV_HEADS).u32(DSPARK_HEAD_DIM).u32(this.cacheCtx()).u32(rows), [dsparkKv, rows])
 }
 
 private fun DsparkDrafter.mixTaps(var backend: Backend, taps: DeviceBuffer, offset: int, mix: string, norm: string, rows: int): bool {
@@ -159,9 +152,8 @@ private fun DsparkDrafter.inject(var backend: Backend, taps: DeviceBuffer, sourc
             !this.dense(backend, "$prefix.attn_k_ctx.weight", this.o("norm"), k, rows) ||
             !this.dense(backend, "$prefix.attn_v_ctx.weight", this.o("norm"), this.o("v"), rows) ||
             !this.norm(backend, "$prefix.attn_k_ctx_norm.weight", k, k, DSPARK_HEAD_DIM, rows * DSPARK_KV_HEADS)) return false
-        for (row in 0 until rows) {
-            if (!this.rope(backend, k + row * dsparkKv * 4, DSPARK_KV_HEADS, first + row)) return false
-        }
+        if (!backend.launch("dspark_rope_batch", kernelArgs().pointer(this.scratch, k).u32(first)
+            .u32(DSPARK_KV_HEADS).u32(DSPARK_HEAD_DIM).u32(rows).f32(this.config.ropeBase), [dsparkKv / 2 * rows])) return false
         if (!this.storeKv(backend, layer, first, rows)) return false
     }
     true

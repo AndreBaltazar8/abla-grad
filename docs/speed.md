@@ -243,12 +243,14 @@ prefill with the same IDs, build and chunk took 8.02 s.
 
 The exact tail now replays the existing target step graph with each
 known token. Its final argmax supplies the first completion token.
+DSpark also rotates each group of contiguous prompt K rows with one
+launch and stores the group’s K/V with the existing batched writer.
 
-| Prompt tokens | Baseline (s) | Graph exact tail (s) |
-|---:|---:|---:|
-| 8,192 | 7.32 | 4.24 |
-| 32,768 | 16.44 | 13.45 |
-| 131,072 | 58.11 | 55.93 |
+| Prompt tokens | Baseline (s) | Graph exact tail (s) | Graph + batched DSpark (s) |
+|---:|---:|---:|---:|
+| 8,192 | 7.32 | 4.24 | 3.55 |
+| 32,768 | 16.44 | 13.45 | 10.30 |
+| 131,072 | 58.11 | 55.93 | 53.95 |
 
 These are first streamed output times on the RTX 4090. Each run
 loaded the same Inkling model and Q8_0 DSpark, warmed up on a short
