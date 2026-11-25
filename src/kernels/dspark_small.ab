@@ -1,0 +1,35 @@
+// One thread per output value. The four learned mix weights are already normalized by the converter.
+val kernelDsparkMix = """
+extern "C" __global__ void dspark_mix(const float *taps, const float *alpha, float *out,
+                                      unsigned width, unsigned rows) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width * rows) return;
+    const unsigned row = i / width;
+    const unsigned col = i % width;
+    const float *x = taps + row * 4 * width + col;
+    float value = 0.0f;
+    #pragma unroll
+    for (unsigned j = 0; j < 4; ++j) value = fmaf(alpha[j], x[j * width], value);
+    out[i] = value;
+}
+"""
+
+// One thread per Markov channel. State is the first segment of the next joint input.
+val kernelDsparkMarkov = """
+extern "C" __global__ void dspark_markov(const float *joint, const float *bias,
+                                         float *state, float *latent, unsigned rank) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rank) return;
+    const float gate = 1.0f / (1.0f + expf(-(joint[i] + bias[i])));
+    const float candidate = tanhf(joint[rank + i] + bias[rank + i]);
+    state[i] = fmaf(gate, state[i] - candidate, candidate);
+    latent[i] = tanhf(joint[2 * rank + i] + bias[2 * rank + i]);
+}
+"""
+
+val kernelDsparkZero = """
+extern "C" __global__ void dspark_zero(float *out, unsigned n) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = 0.0f;
+}
+"""

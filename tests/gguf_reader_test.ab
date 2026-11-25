@@ -40,7 +40,7 @@ private fun fixture(variant: string): string {
     b.appendText(if (variant == "bad magic") "GUFF" else "GGUF")
     b.le(if (variant == "bad version") 1 else 3, 4)
     b.le(if (variant == "bad count") -1 else 2, 8)
-    b.le(8, 8)
+    b.le(9, 8)
     b.ggufKey("general.alignment", 4)
     b.le(if (variant == "bad alignment") 33 else 32, 4)
     b.ggufKey(if (variant == "duplicate key") "general.alignment" else "general.architecture", 8)
@@ -52,6 +52,11 @@ private fun fixture(variant: string): string {
     b.le(-1, 8)
     b.ggufKey("boolean", 7)
     b.le(if (variant == "bad bool") 2 else 1, 1)
+    b.ggufKey("bools", 9)
+    b.le(7, 4)
+    b.le(2, 8)
+    b.le(1, 1)
+    b.le(0, 1)
     b.ggufKey("strings", 9)
     b.le(if (variant == "nested array") 9 else 8, 4)
     b.le(if (variant == "bad array count") -1 else 2, 8)
@@ -138,10 +143,12 @@ private fun validateFixture(filePath: string): bool {
         println(ggufLastError())
         return false
     }
-    if (file.version() != 3 || file.tensorCount() != 2 || file.metadataKeys().size != 8 ||
+    if (file.version() != 3 || file.tensorCount() != 2 || file.metadataKeys().size != 9 ||
         !file.has("wide") || file.getInt("wide") != null || file.getInt("signed") != -5 ||
         file.getBool("boolean") != true || file.getString("general.architecture") != "synthetic" ||
         file.getString("ints") != null || file.getFloat("missing") != null) return false
+    val bools = file.getBoolArray("bools") ?? []
+    if (bools.size != 2 || !bools[0] || bools[1] || file.getBoolArray("ints") != null) return false
     val words = file.getStringArray("strings") ?? []
     val numbers = file.getIntArray("ints") ?? []
     val floats = file.getFloatArray("floats") ?? []

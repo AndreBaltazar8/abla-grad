@@ -1,0 +1,66 @@
+import "abla/io"
+import "abla/float"
+import "abla/math"
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "device_test_support.ab"
+import "support.ab"
+
+private fun checkMix(var backend: Backend): bool {
+    val width = 137
+    val rows = 3
+    val taps = testSignal(4 * width * rows, 5)
+    val alpha: array<f32> = [0.07, 0.19, 0.31, 0.43]
+    val x = uploadFloats(backend, taps) ?? return false
+    val w = uploadFloats(backend, alpha) ?? return false
+    val out = backend.allocate(width * rows * 4) ?? return false
+    if (!backend.launch("dspark_mix", kernelArgs().pointer(x).pointer(w).pointer(out).u32(width).u32(rows), [width * rows]))
+        return false
+    val actual = downloadFloats(backend, out, width * rows) ?? return false
+    for (row in 0 until rows) {
+        for (col in 0 until width) {
+            var sum = 0.0
+            for (tap in 0 until 4) sum = sum + f32ToF64(alpha[tap]) * f32ToF64(taps[(row * 4 + tap) * width + col])
+            val index = row * width + col
+            if (!testNear("DSpark tap mix", index, actual[index], sum, 0.00001, 0.000002)) return false
+        }
+    }
+    true
+}
+
+private fun referenceTanh(x: f64): f64 = 2.0 / (1.0 + exp(-2.0 * x)) - 1.0
+
+private fun checkMarkov(var backend: Backend): bool {
+    val rank = 256
+    val projected = testSignal(3 * rank, 2)
+    val bias = testSignal(3 * rank, 7)
+    val a = uploadFloats(backend, projected) ?? return false
+    val b = uploadFloats(backend, bias) ?? return false
+    val state = uploadFloats(backend, testSignal(rank, 9)) ?? return false
+    val latent = backend.allocate(rank * 4) ?? return false
+    if (!backend.launch("dspark_zero", kernelArgs().pointer(state).u32(rank), [rank])) return false
+    for (step in 0 until 2) {
+        if (!backend.launch("dspark_markov", kernelArgs().pointer(a).pointer(b).pointer(state).pointer(latent).u32(rank), [rank]))
+            return false
+    }
+    val states = downloadFloats(backend, state, rank) ?? return false
+    val latents = downloadFloats(backend, latent, rank) ?? return false
+    for (i in 0 until rank) {
+        val gate = 1.0 / (1.0 + exp(-f32ToF64(projected[i]) - f32ToF64(bias[i])))
+        val candidate = referenceTanh(f32ToF64(projected[rank + i]) + f32ToF64(bias[rank + i]))
+        val sample = referenceTanh(f32ToF64(projected[2 * rank + i]) + f32ToF64(bias[2 * rank + i]))
+        if (!testNear("DSpark recurrent state after two steps", i, states[i], candidate * (1.0 - gate * gate), 0.00001, 0.000002) ||
+            !testNear("DSpark latent", i, latents[i], sample, 0.00001, 0.000002)) return false
+    }
+    true
+}
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    if (!checkMix(backend) || !checkMarkov(backend)) {
+        eprintln("DSpark kernel test failed: ${cudaLastError()}")
+        return 1
+    }
+    println("DSpark tap mix and Markov head match the CPU reference")
+    0
+}

@@ -10,6 +10,7 @@ import "../kernels/fused_gate_up_situ.ab"
 import "../kernels/matvec_q8_0.ab"
 import "../kernels/matvec_bf16.ab"
 import "abla/crypto"
+import "abla/bytes"
 import "abla/fs"
 import "abla/process/environment"
 import "../kernels/rmsnorm.ab"
@@ -18,6 +19,7 @@ import "../kernels/attention_decode.ab"
 import "../kernels/prefill_matmul.ab"
 import "../kernels/prefill_small.ab"
 import "../kernels/prefill_attention.ab"
+import "../kernels/dspark_small.ab"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 
@@ -521,9 +523,26 @@ private val cudaPrefillKernels = [
 ]
 
 
+private fun cudaDsparkMixShape(args: KernelArgs, problem: array<int>): bool =
+    args.words[3] > 0 && args.words[4] > 0 && args.words[3] * args.words[4] == problem[0]
+
+private fun cudaDsparkMarkovShape(args: KernelArgs, problem: array<int>): bool = args.words[4] == problem[0]
+private fun cudaDsparkZeroShape(args: KernelArgs, problem: array<int>): bool = args.words[1] == problem[0]
+
+private val cudaDsparkKernels = [
+    CudaKernelSpec("dspark_mix", kernelDsparkMix, 256, 256,
+        [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32], cudaDsparkMixShape),
+    CudaKernelSpec("dspark_markov", kernelDsparkMarkov, 256, 256,
+        [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32],
+        cudaDsparkMarkovShape),
+    CudaKernelSpec("dspark_zero", kernelDsparkZero, 256, 256,
+        [KERNEL_ARG_POINTER, KERNEL_ARG_U32], cudaDsparkZeroShape)
+]
+
 private fun cudaKernelSpec(name: string): CudaKernelSpec? {
     for (spec in cudaKernels) if (spec.name == name) return spec
     for (spec in cudaPrefillKernels) if (spec.name == name) return spec
+    for (spec in cudaDsparkKernels) if (spec.name == name) return spec
     null
 }
 

@@ -1,0 +1,113 @@
+// Inkling 2 Mini's unpadded DSpark export (llama.cpp #32218).
+import "abla/float"
+import "../gguf/reader.ab"
+import "../gguf/quant.ab"
+
+val DSPARK_TAP_WIDTH = 2304
+val DSPARK_TAP_COUNT = 4
+val DSPARK_TAP_BYTES = DSPARK_TAP_WIDTH * DSPARK_TAP_COUNT * 4
+
+val DSPARK_LAYERS = 3
+val DSPARK_BLOCK = 8
+val DSPARK_HEADS = 24
+val DSPARK_KV_HEADS = 8
+val DSPARK_HEAD_DIM = 128
+val DSPARK_FFN = 9216
+val DSPARK_RANK = 256
+val DSPARK_VOCAB = 200058
+val DSPARK_WINDOW = 1025
+
+class DsparkConfig(val maxPositions: int, val rmsEps: f32, val ropeBase: f32, val softcap: f32)
+
+private var dsparkConfigError = ""
+
+fun dsparkConfigLastError(): string = dsparkConfigError
+
+fun dsparkConfig(file: GgufFile): DsparkConfig? {
+    dsparkConfigError = "expected an unpadded Inkling 2 Mini DSpark GGUF"
+    if (file.getString("general.architecture") != "dflash" ||
+        file.getBool("dflash.has_markov_context") != true ||
+        file.getBool("dflash.sample_from_anchor") != false ||
+        file.getBool("dflash.has_confidence_head") != false) return null
+    val keys = ["block_count", "embedding_length", "feed_forward_length", "attention.head_count",
+        "attention.head_count_kv", "attention.key_length", "attention.value_length", "rope.dimension_count",
+        "block_size", "attention.sliding_window"]
+    val values = [DSPARK_LAYERS, DSPARK_TAP_WIDTH, DSPARK_FFN, DSPARK_HEADS, DSPARK_KV_HEADS, DSPARK_HEAD_DIM,
+        DSPARK_HEAD_DIM, DSPARK_HEAD_DIM, DSPARK_BLOCK, DSPARK_WINDOW]
+    for (i in 0 until keys.size) {
+        if (file.getInt("dflash.${keys[i]}") != values[i]) {
+            dsparkConfigError = "unsupported dflash.${keys[i]}"
+            return null
+        }
+    }
+    val taps = file.getIntArray("dflash.target_layers") ?? return null
+    if (taps.size != DSPARK_TAP_COUNT || taps[0] != 5 || taps[1] != 23 || taps[2] != 41 || taps[3] != 48) return null
+    val swa = file.getBoolArray("dflash.attention.sliding_window_pattern") ?? return null
+    if (swa.size != DSPARK_LAYERS || !swa[0] || swa[1] || !swa[2]) return null
+
+    val maxPositions = file.getInt("dflash.context_length") ?? 0
+    val eps = file.getFloat("dflash.attention.layer_norm_rms_epsilon") ?? 0.0
+    val base = file.getFloat("dflash.rope.freq_base") ?? 0.0
+    val cap = file.getFloat("dflash.final_logit_softcapping") ?? 0.0
+    if (maxPositions < DSPARK_BLOCK || maxPositions > 1048576 || !(eps > 0.0 && eps <= 1.0) ||
+        !(base > 1.0 && base <= 1000000000.0) || !(cap > 0.0 && cap <= 1000.0)) return null
+    dsparkConfigError = ""
+    DsparkConfig(maxPositions, f64ToF32(eps), f64ToF32(base), f64ToF32(cap))
+}
+
+private class DsparkTensor(val name: string, val cols: int, val rows: int = 0)
+
+fun dsparkTensorNames(file: GgufFile): array<string>? {
+    val n = DSPARK_TAP_WIDTH
+    val rank = DSPARK_RANK
+    val q = DSPARK_HEADS * DSPARK_HEAD_DIM
+    val kv = DSPARK_KV_HEADS * DSPARK_HEAD_DIM
+    val ff = DSPARK_FFN
+    val tensors = [
+        DsparkTensor("joint_proj.bias", 3 * rank),
+        DsparkTensor("joint_proj.weight", 2 * (rank + n), 3 * rank),
+        DsparkTensor("markov_ctx_mix.weight", DSPARK_TAP_COUNT),
+        DsparkTensor("markov_ctx_norm.weight", n),
+        DsparkTensor("markov_w1.weight", rank, DSPARK_VOCAB),
+        DsparkTensor("markov_w2.bias", DSPARK_VOCAB),
+        DsparkTensor("markov_w2.weight", rank, DSPARK_VOCAB),
+        DsparkTensor("mask_embd.weight", n, DSPARK_BLOCK - 1),
+        DsparkTensor("output_norm.weight", n),
+        DsparkTensor("token_embd_norm.weight", n)
+    ]
+    for (layer in 0 until DSPARK_LAYERS) {
+        val prefix = "blk.$layer"
+        for (part in ["attn_k", "attn_v", "attn_k_ctx", "attn_v_ctx"])
+            tensors.append(DsparkTensor("$prefix.$part.weight", n, kv))
+        for (part in ["attn_k_norm", "attn_q_norm", "attn_k_ctx_norm"])
+            tensors.append(DsparkTensor("$prefix.$part.weight", DSPARK_HEAD_DIM))
+        for (part in ["attn_norm", "ctx_norm", "ffn_norm"])
+            tensors.append(DsparkTensor("$prefix.$part.weight", n))
+        tensors.append(DsparkTensor("$prefix.attn_q.weight", n, q))
+        tensors.append(DsparkTensor("$prefix.attn_output.weight", q, n))
+        tensors.append(DsparkTensor("$prefix.ctx_mix.weight", DSPARK_TAP_COUNT))
+        tensors.append(DsparkTensor("$prefix.ffn_down.weight", ff, n))
+        tensors.append(DsparkTensor("$prefix.ffn_gate.weight", n, ff))
+        tensors.append(DsparkTensor("$prefix.ffn_up.weight", n, ff))
+    }
+    val names: array<string> = []
+    for (expected in tensors) {
+        val tensor = file.tensor(expected.name)
+        val vector = expected.rows == 0
+        dsparkConfigError = "unsupported or missing DSpark tensor ${expected.name}"
+        if (tensor == null || tensor.dims.size != (if (vector) 1 else 2) || tensor.dims[0] != expected.cols) return null
+        if (vector) {
+            if (tensor.type != GGML_TYPE_F32) return null
+        } else {
+            if (tensor.dims[1] != expected.rows ||
+                (tensor.type != GGML_TYPE_F32 && tensor.type != GGML_TYPE_BF16 && tensor.type != GGML_TYPE_Q8_0)) return null
+        }
+        names.append(expected.name)
+    }
+    if (file.tensorCount() != tensors.size) {
+        dsparkConfigError = "DSpark GGUF has unexpected tensors"
+        return null
+    }
+    dsparkConfigError = ""
+    names
+}

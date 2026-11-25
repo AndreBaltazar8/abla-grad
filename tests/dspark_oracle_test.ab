@@ -1,0 +1,83 @@
+// Real-weight integration test. Run under tools/gpu-lock.sh. Oracle taps, when supplied, are raw f32[position][4][2304].
+import "abla/fs"
+import "abla/integer"
+import "abla/io"
+import "abla/process"
+import "abla/text"
+import "abla/unsafe/memory/raw"
+import "../src/backend/cuda.ab"
+import "../src/gguf/reader.ab"
+import "../src/model/dspark.ab"
+import "../src/model/dspark_config.ab"
+import "../src/model/dump.ab"
+import "../src/model/inkling.ab"
+import "../src/model/inkling_config.ab"
+import "kernels/device_test_support.ab"
+
+private fun readIds(path: string): array<int>? {
+    val text = Path(path).readTextResult()
+    if (!text.succeeded) return null
+    val ids: array<int> = []
+    for (line in text.text.split("\n")) {
+        val token = line.trim()
+        if (token != "") ids.append(token.parseInt() ?? return null)
+    }
+    ids
+}
+
+private fun fail(reason: string): int {
+    eprintln(reason)
+    1
+}
+
+trusted fun main: int {
+    val argc = processArgumentCount()
+    if (argc != 4 && argc != 6 && argc != 7)
+        return fail("usage: dspark_oracle_test TARGET DRAFT PROMPT.ids ANCHOR [FIRST SECOND [TAPS.f32]]")
+    val ids = readIds(processArgument(2)) ?? return fail("reading prompt ids failed")
+    val anchor = processArgument(3).parseInt() ?? return fail("invalid anchor")
+    if (ids.size == 0 || anchor < 0 || anchor >= DSPARK_VOCAB) return fail("need committed prompt and an in-vocabulary anchor")
+    for (id in ids) if (id < 0 || id >= DSPARK_VOCAB) return fail("an input ID is outside the vocabulary")
+    val expected = if (argc >= 6) [processArgument(4).parseInt() ?? -1, processArgument(5).parseInt() ?? -1] else []
+    val targetFile = ggufOpen(processArgument(0)) ?? return fail(ggufLastError())
+    val draftFile = ggufOpen(processArgument(1)) ?? return fail(ggufLastError())
+    val config = inklingConfigFrom(targetFile) ?? return fail(inklingConfigLastError())
+    val backend = cudaBackend() ?? return fail(cudaLastError())
+    val maxCtx = ids.size + 16
+    val target = inklingLoad(backend, targetFile, config, maxCtx) ?? return fail(inklingLastError())
+    val draft = dsparkLoad(backend, draftFile, maxCtx) ?? return fail(dsparkLastError())
+    targetFile.close()
+    draftFile.close()
+    if (!target.enableTaps(backend)) return fail(inklingLastError())
+    if (argc == 7) {
+        val taps = readFloatFile(processArgument(6)) ?? return fail("reading oracle taps failed")
+        if (taps.size != ids.size * DSPARK_TAP_COUNT * DSPARK_TAP_WIDTH) return fail("invalid oracle tap size")
+        val buffer = testFloatBuffer(taps)
+        if (!backend.upload(target.taps, 0, nativePointerAddress(buffer.address), buffer.capacity)) return fail(cudaLastError())
+    } else {
+        if (!target.reset(backend)) return fail(inklingLastError())
+        target.useStep = true
+        for (pos in 0 until ids.size)
+            if (!target.forward(backend, ids[pos], pos)) return fail(inklingLastError())
+    }
+
+    if (draft.pushTaps(backend, target.taps, 1, 1)) return fail("accepted a gap in committed taps")
+    if (draft.propose(backend, target, ids.size, anchor).size != 0 || dsparkLastError() == "")
+        return fail("accepted uncommitted context")
+    if (!draft.pushTaps(backend, target.taps, 0, ids.size)) return fail(dsparkLastError())
+    val proposals = draft.propose(backend, target, ids.size, anchor)
+    if (proposals.size != 2) return fail(dsparkLastError() + " (expected two proposals)")
+    println("anchor $anchor, proposals ${proposals[0]} ${proposals[1]}")
+    if (expected.size > 0 && (proposals[0] != expected[0] || proposals[1] != expected[1])) {
+        return fail("expected ${expected[0]} ${expected[1]}")
+    }
+
+    // Rebuild the same committed prefix incrementally; proposed block KV must never enter it.
+    draft.reset()
+    for (pos in 0 until ids.size)
+        if (!draft.pushTaps(backend, target.taps, pos, 1)) return fail(dsparkLastError())
+    val incremental = draft.propose(backend, target, ids.size, anchor)
+    if (incremental.size != 2 || incremental[0] != proposals[0] || incremental[1] != proposals[1])
+        return fail("batch and incremental tap injection disagree")
+    0
+}

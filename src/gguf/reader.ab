@@ -262,6 +262,16 @@ resource class GgufFile(
         out
     }
 
+    // Copies a boolean array from the mapping, or returns null for another metadata type.
+    fun getBoolArray(key: string): array<bool>? {
+        val entry = this.ggufField(key)
+        if (entry == null || entry.kind != 9 || entry.itemKind != 7) return null
+        val cursor = this.ggufAt(entry)
+        val out: array<bool> = []
+        for (i in 0 until entry.count) out.append(cursor.bits(1) == 1)
+        out
+    }
+
     // Returns the floating-point array widened to F64.
     fun getFloatArray(key: string): array<f64>? {
         val entry = this.ggufField(key)
