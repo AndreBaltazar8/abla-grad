@@ -397,6 +397,9 @@ private val cudaArgsAttentionTc = [prefillArgP, prefillArgP, prefillArgP, prefil
 private fun cudaPrefillAttentionTcShape(args: KernelArgs, problem: array<int>): bool =
     args.words[5] == problem[0] && args.words[6] > 0 && args.words[5] % args.words[6] == 0 && args.words[12] > 0 && problem[1] == (args.words[12] + 31) / 32 &&
         args.words[0] % 16 == 0 && args.words[1] % 16 == 0 && args.words[2] % 16 == 0
+private fun cudaPrefillAttentionGqa3Shape(args: KernelArgs, problem: array<int>): bool =
+    cudaPrefillAttentionTcShape(args, problem) && args.words[5] == 3 * args.words[6] && args.words[7] == 0
+
 private val cudaArgsMatmulSplit = [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgU]
 private val cudaArgsSumSlices = [prefillArgP, prefillArgU, prefillArgU]
 private fun cudaPrefillSplitShape(args: KernelArgs, problem: array<int>, blockElements: int): bool =
@@ -735,6 +738,8 @@ private val cudaPrefillKernels = [
     CudaKernelSpec("matmul_q5_k_grouped32", kernelPrefillMatmul, 128, 128, cudaArgsGrouped, cudaPrefillGroupedQ5Shape, 2, 4),
     CudaKernelSpec("rel_table_rows", kernelPrefillRelTable, 256, 256, cudaArgsRelTableRows, cudaPrefillRelTableRowsShape, 2),
     CudaKernelSpec("attention_prefill_tc", kernelPrefillAttentionTc, 1, 64, cudaArgsAttentionTc, cudaPrefillAttentionTcShape, 2),
+    CudaKernelSpec("attention_prefill_tc_q8_gqa3", "#define INKLING_Q8_KV\n#define INKLING_PREFILL_GQA3\n#define attention_prefill_tc attention_prefill_tc_q8_gqa3\n" +
+        kernelPrefillAttentionTc, 3, 192, cudaArgsAttentionTc, cudaPrefillAttentionGqa3Shape, 2),
     CudaKernelSpec("matmul_f32_split", kernelPrefillMatmul, 128, 256, cudaArgsMatmulSplit, cudaPrefillSplitF32Shape, 2),
     CudaKernelSpec("matmul_bf16_split", kernelPrefillMatmul, 128, 256, cudaArgsMatmulSplit, cudaPrefillSplitF32Shape, 2),
     CudaKernelSpec("sum_slices", kernelPrefillMatmul, 256, 256, cudaArgsSumSlices, cudaPrefillSumSlicesShape),

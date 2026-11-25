@@ -1,6 +1,6 @@
 import "kv_layout.ab"
-// Attention for a chunk of tokens on tensor cores (FlashAttention-2 style; docs/prefill.md). One block = one head and 32 consecutive tokens (two warps of 16
-// rows). Keys are processed 32 at a time: K and V tiles go f32 -> f16 into shared memory, S = Q K^T (mma m16n8k16, f16 in, f32 accumulate; Q and K are split into an f16 high and low part and the product is Qh Kh + Qh Kl + Ql Kh, because logits reach 40 and one f16 rounding of Q and K would already move them by 0.02), then
+// Tensor-core attention for a chunk of tokens (docs/prefill.md). Two warps process 32 consecutive tokens for each head.
+// The global Q8 variant can stage K and V once per group of three query heads. Keys are processed 32 at a time: K and V tiles go f32 -> f16 into shared memory, S = Q K^T (mma m16n8k16, f16 in, f32 accumulate; Q and K are split into an f16 high and low part and the product is Qh Kh + Qh Kl + Ql Kh, because logits reach 40 and one f16 rounding of Q and K would already move them by 0.02), then
 // logit = S * scale + table[token][head][min(pos - key, extent)] (the relative-position bias with the sink folded in), causal and window masks, online softmax
 // that starts from the sink's zero logit (running max 0, running sum 1), P (f16) times V accumulates the output. Head dimension 128.
 // problem [nHead, ceil(tokens / 32)]; q, out [token][head][128]; table [token][head][extent + 1]; caches [kvHead][maxCtx][128] (f32).
@@ -46,7 +46,13 @@ static __device__ __forceinline__ void at_mma(float (&c)[4], const unsigned (&a)
 
 enum { AT_KEYS = 32, AT_DIM = 128, AT_PITCH = 136, AT_WARPS = 2 };
 
-extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc(
+#ifdef INKLING_PREFILL_GQA3
+#define AT_BLOCK_THREADS 192
+#else
+#define AT_BLOCK_THREADS 64
+#endif
+
+extern "C" __global__ void __launch_bounds__(AT_BLOCK_THREADS) attention_prefill_tc(
     const float *q, const kv_element *kCache, const kv_element *vCache, const float *table, float *out, unsigned nHead, unsigned nKvHead,
     unsigned window, const unsigned *posPtr, unsigned extent, unsigned maxCtx, float scale, unsigned tokens) {
     const unsigned firstPos = *posPtr;
@@ -56,12 +62,21 @@ extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc(
     const unsigned tid = threadIdx.x;
     const unsigned lane = tid & 31u;
     const unsigned warp = tid >> 5;
+#ifdef INKLING_PREFILL_GQA3
+    // Two query warps per head. All three heads in this block read the
+    // same K/V head and stage each tile together.
+    const unsigned kvHead = blockIdx.x;
+    const unsigned head = kvHead * 3 + warp / AT_WARPS;
+    const unsigned queryWarp = warp % AT_WARPS;
+#else
     const unsigned head = blockIdx.x;
     const unsigned kvHead = head / (nHead / nKvHead);
+    const unsigned queryWarp = warp;
+#endif
     const unsigned tileFirst = blockIdx.y * (AT_WARPS * 16);
     const unsigned group = lane >> 2;
     const unsigned quad = lane & 3u;
-    const unsigned rowA = tileFirst + warp * 16 + group;
+    const unsigned rowA = tileFirst + queryWarp * 16 + group;
     const unsigned rowB = rowA + 8;
     const bool validA = rowA < tokens;
     const bool validB = rowB < tokens;
@@ -105,7 +120,7 @@ extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc(
     for (unsigned j0 = keyFirst; j0 <= posLast; j0 += AT_KEYS) {
         __syncthreads();
         // load the K and V tiles (rows beyond the last key are zero)
-        for (unsigned idx = tid; idx < AT_KEYS * (AT_DIM / 4); idx += 64) {
+        for (unsigned idx = tid; idx < AT_KEYS * (AT_DIM / 4); idx += AT_BLOCK_THREADS) {
             unsigned row = idx >> 5;
             unsigned c4 = (idx & 31u) * 4;
             unsigned key = j0 + row;
@@ -219,6 +234,7 @@ extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc(
         if (validB) *reinterpret_cast<float2 *>(out + (static_cast<unsigned long long>(rowB) * nHead + head) * AT_DIM + dim) = make_float2(o[dt][2] * invB, o[dt][3] * invB);
     }
 }
+#undef AT_BLOCK_THREADS
 extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc_split(
     const float *q, const kv_element *kCache, const kv_element *vCache, const float *table, float *out, unsigned nHead, unsigned nKvHead,
     unsigned window, const unsigned *posPtr, unsigned extent, unsigned maxCtx, float scale, unsigned tokens, unsigned splits, float *partO, float *partML) {

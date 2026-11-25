@@ -169,10 +169,37 @@ From the first measured embedding launch through the final kernel,
 58.35 of 58.90 s were GPU-active. The GPU timeline had
 0.55 s of gaps, including 0.01 s immediately before
 embedding launches at chunk boundaries after staging copies. CUDA
-copies accounted for 0.00 s.
+copies accounted for 0.20 ms.
 
 Raw samples, token IDs, reference driver and Nsight artifacts are in
 `~/src/abla-grad-oracle/prefill-1256/`.
+
+### Shared K/V staging for 128k global prefill
+
+On a full 512-token prefill chunk, one CTA stages each global Q8 K/V
+tile for all three query heads in its group. Each head still uses
+two warps for its QK, softmax and value product. Chunks below 256 tokens and
+other head ratios use the existing per-head launch.
+
+Matched screen on `56d0e48` with the same exact prompts and harness above.
+
+| Prompt tokens | Baseline pp (tok/s) | Shared-K/V pp (tok/s) |
+|---:|---:|---:|
+| 8,192 | 4620.34 | 4632.13 |
+| 32,768 | 4036.87 | 4037.89 |
+| 131,072 | 2252.38 | 2573.48 |
+
+| Prompt tokens | Baseline TTFT (s) | Shared-K/V TTFT (s) | Prefill chunks, baseline / candidate |
+|---:|---:|---:|---:|
+| 32,768 | 28.60 | 28.81 | 128 / 128 |
+| 131,072 | 66.93 | 61.00 | 512 / 512 |
+
+At 128k, prompt throughput rose 14.26% and
+TTFT fell 8.86%.
+Both lengths used a warmed server, zero prompt reuse and
+identical streamed outputs across the two builds. All 1,624
+forced-Q8 prompt 05 logit rows matched byte for byte. A paired
+640-token forced-Q8 check on the later int8 GEMM base also matched.
 
 ## Decode and speculation across cache depths
 

@@ -536,7 +536,9 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
             ok = ok && backend.launch("attention_prefill_merge", kernelArgs().pointer(ws.buffer, ws.o("attPartO")).pointer(ws.buffer, ws.o("attPartML"))
                 .pointer(ws.buffer, att + start * qDim * 4).u32(c.nHead).u32(count).u32(8), [c.nHead, count])
         } else {
-            ok = ok && backend.launch("attention_prefill_tc" + suffix, kernelArgs().pointer(ws.buffer, q + start * qDim * 4).pointer(this.kCache, cache)
+            val kernel = if (suffix == "_q8" && c.nHead == 3 * c.nHeadKv && count >= 256)
+                "attention_prefill_tc_q8_gqa3" else "attention_prefill_tc" + suffix
+            ok = ok && backend.launch(kernel, kernelArgs().pointer(ws.buffer, q + start * qDim * 4).pointer(this.kCache, cache)
                 .pointer(this.vCache, cache).pointer(ws.buffer, table + start * c.nHead * (extent + 1) * 4).pointer(ws.buffer, att + start * qDim * 4).u32(c.nHead).u32(c.nHeadKv)
                 .u32(if (isSwa) c.nSwa else 0).pointer(posBuf, segmentPosOffset).u32(extent).u32(this.maxCtx).f32(scale).u32(count), [c.nHead, (count + 31) / 32])
         }
