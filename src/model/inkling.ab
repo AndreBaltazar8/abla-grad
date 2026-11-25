@@ -377,7 +377,7 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
         if (this.splitAttention) {
             ok = ok && opAttentionRelSplitStep(backend, this.scratch, q, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
                 this.scratch, table, this.scratch, this.so("attPart"), this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent,
-                this.maxCtx, scale, this.attentionSplits)
+                this.maxCtx, scale, this.attentionSplits, this.scratch, this.so("gate"), true)
         } else {
             ok = ok && opAttentionDecodeRelStep(backend, this.scratch, q, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
                 this.scratch, table, this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent, this.maxCtx, scale)
@@ -389,7 +389,8 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
         ok = ok && opAttentionDecodeRel(backend, this.scratch, q, this.kCache, visit * layerCacheBytes, this.vCache, visit * layerCacheBytes,
             this.scratch, table, this.scratch, att, c.nHead, c.nHeadKv, c.headDim, first, pos, pos, extent, this.maxCtx, scale)
     }
-    ok = ok && opSigmoidMul(backend, this.scratch, att, this.scratch, this.so("gate"), this.scratch, att, qDim)
+    // the split attention already applied the output gate (sigmoid_mul fused into its merge)
+    if (!(this.useStep && this.splitAttention)) ok = ok && opSigmoidMul(backend, this.scratch, att, this.scratch, this.so("gate"), this.scratch, att, qDim)
     val oproj = this.so("oproj")
     ok = ok && this.matvec(backend, "blk.$ip.attn_output.weight", att, oproj)
     val postConv = this.w("blk.$ip.attn_post_conv.weight")

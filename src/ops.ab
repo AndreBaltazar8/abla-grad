@@ -303,7 +303,8 @@ fun opStepRecord(var backend: Backend, step: DeviceBuffer): bool =
 fun opAttentionRelSplitStep(
     var backend: Backend, q: DeviceBuffer, qOffset: int, kCache: DeviceBuffer, kCacheOffset: int, vCache: DeviceBuffer, vCacheOffset: int,
     table: DeviceBuffer, tableOffset: int, part: DeviceBuffer, partOffset: int, out: DeviceBuffer, outOffset: int, step: DeviceBuffer,
-    nHead: int, nKvHead: int, headDim: int, window: int, extent: int, maxCtx: int, scale: f32, nSplit: int
+    nHead: int, nKvHead: int, headDim: int, window: int, extent: int, maxCtx: int, scale: f32, nSplit: int,
+    gate: DeviceBuffer, gateOffset: int, useGate: bool
 ): bool {
     val ok = backend.launch(
         "attention_rel_split_step",
@@ -311,6 +312,13 @@ fun opAttentionRelSplitStep(
             .pointer(part, partOffset).pointer(step, 0).u32(nHead).u32(nKvHead).u32(headDim).u32(window).u32(extent).u32(maxCtx).f32(scale).u32(nSplit),
         [nHead * nSplit]
     )
+    if (useGate) {
+        // the merge applies the attention output gate: out = merged * sigmoid(gate)
+        return ok && backend.launch(
+            "attention_rel_merge_gated",
+            kernelArgs().pointer(part, partOffset).pointer(out, outOffset).pointer(gate, gateOffset).u32(nHead).u32(headDim).u32(nSplit), [nHead]
+        )
+    }
     ok && backend.launch(
         "attention_rel_merge", kernelArgs().pointer(part, partOffset).pointer(out, outOffset).u32(nHead).u32(headDim).u32(nSplit), [nHead]
     )

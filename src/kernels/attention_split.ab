@@ -89,7 +89,7 @@ extern "C" __global__ void attention_rel_split_step(
     }
 }
 
-extern "C" __global__ void attention_rel_merge(const float *part, float *out, unsigned nHead, unsigned dim, unsigned nSplit) {
+static __device__ __forceinline__ void rel_merge(const float *part, float *out, const float *gate, unsigned dim, unsigned nSplit) {
     const unsigned head = blockIdx.x;
     __shared__ float weights[64];
     __shared__ float denominator;
@@ -113,7 +113,19 @@ extern "C" __global__ void attention_rel_merge(const float *part, float *out, un
     if (threadIdx.x < dim) {
         float weighted = 0.0f;
         for (unsigned s = 0; s < nSplit; ++s) weighted = fmaf(weights[s], base[s * (dim + 2) + threadIdx.x], weighted);
-        out[static_cast<unsigned long long>(head) * dim + threadIdx.x] = weighted / denominator;
+        const unsigned long long at = static_cast<unsigned long long>(head) * dim + threadIdx.x;
+        float value = weighted / denominator;
+        // the output gate of the attention layer (value * sigmoid(gate)), when given
+        if (gate != nullptr) value = value / (1.0f + expf(-gate[at]));
+        out[at] = value;
     }
+}
+
+extern "C" __global__ void attention_rel_merge(const float *part, float *out, unsigned nHead, unsigned dim, unsigned nSplit) {
+    rel_merge(part, out, nullptr, dim, nSplit);
+}
+
+extern "C" __global__ void attention_rel_merge_gated(const float *part, float *out, const float *gate, unsigned nHead, unsigned dim, unsigned nSplit) {
+    rel_merge(part, out, gate, dim, nSplit);
 }
 """
