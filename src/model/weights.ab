@@ -2,6 +2,7 @@
 import "../backend/backend.ab"
 import "../gguf/reader.ab"
 import "../gguf/quant.ab"
+import "abla/text"
 
 private var weightsError = ""
 
@@ -22,6 +23,14 @@ fun weightKind(type: int): string = when (type) {
 // A tensor in the arena: byte offset, stored size, ggml type, and shape: `cols` = elements per row (dims[0]), `rows` = the product of the other dims.
 class WeightRef(val offset: int, val bytes: int, val type: int, val rows: int, val cols: int)
 
+// Debug/experiment: store the attention projections (Q8_0 in the GGUF) as Q6_K, converted on the device at load (docs/speed.md; decode-bench --q6k).
+var weightsRequantQ6K = false
+
+private fun requantTarget(name: string, info: GgufTensorInfo): bool =
+    weightsRequantQ6K && info.type == GGML_TYPE_Q8_0 && info.dims.size == 2 && info.dims[0] % 256 == 0 &&
+        (name.endsWith(".attn_q.weight") || name.endsWith(".attn_k.weight") || name.endsWith(".attn_v.weight") ||
+         name.endsWith(".attn_output.weight") || name.endsWith(".attn_gate.weight"))
+
 class ArenaPlan(val refs: Map<string, WeightRef>, val names: array<string>, val total: int)
 
 fun alignUp(value: int): int = (value + 255) / 256 * 256
@@ -39,8 +48,10 @@ fun planWeights(file: GgufFile, names: array<string>): ArenaPlan? {
         }
         var rows = 1
         for (index in 1 until info.dims.size) rows = rows * info.dims[index]
-        refs.set(name, WeightRef(at, info.bytes, info.type, rows, info.dims[0]))
-        at = at + alignUp(info.bytes)
+        val requant = requantTarget(name, info)
+        val stored = if (requant) rows * (info.dims[0] / 256) * 210 else info.bytes
+        refs.set(name, WeightRef(at, stored, if (requant) GGML_TYPE_Q6_K else info.type, rows, info.dims[0]))
+        at = at + alignUp(stored)
     }
     ArenaPlan(refs, names, at)
 }
@@ -59,7 +70,21 @@ fun uploadWeights(var backend: Backend, file: GgufFile, plan: ArenaPlan): Device
         val ref = plan.refs.get(name)
         if (info == null || ref == null) return null
         val address = file.tensorAddress(info)
-        if (address == 0 || !backend.upload(arena, ref.offset, address, info.bytes)) {
+        if (address == 0) {
+            weightsError = "uploading $name failed"
+            return null
+        }
+        if (ref.type == GGML_TYPE_Q6_K && info.type == GGML_TYPE_Q8_0) {
+            // re-quantize to Q6_K on the device: the Q8_0 bytes go to a temporary buffer, a kernel writes the Q6_K blocks into the arena
+            val temp = backend.allocate(info.bytes)
+            val blocksPerRow = ref.cols / 256
+            if (temp == null || !backend.upload(temp, 0, address, info.bytes) ||
+                !backend.launch("requant_q8_to_q6k", kernelArgs().pointer(temp, 0).pointer(arena, ref.offset).u32(ref.rows).u32(blocksPerRow), [ref.rows * blocksPerRow]) ||
+                !backend.synchronize()) {
+                weightsError = "re-quantizing $name failed"
+                return null
+            }
+        } else if (!backend.upload(arena, ref.offset, address, info.bytes)) {
             weightsError = "uploading $name failed"
             return null
         }

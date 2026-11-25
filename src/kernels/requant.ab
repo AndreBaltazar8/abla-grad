@@ -1,0 +1,116 @@
+// Q8_0 -> Q6_K re-quantization on the device (ablac-60-2): run once at load for the attention projections so decode reads 23% fewer bytes. A port of ggml's
+// quantize_row_q6_K_ref (make_qx_quants with the rmse search) applied to the dequantized Q8_0 values; one thread per Q6_K block (256 values).
+// Q8_0 block: f16 scale + 32 int8 (34 bytes); Q6_K block: ql[128], qh[64], scales[16] (int8), f16 d (210 bytes).
+val kernelRequantQ8ToQ6K = """
+static __device__ __forceinline__ int nearestInt(float v) { return __float2int_rn(v); }
+static __device__ __forceinline__ float halfToFloat(unsigned short bits) { float v; asm("cvt.f32.f16 %0, %1;" : "=f"(v) : "h"(bits)); return v; }
+static __device__ __forceinline__ unsigned short floatToHalf(float v) { unsigned short bits; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(bits) : "f"(v)); return bits; }
+
+// Fills L[0..15] (values 0..63) for 16 floats and returns the sub-block scale (ggml make_qx_quants, nmax 32, rmse_type 1).
+static __device__ float makeQx(const float *x, unsigned char *L) {
+    const int nmax = 32;
+    float mx = 0.0f, amax = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+        float ax = fabsf(x[i]);
+        if (ax > amax) { amax = ax; mx = x[i]; }
+    }
+    if (amax < 1e-30f) {
+        for (int i = 0; i < 16; ++i) L[i] = 0;
+        return 0.0f;
+    }
+    float iscale = -nmax / mx;
+    float sumlx = 0.0f, suml2 = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+        int l = nearestInt(iscale * x[i]);
+        l = max(-nmax, min(nmax - 1, l));
+        L[i] = (unsigned char)(l + nmax);
+        float w = x[i] * x[i];
+        sumlx += w * x[i] * l;
+        suml2 += w * l * l;
+    }
+    float scale = suml2 != 0.0f ? sumlx / suml2 : 0.0f;
+    float best = scale * sumlx;
+    for (int is = -9; is <= 9; ++is) {
+        if (is == 0) continue;
+        iscale = -(nmax + 0.1f * is) / mx;
+        sumlx = 0.0f; suml2 = 0.0f;
+        for (int i = 0; i < 16; ++i) {
+            int l = nearestInt(iscale * x[i]);
+            l = max(-nmax, min(nmax - 1, l));
+            float w = x[i] * x[i];
+            sumlx += w * x[i] * l;
+            suml2 += w * l * l;
+        }
+        if (suml2 > 0.0f && sumlx * sumlx > best * suml2) {
+            for (int i = 0; i < 16; ++i) {
+                int l = nearestInt(iscale * x[i]);
+                L[i] = (unsigned char)(nmax + max(-nmax, min(nmax - 1, l)));
+            }
+            scale = sumlx / suml2;
+            best = scale * sumlx;
+        }
+    }
+    return scale;
+}
+
+extern "C" __global__ void requant_q8_to_q6k(const unsigned char *src, unsigned char *dst, unsigned rows, unsigned blocksPerRow) {
+    unsigned long long blockId = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (blockId >= (unsigned long long)rows * blocksPerRow) return;
+    unsigned long long row = blockId / blocksPerRow;
+    unsigned long long b = blockId % blocksPerRow;
+    float x[256];
+    const unsigned char *q8 = src + row * (unsigned long long)blocksPerRow * 8 * 34 + b * 8 * 34;
+    for (int j = 0; j < 8; ++j) {
+        unsigned short hbits = (unsigned short)q8[j * 34] | ((unsigned short)q8[j * 34 + 1] << 8);
+        float d = halfToFloat(hbits);
+        for (int i = 0; i < 32; ++i) x[j * 32 + i] = d * (float)(signed char)q8[j * 34 + 2 + i];
+    }
+    unsigned char L[256];
+    float scales[16];
+    float maxScale = 0.0f, maxAbs = 0.0f;
+    for (int ib = 0; ib < 16; ++ib) {
+        float scale = makeQx(x + 16 * ib, L + 16 * ib);
+        scales[ib] = scale;
+        float as = fabsf(scale);
+        if (as > maxAbs) { maxAbs = as; maxScale = scale; }
+    }
+    unsigned char *out = dst + blockId * 210;
+    unsigned char *ql = out, *qh = out + 128;
+    signed char *sc = (signed char *)(out + 192);
+    if (maxAbs < 1e-30f) {
+        for (int i = 0; i < 208; ++i) out[i] = 0;
+        out[208] = 0; out[209] = 0;
+        return;
+    }
+    float iscale = -128.0f / maxScale;
+    float dBlock = 1.0f / iscale;
+    unsigned short dBits = floatToHalf(dBlock);
+    float d = halfToFloat(dBits);
+    for (int ib = 0; ib < 16; ++ib) {
+        int s = nearestInt(iscale * scales[ib]);
+        s = min(127, s);
+        sc[ib] = (signed char)s;
+    }
+    for (int ib = 0; ib < 16; ++ib) {
+        float dd = d * sc[ib];
+        if (dd == 0.0f) continue;
+        for (int j = 0; j < 16; ++j) {
+            int l = nearestInt(x[16 * ib + j] / dd);
+            l = max(-32, min(31, l));
+            L[16 * ib + j] = (unsigned char)(l + 32);
+        }
+    }
+    for (int j = 0; j < 256; j += 128) {
+        for (int l = 0; l < 32; ++l) {
+            unsigned char q1 = L[j + l] & 0xF, q2 = L[j + l + 32] & 0xF, q3 = L[j + l + 64] & 0xF, q4 = L[j + l + 96] & 0xF;
+            ql[l + 0] = q1 | (q3 << 4);
+            ql[l + 32] = q2 | (q4 << 4);
+            qh[l] = (L[j + l] >> 4) | ((L[j + l + 32] >> 4) << 2) | ((L[j + l + 64] >> 4) << 4) | ((L[j + l + 96] >> 4) << 6);
+        }
+        ql += 64;
+        qh += 32;
+    }
+    out[208] = (unsigned char)(dBits & 0xff);
+    out[209] = (unsigned char)(dBits >> 8);
+}
+"""

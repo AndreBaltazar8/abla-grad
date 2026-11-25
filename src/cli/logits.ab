@@ -11,6 +11,7 @@ import "../model/llama.ab"
 import "../model/llama_config.ab"
 import "../model/inkling.ab"
 import "../model/inkling_config.ab"
+import "../model/weights.ab"
 import "../compare/grdl.ab"
 import "../model/dump.ab"
 import "abla/float"
@@ -65,6 +66,9 @@ fun cmdLogits(args: array<string>): int {
             index = index + 1
         } else if (args[index] == "--no-fuse") {
             noFuse = true
+            index = index + 1
+        } else if (args[index] == "--q6k") {
+            weightsRequantQ6K = true
             index = index + 1
         } else if (args[index] == "--step") {
             useStep = true

@@ -1,0 +1,63 @@
+// requant_q8_to_q6k: a Q8_0 matrix re-quantized to Q6_K must give (nearly) the same matvec: relative error of the output vector below 2% (uniform random weights quantized to 6 bits give ~1.4%).
+import "abla/io"
+import "abla/float"
+import "abla/float/text"
+import "abla/math"
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "support.ab"
+
+fun check(var backend: Backend, rows: int, cols: int): bool {
+    val blocks = cols / 32
+    val bytes: array<int> = []
+    var state = 12345
+    for (r in 0 until rows) {
+        for (b in 0 until blocks) {
+            state = (state * 1103515245 + 12345) % 2147483648
+            val scaleBits = 0x2400 + (state / 65536) % 0x200
+            bytes.append(scaleBits % 256)
+            bytes.append(scaleBits / 256)
+            for (i in 0 until 32) {
+                state = (state * 1103515245 + 12345) % 2147483648
+                val v = (state / 65536) % 255 - 127
+                bytes.append(if (v < 0) v + 256 else v)
+            }
+        }
+    }
+    val words: array<int> = []
+    var i = 0
+    while (i < bytes.size) {
+        words.append(bytes[i] + bytes[i + 1] * 256 + bytes[i + 2] * 65536 + bytes[i + 3] * 16777216)
+        i = i + 4
+    }
+    val w8 = uploadWords(backend, words) ?? return false
+    val x = uploadFloats(backend, testSignal(cols, 5)) ?? return false
+    val y8 = uploadFloats(backend, testSignal(rows, 6)) ?? return false
+    val y6 = uploadFloats(backend, testSignal(rows, 7)) ?? return false
+    val w6 = backend.allocate(rows * (cols / 256) * 210 + 16) ?? return false
+    if (!backend.launch("matvec_q8_0", kernelArgs().pointer(w8).pointer(x).pointer(y8).u32(rows).u32(cols), [rows])) return false
+    if (!backend.launch("requant_q8_to_q6k", kernelArgs().pointer(w8).pointer(w6).u32(rows).u32(cols / 256), [rows * (cols / 256)])) return false
+    if (!backend.launch("matvec_q6_k", kernelArgs().pointer(w6).pointer(x).pointer(y6).u32(rows).u32(cols), [rows])) return false
+    val a = downloadFloats(backend, y8, rows) ?? return false
+    val b = downloadFloats(backend, y6, rows) ?? return false
+    var num = 0.0
+    var den = 0.0
+    for (r in 0 until rows) {
+        val d = f32ToF64(a[r]) - f32ToF64(b[r])
+        num = num + d * d
+        den = den + f32ToF64(a[r]) * f32ToF64(a[r])
+    }
+    val rel = sqrt(num / den)
+    println("requant $rows x $cols: relative error $rel")
+    rel < 0.02
+}
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    if (!check(backend, 8, 512) || !check(backend, 64, 2304)) {
+        println("requant test FAILED (${cudaLastError()})")
+        return 1
+    }
+    println("requant test passed")
+    0
+}
