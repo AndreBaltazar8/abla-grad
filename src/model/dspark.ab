@@ -44,7 +44,8 @@ resource class DsparkDrafter(
     val scratch: DeviceBuffer,
     val kCache: DeviceBuffer,
     val vCache: DeviceBuffer,
-    var committed: int = 0
+    var committed: int = 0,
+    var stepPrepared: bool = false
 )
 
 /** Uploads the unpadded drafter. maxCtx counts target positions and maxProposals is one or two. */
@@ -79,6 +80,7 @@ fun dsparkLoad(var backend: Backend, file: GgufFile, maxCtx: int, maxProposals: 
 /** Makes the existing scratch and cache available for a new independent sequence. */
 fun DsparkDrafter.reset(): void {
     this.committed = 0
+    this.stepPrepared = false
 }
 
 private fun DsparkDrafter.o(name: string): int = this.layout.offsets.get(name) ?? 0
@@ -185,7 +187,37 @@ trusted fun DsparkDrafter.prepareStep(var backend: Backend): bool {
     val host = nativeByteBuffer(8)
     val address = nativePointerAddress(host.address)
     ablaUnsafeStoreU32(nativePointerFromAddress(address), this.committed)
-    backend.upload(this.scratch, this.o("cursor"), address, 4)
+    if (!backend.upload(this.scratch, this.o("cursor"), address, 4)) {
+        dsparkError = "uploading the DSpark cursor failed"
+        return false
+    }
+    this.stepPrepared = true
+    true
+}
+
+/** Injects the missing committed taps through position p (exclusive) and seeds the next replay. Wait for in-flight replays first. */
+trusted fun DsparkDrafter.resume(var backend: Backend, taps: DeviceBuffer, p: int): bool {
+    dsparkError = ""
+    if (p < 0 || p > this.maxCtx || p > taps.bytes / DSPARK_TAP_BYTES) {
+        dsparkError = "the DSpark resume position is outside the tap buffer or drafter cache"
+        return false
+    }
+    var first = this.committed
+    if (this.stepPrepared) {
+        val host = nativeByteBuffer(8)
+        val address = nativePointerAddress(host.address)
+        if (!backend.download(this.scratch, this.o("cursor"), address, 4)) {
+            dsparkError = "downloading the DSpark cursor failed"
+            return false
+        }
+        first = int(ablaUnsafeLoadU32(nativePointerFromAddress(address)))
+    }
+    if (first > p) {
+        dsparkError = "cannot resume DSpark behind its committed prefix (cursor $first, position $p)"
+        return false
+    }
+    this.committed = first
+    this.pushTaps(backend, taps, first, p - first) && this.prepareStep(backend)
 }
 
 private fun DsparkDrafter.mixStep(var backend: Backend, taps: DeviceBuffer, step: DeviceBuffer,

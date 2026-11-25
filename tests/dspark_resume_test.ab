@@ -1,0 +1,95 @@
+// Real-weight test of switching from a speculative graph to plain decode and back.
+import "abla/fs"
+import "abla/integer"
+import "abla/io"
+import "abla/process"
+import "abla/text"
+import "../src/backend/backend.ab"
+import "../src/backend/cuda.ab"
+import "../src/gguf/reader.ab"
+import "../src/model/dspark.ab"
+import "../src/model/inkling.ab"
+import "../src/model/inkling_config.ab"
+import "../src/model/inkling_prefill.ab"
+import "../src/ops.ab"
+import "kernels/support.ab"
+
+private fun fail(reason: string): int {
+    eprintln("dspark resume: $reason")
+    1
+}
+
+private fun readIds(path: string): array<int>? {
+    val text = Path(path).readTextResult()
+    if (!text.succeeded) return null
+    val ids: array<int> = []
+    for (line in text.text.split("\n")) {
+        val token = line.trim()
+        if (token != "") ids.append(token.parseInt() ?? return null)
+    }
+    ids
+}
+
+private fun captureCycle(var backend: Backend, target: InklingModel, drafter: DsparkDrafter,
+    ws: PrefillWorkspace, spec: DeviceBuffer): Recording? {
+    if (!backend.beginRecording()) return null
+    val ok = opSpecBegin(backend, target.step, spec) &&
+        drafter.pushTapsStep(backend, target.taps, target.step) &&
+        drafter.proposeStep(backend, target, target.step, spec) &&
+        target.verifyStep(backend, ws, spec, target.step) &&
+        opSpecAccept(backend, target.step, spec, target.maxCtx) &&
+        target.commitStep(backend, ws, target.step)
+    val recording = backend.endRecording()
+    if (!ok) return null
+    return move(recording)
+}
+
+fun main: int {
+    if (processArgumentCount() != 3) return fail("usage: dspark_resume_test TARGET DRAFT PROMPT.ids")
+    val ids = readIds(processArgument(2)) ?? return fail("reading the prompt IDs failed")
+    if (ids.size == 0) return fail("empty prompt")
+    val targetFile = ggufOpen(processArgument(0)) ?? return fail(ggufLastError())
+    val draftFile = ggufOpen(processArgument(1)) ?? return fail(ggufLastError())
+    val config = inklingConfigFrom(targetFile) ?? return fail(inklingConfigLastError())
+    var backend = cudaBackend() ?? return fail(cudaLastError())
+    val ctx = ids.size + 48
+    var target = inklingLoad(backend, targetFile, config, ctx) ?? return fail(inklingLastError())
+    val drafter = dsparkLoad(backend, draftFile, ctx) ?? return fail(dsparkLastError())
+    val reference = dsparkLoad(backend, draftFile, ctx) ?? return fail(dsparkLastError())
+    val workspace = prefillWorkspace(backend, config, 3, true, 3) ?? return fail(inklingPrefillLastError())
+    val spec = uploadWords(backend, [0, 0, 0, 0, 0, 0, 0, 0]) ?? return fail(cudaLastError())
+    if (!target.reset(backend) || !target.enableTaps(backend)) return fail(inklingLastError())
+    target.useStep = true
+    for (position in 0 until ids.size) {
+        if (ids[position] < 0 || ids[position] >= config.nVocab || !target.forward(backend, ids[position], position))
+            return fail("target prompt step failed: ${inklingLastError()}")
+    }
+    if (!opArgmax(backend, target.scratch, target.so("logits"), config.nVocab, target.step, 0) ||
+        !opStepAdvance(backend, target.step) || !backend.synchronize()) return fail(cudaLastError())
+    if (!drafter.resume(backend, target.taps, ids.size)) return fail(dsparkLastError())
+    val cycle = captureCycle(backend, target, drafter, workspace, spec) ?? return fail(cudaLastError())
+    val plain = target.capture(backend) ?? return fail(inklingLastError())
+
+    for (trial in 0 until 2) {
+        // In the first trial the graph cursor advances beyond the host's seed. Plain
+        // steps then create a gap larger than one speculation cycle can inject.
+        val specReplays = if (trial == 0) 3 else 1
+        val plainReplays = if (trial == 0) 5 else 0
+        if (!target.replayMany(backend, cycle, specReplays) ||
+            !target.replayMany(backend, plain, plainReplays)) return fail(cudaLastError())
+        val p = target.readStepWord(backend, 1) ?? return fail(inklingLastError())
+        val anchor = target.readStepWord(backend, 0) ?? return fail(inklingLastError())
+        if (!drafter.resume(backend, target.taps, p) || !drafter.resume(backend, target.taps, p)) return fail(dsparkLastError())
+        if (drafter.resume(backend, target.taps, p - 1)) return fail("resume accepted a cursor rewind")
+        reference.reset()
+        if (!reference.pushTaps(backend, target.taps, 0, p)) return fail(dsparkLastError())
+        val expected = reference.propose(backend, target, p, anchor)
+        if (expected.size != 2) return fail("fresh host drafter failed: ${dsparkLastError()}")
+        if (!target.replayMany(backend, cycle, 1)) return fail(cudaLastError())
+        val out = downloadWords(backend, spec, 8) ?? return fail(cudaLastError())
+        if (out[0] != anchor || out[3] != 2 || out[1] != expected[0] || out[2] != expected[1])
+            return fail("P=$p anchor $anchor: got ${out[1]},${out[2]} (count ${out[3]}), expected ${expected[0]},${expected[1]}")
+        println("DSpark resume at P=$p after $specReplays cycle and $plainReplays plain replays matches a fresh drafter")
+    }
+    0
+}
