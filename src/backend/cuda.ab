@@ -776,18 +776,32 @@ private val cudaDsparkKernels = [
 
 // Reuse each linear kernel's argument contract and launch geometry. The ring
 // specialization changes only the physical K/V slot and per-head stride.
+private fun cudaKvVariant(spec: CudaKernelSpec, suffix: string, slots: int, half: bool): CudaKernelSpec {
+    val name = spec.name + suffix
+    val layout = (if (suffix == "_q8") "#define INKLING_Q8_KV\n" else "") + (if (half) "#define INKLING_HALF_KV\n" else "") +
+        (if (slots > 0) "#define INKLING_RING_SLOTS ${slots}u\n" else "")
+    val source = layout + "#define ${spec.name} ${name}\n" + spec.source
+    CudaKernelSpec(name, source, spec.itemsPerBlock, spec.blockX, spec.argumentKinds, spec.validate, spec.problemDimensions, spec.nullablePointer)
+}
+
 private fun cudaRingSpecs(): array<CudaKernelSpec> {
     val result: array<CudaKernelSpec> = []
-    val names = ["kv_store", "kv_store_step", "kv_store_batch", "kv_store_batch_ptr",
-        "attention_decode_rel", "attention_decode_rel_step", "attention_rel_split_step",
-        "attention_prefill_rel", "attention_prefill_tc", "attention_prefill_tc_split"]
-    for (list in [cudaKernels, cudaPrefillKernels]) for (spec in list) {
-        for (base in names) if (spec.name == base) {
-            val name = spec.name + "_ring"
-            val source = "#define INKLING_RING_SLOTS ${INKLING_KV_RING}u\n#define ${spec.name} ${name}\n" + spec.source
-            result.append(CudaKernelSpec(name, source, spec.itemsPerBlock, spec.blockX, spec.argumentKinds,
-                spec.validate, spec.problemDimensions, spec.nullablePointer))
+    val target = ["kv_store", "kv_store_step", "kv_store_batch", "kv_store_batch_ptr", "attention_decode_rel",
+        "attention_decode_rel_step", "attention_rel_split_step", "attention_prefill_rel", "attention_prefill_tc", "attention_prefill_tc_split"]
+    for (list in [cudaKernels, cudaPrefillKernels, cudaDsparkKernels]) for (spec in list) {
+        for (base in target) if (spec.name == base) {
+            result.append(cudaKvVariant(spec, "_ring", INKLING_KV_RING, false))
+            result.append(cudaKvVariant(spec, "_f16", 0, true))
+            result.append(cudaKvVariant(spec, "_q8", 0, false))
+            result.append(cudaKvVariant(spec, "_ring_f16", INKLING_KV_RING, true))
         }
+        if (spec.name == "attention_decode" || spec.name == "dspark_attention_step" || spec.name == "dspark_kv_step") {
+            result.append(cudaKvVariant(spec, "_f16", 0, true))
+            result.append(cudaKvVariant(spec, "_draft_ring_f16", INKLING_DRAFT_RING, true))
+        }
+        if (spec.name == "kv_store_batch") result.append(cudaKvVariant(spec, "_draft_ring_f16", INKLING_DRAFT_RING, true))
+        if (spec.name == "tap_rows" || spec.name == "tap_store_step" || spec.name == "dspark_mix_step")
+            result.append(cudaKvVariant(spec, "_tap_ring", INKLING_DRAFT_RING, false))
     }
     result
 }

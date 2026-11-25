@@ -1,0 +1,48 @@
+// With integral block scales all three stores are exact. Test two heads, signed
+// values, an all-zero block and the first slot after a sliding-cache wrap.
+import "abla/io"
+import "abla/float"
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "../../src/kernels/kv_layout.ab"
+import "support.ab"
+
+private fun check(var backend: Backend): bool {
+    val ctx = INKLING_KV_RING + 1
+    val src: array<f32> = []
+    for (row in 0 until 2) for (head in 0 until 2) for (d in 0 until 128) {
+        val scale = if (d / 32 == 3) 0 else 1 + row + head
+        val code = if (d % 32 == 0) -127 else (d * 13 + head + row) % 127
+        src.append(f64ToF32(f64FromInt(code * scale)))
+    }
+    val input = uploadFloats(backend, src) ?? return false
+    val query = uploadFloats(backend, testSignal(256, 1)) ?? return false
+    val table = uploadFloats(backend, testSignal(6, 2)) ?? return false
+    val step = uploadWords(backend, [0, ctx - 1, 0, 0]) ?? return false
+    val expected: array<int> = []
+    for (suffix in ["", "_f16", "_ring_f16", "_q8"]) {
+        val slots = if (suffix == "_ring_f16") INKLING_KV_RING else ctx
+        val bytes = slots * 256 * (if (suffix == "") 4 else 2)
+        val keys = backend.allocate(if (suffix == "_q8") slots * 256 / 32 * 36 else bytes) ?? return false
+        val values = backend.allocate(keys.bytes) ?? return false
+        val out = backend.allocate(256 * 4) ?? return false
+        if (!backend.launch("kv_store_batch" + suffix, kernelArgs().pointer(input).pointer(input).pointer(keys).pointer(values)
+            .u32(ctx - 2).u32(2).u32(128).u32(ctx).u32(2), [256, 2])) return false
+        if (!backend.launch("attention_decode_rel_step" + suffix, kernelArgs().pointer(query).pointer(keys).pointer(values)
+            .pointer(table).pointer(out).pointer(step).u32(2).u32(2).u32(128).u32(2).u32(2).u32(ctx).f32(0.00390625), [2])) return false
+        val got = downloadWords(backend, out, 256) ?? return false
+        if (suffix == "") for (word in got) expected.append(word)
+        else for (i in 0 until got.size) if (expected[i] != got[i]) {
+            eprintln("KV precision fixture failed for $suffix at feature $i")
+            return false
+        }
+    }
+    true
+}
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    if (!check(backend)) { eprintln(cudaLastError()); return 1 }
+    println("KV precision fixture passed")
+    0
+}

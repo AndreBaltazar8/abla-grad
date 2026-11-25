@@ -1,3 +1,4 @@
+import "../kernels/kv_layout.ab"
 import "inkling_config.ab"
 // Greedy speculative decoding of an Inkling model with the DSpark drafter (docs/spec-cycle.md): one recorded graph per cycle (draft, 3-row verification,
 // greedy acceptance, history commit) and, when `adaptive`, the plain decode graph whenever it is faster for the text at hand. Used by `generate` and
@@ -88,7 +89,7 @@ resource class SpecSession(
 fun specSessionCreate(var backend: Backend, var model: InklingModel, draftFile: GgufFile, maxProposals: int): SpecSession? {
     speculateError = ""
     model.useStep = true
-    if (!model.enableTaps(backend)) {
+    if (!model.enableTaps(backend, model.maxCtx >= INKLING_HALF_KV_CONTEXT)) {
         speculateError = inklingLastError()
         return null
     }
@@ -196,19 +197,28 @@ fun SpecSession.turn(
     this.drafter.stepPrepared = false
     // feed: older positions through the batched prefill when there are many, the last SPEC_EXACT_WINDOW in step mode (exact taps)
     var seeded = start
+    var injected = start
     if (length - 1 - start > this.exactWindow) {
         val seedWs = specSeedWorkspace(backend, config)
         if (seedWs == null) {
             speculateError = inklingPrefillLastError()
             return false
         }
-        val head: array<int> = []
-        for (i in start until length - 1 - this.exactWindow) head.append(this.seq[i])
-        if (!model.prefill(backend, seedWs, head, start)) {
-            speculateError = inklingPrefillLastError()
-            return false
+        val end = length - 1 - this.exactWindow
+        while (seeded < end) {
+            val count = if (model.rollingTaps && end - seeded > seedWs.chunk) seedWs.chunk else end - seeded
+            val head: array<int> = []
+            for (i in seeded until seeded + count) head.append(this.seq[i])
+            if (!model.prefill(backend, seedWs, head, seeded)) {
+                speculateError = inklingPrefillLastError()
+                return false
+            }
+            if (model.rollingTaps) {
+                if (!this.drafter.pushTaps(backend, model.taps, seeded, count)) { speculateError = dsparkLastError(); return false }
+                injected = seeded + count
+            }
+            seeded = seeded + count
         }
-        seeded = start + head.size
     }
     for (p in seeded until length) {
         if (p == length - 1) {
@@ -220,6 +230,10 @@ fun SpecSession.turn(
             }
             this.promptPos = length - 1
         }
+        if (model.rollingTaps && p - injected == INKLING_DRAFT_RING) {
+            if (!this.drafter.pushTaps(backend, model.taps, injected, p - injected)) { speculateError = dsparkLastError(); return false }
+            injected = p
+        }
         if (!model.forward(backend, this.seq[p], p)) {
             speculateError = inklingLastError()
             return false
@@ -229,7 +243,7 @@ fun SpecSession.turn(
         speculateError = "the first token could not be chosen"
         return false
     }
-    if (!this.drafter.pushTaps(backend, model.taps, start, length - start) || !this.drafter.prepareStep(backend) || !backend.synchronize()) {
+    if (!this.drafter.pushTaps(backend, model.taps, injected, length - injected) || !this.drafter.prepareStep(backend) || !backend.synchronize()) {
         speculateError = dsparkLastError()
         return false
     }
@@ -252,6 +266,7 @@ fun SpecSession.turn(
     produced = 1
     stats.generated = 1
     if (control.cancel) return true
+    var drafterPosition = length
     var position = length
     var logged = length
     // Arms: 0 = the plain graph, 1 = cycle with 2 proposals, 2 = 3 proposals, 3 = 4 proposals. Without `adaptive` the top arm runs alone. The controller
@@ -349,6 +364,21 @@ fun SpecSession.turn(
             if (produced >= maxTokens) {
                 ended = true
                 break
+            }
+        }
+        if (model.rollingTaps) {
+            if (arm != 0) drafterPosition = position
+            else {
+                // Keep enough taps to catch the drafter up during a long plain run.
+                // The next turn resumes at batchStart when generation ended in this batch.
+                val keep = if (ended) batchStart else position
+                if ((ended || keep - drafterPosition >= INKLING_DRAFT_RING / 2) && keep > drafterPosition) {
+                    if (!this.drafter.resume(backend, model.taps, keep)) {
+                        speculateError = dsparkLastError()
+                        return false
+                    }
+                    drafterPosition = keep
+                }
             }
         }
         if (ended) {

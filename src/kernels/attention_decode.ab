@@ -4,7 +4,7 @@ import "kv_layout.ab"
 val kernelAttentionDecode = kvAddressing + "\n" + """
 template <bool Relative>
 static __device__ __forceinline__ void attention(
-    const float *q, const float *k, const float *v, const float *table,
+    const float *q, const kv_element *k, const kv_element *v, const float *table,
     float *out, unsigned nHead, unsigned nKvHead, unsigned dim, unsigned first,
     unsigned last, unsigned pos, unsigned extent, unsigned maxCtx, float scale) {
     const unsigned head = blockIdx.x;
@@ -29,7 +29,7 @@ static __device__ __forceinline__ void attention(
         #pragma unroll
         for (unsigned i = 0; i < 8; ++i) {
             unsigned index = lane + i * 32;
-            if (index < dim) score = fmaf(query[index], k[base + index], score);
+            if (index < dim) score = fmaf(query[index], kv_load(k, base + index), score);
         }
         for (unsigned width = 16; width; width /= 2) {
             score += __shfl_down_sync(0xffffffffu, score, width);
@@ -48,7 +48,7 @@ static __device__ __forceinline__ void attention(
         #pragma unroll
         for (unsigned i = 0; i < 8; ++i) {
             unsigned index = lane + i * 32;
-            if (index < dim) accumulated[i] = fmaf(current, v[base + index], accumulated[i] * history);
+            if (index < dim) accumulated[i] = fmaf(current, kv_load(v, base + index), accumulated[i] * history);
         }
     }
     if (lane == 0) {
@@ -81,20 +81,20 @@ static __device__ __forceinline__ void attention(
 }
 
 extern "C" __global__ void attention_decode(
-    const float *q, const float *k, const float *v, float *out, unsigned nHead,
+    const float *q, const kv_element *k, const kv_element *v, float *out, unsigned nHead,
     unsigned nKvHead, unsigned dim, unsigned first, unsigned last, unsigned maxCtx, float scale) {
     attention<false>(q, k, v, nullptr, out, nHead, nKvHead, dim, first, last, 0, 0, maxCtx, scale);
 }
 
 extern "C" __global__ void attention_decode_rel(
-    const float *q, const float *k, const float *v, const float *table, float *out,
+    const float *q, const kv_element *k, const kv_element *v, const float *table, float *out,
     unsigned nHead, unsigned nKvHead, unsigned dim, unsigned first, unsigned last,
     unsigned pos, unsigned extent, unsigned maxCtx, float scale) {
     attention<true>(q, k, v, table, out, nHead, nKvHead, dim, first, last, pos, extent, maxCtx, scale);
 }
 
 extern "C" __global__ void attention_decode_rel_step(
-    const float *q, const float *k, const float *v, const float *table, float *out,
+    const float *q, const kv_element *k, const kv_element *v, const float *table, float *out,
     const unsigned *step, unsigned nHead, unsigned nKvHead, unsigned dim,
     unsigned window, unsigned extent, unsigned maxCtx, float scale) {
     const unsigned pos = step[1];

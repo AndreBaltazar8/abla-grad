@@ -5,12 +5,70 @@ val INKLING_KV_RING = 1024 + INKLING_KV_SEGMENT
 
 // The full-cache specialization is the identity. All context checks, relative
 // distances and attention iteration use logical positions in both variants.
+val INKLING_DRAFT_RING = 2048
+val INKLING_HALF_KV_CONTEXT = 65536
+val INKLING_Q8_KV_CONTEXT = 98304
+
+fun kvKernelSuffix(ring: bool, half: bool, q8: bool = false): string =
+    if (q8) "_q8" else if (half && ring) "_ring_f16" else if (half) "_f16" else if (ring) "_ring" else ""
+
 val kvAddressing = """
+#ifndef INKLING_KV_LAYOUT_DEFINED
+#define INKLING_KV_LAYOUT_DEFINED
+#ifdef INKLING_Q8_KV
+// A warp owns 32 consecutive feature channels in every store. Its block
+// has an FP32 scale and 32 signed bytes, aligned to a four-byte boundary.
+typedef unsigned char kv_element;
+struct kv_q8_block { float scale; signed char data[32]; };
+static __device__ __forceinline__ float kv_load(const kv_element *base, unsigned long long i) {
+    const kv_q8_block &b = reinterpret_cast<const kv_q8_block *>(base)[i / 32];
+    return b.scale * float(b.data[i % 32]);
+}
+static __device__ __forceinline__ void kv_put(kv_element *base, unsigned long long i, float x) {
+    float a = fabsf(x);
+    #pragma unroll
+    for (int d = 16; d > 0; d >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, d));
+    const float scale = a / 127.0f;
+    kv_q8_block &b = reinterpret_cast<kv_q8_block *>(base)[i / 32];
+    if ((i % 32) == 0) b.scale = scale;
+    b.data[i % 32] = scale ? (signed char)__float2int_rn(x / scale) : 0;
+}
+static __device__ __forceinline__ float4 kv_load4(const kv_element *base, unsigned long long i) {
+    const kv_q8_block &b = reinterpret_cast<const kv_q8_block *>(base)[i / 32];
+    char4 v = *reinterpret_cast<const char4 *>(b.data + (i % 32));
+    return make_float4(b.scale*v.x, b.scale*v.y, b.scale*v.z, b.scale*v.w);
+}
+#define KV_HEAD(ptr,offset) ((ptr) + (offset) / 32 * 36)
+#else
+#ifdef INKLING_HALF_KV
+typedef unsigned short kv_element;
+static __device__ __forceinline__ float kv_read(kv_element x) {
+    float f; asm("cvt.f32.f16 %0,%1;" : "=f"(f) : "h"(x)); return f;
+}
+static __device__ __forceinline__ kv_element kv_round(float f) {
+    kv_element x; asm("cvt.rn.f16.f32 %0,%1;" : "=h"(x) : "f"(f)); return x;
+}
+static __device__ __forceinline__ float4 kv_read4(const kv_element *ptr) {
+    const ushort4 v = *reinterpret_cast<const ushort4 *>(ptr);
+    return make_float4(kv_read(v.x), kv_read(v.y), kv_read(v.z), kv_read(v.w));
+}
+#else
+typedef float kv_element;
+static __device__ __forceinline__ float kv_read(float f) { return f; }
+static __device__ __forceinline__ float kv_round(float f) { return f; }
+static __device__ __forceinline__ float4 kv_read4(const kv_element *ptr) { return *reinterpret_cast<const float4 *>(ptr); }
+#endif
+#define kv_load(ptr,i) kv_read((ptr)[(i)])
+#define kv_put(ptr,i,x) ((ptr)[(i)] = kv_round((x)))
+#define kv_load4(ptr,i) kv_read4((ptr) + (i))
+#define KV_HEAD(ptr,offset) ((ptr) + (offset))
+#endif
 #ifdef INKLING_RING_SLOTS
 #define KV_STRIDE(ctx) INKLING_RING_SLOTS
 #define KV_SLOT(position) ((position) % INKLING_RING_SLOTS)
 #else
 #define KV_STRIDE(ctx) (ctx)
 #define KV_SLOT(position) (position)
+#endif
 #endif
 """

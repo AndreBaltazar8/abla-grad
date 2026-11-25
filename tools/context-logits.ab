@@ -1,0 +1,69 @@
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/integer"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "../src/backend/cuda.ab"
+import "../src/gguf/reader.ab"
+import "../src/model/inkling.ab"
+import "../src/model/inkling_config.ab"
+import "../src/model/inkling_prefill.ab"
+
+// Raw float32 rows in absolute input order. Only one chunk of logits is resident.
+private trusted fun writeRow(address: int, bytes: int): bool {
+    var done = 0
+    while (done < bytes) {
+        val n = linuxSyscall3(1, 1, address + done, bytes - done)
+        if (n == -4) continue
+        if (n <= 0) return false
+        done = done + n
+    }
+    true
+}
+
+trusted fun main: int {
+    if (processArgumentCount() != 4) {
+        eprintln("usage: context-logits <model.gguf> <ids> <auto|f16|q8> <chunk> > rows.f32")
+        return 2
+    }
+    val mode = processArgument(2)
+    if (mode != "auto" && mode != "f16" && mode != "q8") return 2
+    val file = ggufOpen(processArgument(0)) ?? return 1
+    val config = inklingConfigFrom(file) ?? return 1
+    val result = Path(processArgument(1)).readTextResult()
+    if (!result.succeeded) return 1
+    val ids: array<int> = []
+    for (raw in result.text.split("\n")) {
+        val line = raw.trim()
+        if (line != "") ids.append(line.parseInt() ?? return 2)
+    }
+    if (ids.size == 0) return 2
+    var backend = cudaBackend() ?? return 1
+    val model = inklingLoad(backend, file, config, ids.size, 5, mode == "f16", mode == "q8") ?? return 1
+    val chunk = processArgument(3).parseInt() ?? return 2
+    if (chunk < 1 || chunk > 512) return 2
+    val ws = prefillWorkspace(backend, config, chunk, true) ?? return 1
+    if (!model.reset(backend)) return 1
+    val stride = config.nVocabPadded * 4
+    val host = nativeByteBuffer(chunk * stride)
+    val addr = nativePointerAddress(host.address)
+    val off = ws.offsets.get("logits") ?? return 1
+    var start = 0
+    while (start < ids.size) {
+        val count = if (ids.size - start < chunk) ids.size - start else chunk
+        val part: array<int> = []
+        for (i in 0 until count) part.append(ids[start + i])
+        if (!model.prefill(backend, ws, part, start) || !backend.download(ws.buffer, off, addr, count * stride)) {
+            eprintln(inklingPrefillLastError() + " " + cudaLastError())
+            return 1
+        }
+        for (i in 0 until count) if (!writeRow(addr + i * stride, config.nVocab * 4)) return 1
+        start = start + count
+        if (start % 8192 == 0) eprintln("rows $start")
+    }
+    host.close()
+    0
+}

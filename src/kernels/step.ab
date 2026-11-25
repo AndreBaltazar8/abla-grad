@@ -5,7 +5,7 @@ import "kv_layout.ab"
 
 // kv_store with pos = step[1]. k and v are [kvHead][headDim]; the caches are [kvHead][maxCtx][headDim].
 val kernelKvStoreStep = kvAddressing + "\n" + """
-extern "C" __global__ void kv_store_step(const float *k, const float *v, float *kCache, float *vCache, const unsigned *step,
+extern "C" __global__ void kv_store_step(const float *k, const float *v, kv_element *kCache, kv_element *vCache, const unsigned *step,
                                          unsigned nKvHead, unsigned headDim, unsigned maxCtx) {
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nKvHead * headDim) return;
@@ -13,8 +13,8 @@ extern "C" __global__ void kv_store_step(const float *k, const float *v, float *
     unsigned head = i / headDim;
     unsigned d = i % headDim;
     unsigned long long at = ((unsigned long long)head * KV_STRIDE(maxCtx) + KV_SLOT(pos)) * headDim + d;
-    kCache[at] = k[i];
-    vCache[at] = v[i];
+    kv_put(kCache, at, k[i]);
+    kv_put(vCache, at, v[i]);
 }
 """
 
@@ -44,11 +44,11 @@ extern "C" __global__ void step_record(unsigned *step) {
 """
 
 // tap[step[1]][slot][0..n) = src[0..n): copies a hidden state into the tap record of the current position (tap is position-major [position][slots][n]).
-val kernelTapStoreStep = """
+val kernelTapStoreStep = kvAddressing + "\n" + """
 extern "C" __global__ void tap_store_step(const float *src, float *tap, const unsigned *step, unsigned n, unsigned slot, unsigned slots) {
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    unsigned long long at = ((unsigned long long)step[1] * slots + slot) * n + i;
+    unsigned long long at = ((unsigned long long)KV_SLOT(step[1]) * slots + slot) * n + i;
     tap[at] = src[i];
 }
 """

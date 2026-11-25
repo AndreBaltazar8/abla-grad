@@ -26,3 +26,11 @@
 # Abla target F16 K/V                                 149             799    .581823546   13.264651
 # Abla global block Q8, sliding F16                   142             786    .612149434   13.850366
 # All three worst KL values occurred at position 3061 (zero-based). The calibrated cap is .726531578.
+#
+# First 102,400 IDs of the same book, SHA-256
+# 39837cec388fca9774cfce468f20a15c8c2ac3add0f878333c9a3efa589c7f52, b=ub=64.
+# Engine vs pinned mainline CUDA              rows KL>.04   argmax misses   worst KL    max |delta|
+# Unsloth b12649                                      356            2331   1.418658339   16.690143
+# Abla target F16 K/V                                 358            2331    .662612384   15.573454
+# Abla global block Q8, sliding F16                   350            2330    .824670563   18.409976
+# The Unsloth worst was at 69,422 and both Abla worst values were at 42,947. The calibrated cap is 1.468658339.

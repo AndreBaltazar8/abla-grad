@@ -47,6 +47,8 @@ fun cmdLogits(args: array<string>): int {
     var maxCtx = 0
     var dumpDir = ""
     var useStep = false
+    var quantizeKv = false
+    var halfKv = false
     var noSplit = false
     var tapsCheck = ""
     var prefill = false
@@ -62,6 +64,12 @@ fun cmdLogits(args: array<string>): int {
         } else if (args[index] == "--taps-check" && index + 1 < args.size) {
             tapsCheck = args[index + 1]
             index = index + 2
+        } else if (args[index] == "--q8-kv") {
+            quantizeKv = true
+            index = index + 1
+        } else if (args[index] == "--f16-kv") {
+            halfKv = true
+            index = index + 1
         } else if (args[index] == "--no-split") {
             noSplit = true
             index = index + 1
@@ -112,6 +120,7 @@ fun cmdLogits(args: array<string>): int {
         println("logits: ${positional[1]} is not a file of token ids, one per line")
         return 2
     }
+    if (halfKv && quantizeKv) { println("logits: select one KV format"); return 2 }
     val file = ggufOpen(positional[0])
     if (file == null) {
         println("logits: ${ggufLastError()}")
@@ -132,7 +141,7 @@ fun cmdLogits(args: array<string>): int {
             println("logits: ${inklingConfigLastError()}")
             return 2
         }
-        var model = inklingLoad(backend, file, config, context) ?? return inklingLoadFailed()
+        var model = inklingLoad(backend, file, config, context, 5, halfKv, quantizeKv) ?? return inklingLoadFailed()
         model.dumpDir = dumpDir
         model.useStep = useStep
         model.splitAttention = !noSplit

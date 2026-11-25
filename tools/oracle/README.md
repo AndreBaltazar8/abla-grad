@@ -109,3 +109,18 @@ The individual Llama pp512 samples were 44,364.5, 60,497.8 and 60,316.9
 tokens/s. At context 512, llama.cpp reported 49 of 49 Inkling layers
 offloaded and 15,360.37 MiB in the CUDA model buffer. F16 KV buffers used
 96.00 MiB and the CUDA compute buffer used 787.86 MiB, before driver overhead.
+
+### All-row long-context comparison
+
+`context-logits.c` writes one raw float32 vocabulary row per input ID in absolute position order. Build it separately against the headers and libraries for each pinned llama.cpp build. Pass the model path, an IDs file, the number of positions and the chunk size. It requests F16 K/V, uses one sequence, and disables full-size sliding caches. The portable Unsloth build needs its backend plugin directory. For each run save the IDs file’s SHA-256 alongside the output and check the GPU layer and cache allocation logs.
+
+The Abla producer takes the model path, the same IDs file, the cache mode (`auto`, `f16` or `q8`) and chunk size. The Q8 mode stores global K/V in 32-channel blocks and sliding K/V in F16. Use the same chunk size in both llama.cpp builds and Abla. The 32,768-position calibration used 256. The 102,400-position reference used 64 to fit the full-attention compute buffer.
+
+```sh
+ablac build tools/context-logits.ab -o build/context-logits --fast
+cc -O3 -fopenmp -fno-math-errno tools/oracle/compare-context.c -lm -o build/compare-context
+tools/gpu-lock.sh -t 3000 -- build/context-logits "$model" "$ids" q8 "$chunk" |
+    build/compare-context "$mainline_raw" - "$positions" 200058
+```
+
+Run the pipeline with `set -o pipefail`. The comparator streams batches of 16 rows and checks both input lengths. Its TSV columns are position count, rows over KL .04, argmax differences, worst KL, zero-based worst position and maximum absolute logit difference. Run the same comparison with Unsloth logits and the identical mainline reference to obtain the worst-KL limit in `tests/tolerances-inkling-long.txt`. At 102,400 positions one uncompressed reference is 81,943,756,800 bytes. Both candidate streams can go directly into the comparator.

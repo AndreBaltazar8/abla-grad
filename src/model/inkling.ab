@@ -112,6 +112,10 @@ resource class InklingModel(
     val plan: ArenaPlan,
     val scratchMap: ScratchMap,
     val maxCtx: int,
+    val kvElementBytes: int,
+    val quantizedGlobalKv: bool,
+    val ringVisits: array<bool>,
+    val hasSlidingRing: bool,
     val visits: int,
     val cacheOffsets: array<int>, // one byte offset per visit, followed by the total allocation
     val arena: DeviceBuffer,
@@ -127,6 +131,7 @@ resource class InklingModel(
     // 16 bytes until `enableTaps`, then maxCtx records. Written by the step-mode forward only.
     var taps: DeviceBuffer,
     var tapsOn: bool = false,
+    var rollingTaps: bool = false,
     // Debug: when set, every layer visit appends the router's expert ids (nExpertUsed ints) to idLog (host sync per visit; direct mode only).
     var traceIds: bool = false,
     // Use the step-buffer kernels (token and position come from `step`, uploaded by `forward`); required for `inklingCapture`.
@@ -143,12 +148,12 @@ resource class InklingModel(
 )
 
 fun InklingModel.ringVisit(visit: int): bool =
-    this.cacheOffsets[visit + 1] - this.cacheOffsets[visit] < this.config.nHeadKv * this.maxCtx * this.config.headDim * 4
+    this.ringVisits[visit]
 
 // Can the next query at pos still read its earliest sliding-window key?
 // writtenEnd is an exclusive upper bound including uncommitted verify rows.
 fun InklingModel.canRestoreKv(pos: int, writtenEnd: int): bool {
-    if (this.kCache.bytes == this.visits * this.config.nHeadKv * this.maxCtx * this.config.headDim * 4) return true
+    if (!this.hasSlidingRing) return true
     val firstKey = if (pos + 1 > this.config.nSwa) pos + 1 - this.config.nSwa else 0
     writtenEnd <= firstKey + INKLING_KV_RING
 }
@@ -156,7 +161,7 @@ fun InklingModel.canRestoreKv(pos: int, writtenEnd: int): bool {
 private fun historyBytesPerVisit(c: InklingConfig): int = (c.nConv - 1) * (2 * c.nHeadKv * c.headDim + 2 * c.nEmbd) * 4
 
 // A caller that verifies unusually wide speculative batches can reserve linear caches for rollback.
-fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: int, maxVerifyRows: int = 5): InklingModel? {
+fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: int, maxVerifyRows: int = 5, halfKv: bool = false, quantizeKv: bool = false): InklingModel? {
     inklingError = ""
     val plan = planWeights(file, inklingNames(file, c))
     if (plan == null) {
@@ -171,6 +176,10 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
     val map = inklingScratch(c)
     val visits = inklingVisits(c)
     val scratch = backend.allocate(map.total)
+    val quantized = (quantizeKv || (!halfKv && maxCtx > INKLING_Q8_KV_CONTEXT)) && c.headDim % 32 == 0
+    val ringVisits: array<bool> = []
+    var hasSlidingRing = false
+    val kvElementBytes = if (quantized || halfKv || maxCtx >= INKLING_HALF_KV_CONTEXT) 2 else 4
     val cacheOffsets = [0]
     val core = c.loopEnd - c.loopStart
     for (visit in 0 until visits) {
@@ -180,7 +189,11 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
         val sliding = plan.refs.get("blk.$ip.attn_q_inp_norm.weight") == null
         val slots = if (sliding && maxCtx > INKLING_KV_RING && c.nSwa > 0 && c.nSwa <= INKLING_KV_RING - INKLING_KV_SEGMENT &&
             maxVerifyRows <= INKLING_KV_RING - c.nSwa) INKLING_KV_RING else maxCtx
-        cacheOffsets.append(cacheOffsets[visit] + slots * c.nHeadKv * c.headDim * 4)
+        ringVisits.append(slots < maxCtx)
+        if (slots < maxCtx) hasSlidingRing = true
+        val elements = slots * c.nHeadKv * c.headDim
+        val bytes = if (quantized && !sliding) elements / 32 * 36 else elements * kvElementBytes
+        cacheOffsets.append(cacheOffsets[visit] + bytes)
     }
     val kvBytes = cacheOffsets[visits]
     val kCache = backend.allocate(kvBytes)
@@ -194,7 +207,7 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
         inklingError = "device memory for the activations, KV caches and convolution histories is not available"
         return null
     }
-    InklingModel(c, plan, map, maxCtx, visits, cacheOffsets, move(arena), move(scratch), move(kCache), move(vCache), move(history), move(blocks), move(bank), move(step), move(taps))
+    InklingModel(c, plan, map, maxCtx, kvElementBytes, quantized, ringVisits, hasSlidingRing, visits, cacheOffsets, move(arena), move(scratch), move(kCache), move(vCache), move(history), move(blocks), move(bank), move(step), move(taps))
 }
 
 // Zeroes the convolution histories (a fresh sequence).
@@ -292,7 +305,7 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     var blocks = nBlocks
     var ok = true
     if (this.tapsOn && this.useStep && (visit == 5 || visit == 23 || visit == 41)) {
-        ok = opTapStoreStep(backend, this.scratch, x, this.taps, this.step, n, if (visit == 5) 0 else if (visit == 23) 1 else 2, 4)
+        ok = opTapStoreStep(backend, this.scratch, x, this.taps, this.step, n, if (visit == 5) 0 else if (visit == 23) 1 else 2, 4, this.rollingTaps)
     }
 
 
@@ -412,22 +425,22 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     val att = this.so("att")
     if (this.useStep) {
         ok = ok && opKvStoreStep(backend, this.scratch, k, this.scratch, v, this.kCache, cache, this.vCache, cache,
-            this.step, c.nHeadKv, c.headDim, this.maxCtx, ring)
+            this.step, c.nHeadKv, c.headDim, this.maxCtx, ring, this.kvElementBytes == 2, this.quantizedGlobalKv && !isSwa)
         val window = if (isSwa) c.nSwa else 0
         if (this.splitAttention) {
             ok = ok && opAttentionRelSplitStep(backend, this.scratch, q, this.kCache, cache, this.vCache, cache,
                 this.scratch, table, this.scratch, this.so("attPart"), this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent,
-                this.maxCtx, scale, this.attentionSplits, this.scratch, this.so("gate"), true, ring)
+                this.maxCtx, scale, this.attentionSplits, this.scratch, this.so("gate"), true, ring, this.kvElementBytes == 2, this.quantizedGlobalKv && !isSwa)
         } else {
             ok = ok && opAttentionDecodeRelStep(backend, this.scratch, q, this.kCache, cache, this.vCache, cache,
-                this.scratch, table, this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent, this.maxCtx, scale, ring)
+                this.scratch, table, this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent, this.maxCtx, scale, ring, this.kvElementBytes == 2, this.quantizedGlobalKv && !isSwa)
         }
     } else {
         ok = ok && opKvStore(backend, this.scratch, k, this.scratch, v, this.kCache, cache, this.vCache, cache,
-            pos, c.nHeadKv, c.headDim, this.maxCtx, ring)
+            pos, c.nHeadKv, c.headDim, this.maxCtx, ring, this.kvElementBytes == 2, this.quantizedGlobalKv && !isSwa)
         val first = if (isSwa && pos - c.nSwa + 1 > 0) pos - c.nSwa + 1 else 0
         ok = ok && opAttentionDecodeRel(backend, this.scratch, q, this.kCache, cache, this.vCache, cache,
-            this.scratch, table, this.scratch, att, c.nHead, c.nHeadKv, c.headDim, first, pos, pos, extent, this.maxCtx, scale, ring)
+            this.scratch, table, this.scratch, att, c.nHead, c.nHeadKv, c.headDim, first, pos, pos, extent, this.maxCtx, scale, ring, this.kvElementBytes == 2, this.quantizedGlobalKv && !isSwa)
     }
     // the split attention already applied the output gate (sigmoid_mul fused into its merge)
     if (!(this.useStep && this.splitAttention)) ok = ok && opSigmoidMul(backend, this.scratch, att, this.scratch, this.so("gate"), this.scratch, att, qDim)
@@ -658,7 +671,7 @@ private fun InklingModel.run(var backend: Backend, token: int, pos: int): bool {
     // output: depth mix, norm, lm head, softcap
     ok = this.mix(backend, blocks, x, "output_res_query.weight", 1, x)
     ok = ok && this.norm(backend, "output_norm.weight", x, x)
-    if (this.tapsOn && this.useStep) ok = ok && opTapStoreStep(backend, this.scratch, x, this.taps, this.step, n, 3, 4)
+    if (this.tapsOn && this.useStep) ok = ok && opTapStoreStep(backend, this.scratch, x, this.taps, this.step, n, 3, 4, this.rollingTaps)
     this.dump(backend, pos, "result_norm", x, n)
     val output = this.w("output.weight")
     val outputKind = weightKind(output.type)
@@ -762,13 +775,15 @@ trusted fun InklingModel.readStepWord(var backend: Backend, index: int): int? {
 }
 
 // Allocates the tap records (position-major [position][4][nEmbd] f32, maxCtx positions) and turns tap capture on for the step-mode forward.
-fun InklingModel.enableTaps(var backend: Backend): bool {
-    val buffer = backend.allocate(this.maxCtx * 4 * this.config.nEmbd * 4)
+fun InklingModel.enableTaps(var backend: Backend, streaming: bool = false): bool {
+    val slots = if (streaming && this.maxCtx > INKLING_DRAFT_RING) INKLING_DRAFT_RING else this.maxCtx
+    val buffer = backend.allocate(slots * 4 * this.config.nEmbd * 4)
     if (buffer == null) {
         inklingError = "device memory for the taps is not available"
         return false
     }
     this.taps = move(buffer)
+    this.rollingTaps = slots < this.maxCtx
     this.tapsOn = true
     true
 }
@@ -778,7 +793,7 @@ trusted fun InklingModel.readTap(var backend: Backend, position: int, slot: int)
     val n = this.config.nEmbd
     val host = nativeByteBuffer(n * 4 + 4)
     val address = nativePointerAddress(host.address)
-    if (!backend.download(this.taps, (position * 4 + slot) * n * 4, address, n * 4)) {
+    if (!backend.download(this.taps, ((if (this.rollingTaps) position % INKLING_DRAFT_RING else position) * 4 + slot) * n * 4, address, n * 4)) {
         inklingError = "downloading a tap failed"
         host.close()
         return null

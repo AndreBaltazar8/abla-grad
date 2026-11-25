@@ -1,3 +1,4 @@
+import "kv_layout.ab"
 import "attention_decode.ab"
 
 // [step] is [anchor, P, proposal count, accepted count]. cursor is the number
@@ -13,7 +14,7 @@ static __device__ __forceinline__ unsigned tap_rows(const unsigned *step, const 
 }
 """
 
-val kernelDsparkMixStep = dsparkTapRange + """
+val kernelDsparkMixStep = kvAddressing + "\n" + dsparkTapRange + """
 extern "C" __global__ void dspark_mix_step(const float *taps, const float *alpha, float *out,
     const unsigned *step, const unsigned *cursor, unsigned width, unsigned limit, unsigned capacity, unsigned lastOnly) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -24,7 +25,7 @@ extern "C" __global__ void dspark_mix_step(const float *taps, const float *alpha
     float value = 0.0f;
     if (row < count) {
         const unsigned pos = lastOnly ? step[1] - 1 : *cursor + row;
-        const float *x = taps + static_cast<unsigned long long>(pos) * 4 * width + i % width;
+        const float *x = taps + static_cast<unsigned long long>(KV_SLOT(pos)) * 4 * width + i % width;
         #pragma unroll
         for (unsigned j = 0; j < 4; ++j) value = fmaf(alpha[j], x[j * width], value);
     }
@@ -62,8 +63,8 @@ extern "C" __global__ void dspark_rope_step(float *x, const unsigned *first, uns
 }
 """
 
-val kernelDsparkKvStep = dsparkTapRange + """
-extern "C" __global__ void dspark_kv_step(const float *k, const float *v, float *kc, float *vc,
+val kernelDsparkKvStep = kvAddressing + "\n" + dsparkTapRange + """
+extern "C" __global__ void dspark_kv_step(const float *k, const float *v, kv_element *kc, kv_element *vc,
     const unsigned *step, const unsigned *cursor, unsigned headDim, unsigned kvDim,
     unsigned cacheCtx, unsigned limit, unsigned capacity, unsigned block) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -73,14 +74,14 @@ extern "C" __global__ void dspark_kv_step(const float *k, const float *v, float 
     const unsigned first = block ? p : *cursor;
     const unsigned rows = block ? capacity : tap_rows(step, cursor, limit, capacity);
     if (i >= kvDim || row >= rows || first >= cacheCtx || row >= cacheCtx - first) return;
-    const unsigned long long dst = (static_cast<unsigned long long>(i / headDim) * cacheCtx + first + row) * headDim + i % headDim;
-    kc[dst] = k[row * kvDim + i];
-    vc[dst] = v[row * kvDim + i];
+    const unsigned long long dst = (static_cast<unsigned long long>(i / headDim) * KV_STRIDE(cacheCtx) + KV_SLOT(first + row)) * headDim + i % headDim;
+    kc[dst] = kv_round(k[row * kvDim + i]);
+    vc[dst] = kv_round(v[row * kvDim + i]);
 }
 """
 
 val kernelDsparkAttentionStep = kernelAttentionDecode + """
-extern "C" __global__ void dspark_attention_step(const float *q, const float *k, const float *v,
+extern "C" __global__ void dspark_attention_step(const float *q, const kv_element *k, const kv_element *v,
     float *out, const unsigned *step, unsigned heads, unsigned kvHeads, unsigned dim,
     unsigned rows, unsigned cacheCtx, unsigned window, float scale) {
     const unsigned p = step[1];

@@ -333,7 +333,7 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     var ok = true
     if (this.tapsOn && (visit == 5 || visit == 23 || visit == 41)) {
         // the drafter's tap: the layer input of this visit, position-major [position][4][n]
-        ok = backend.launch("tap_rows", kernelArgs().pointer(ws.buffer, x).pointer(this.taps).pointer(posBuf, posOff).u32(n).u32(if (visit == 5) 0 else if (visit == 23) 1 else 2).u32(4).u32(tokens), [n, tokens])
+        ok = backend.launch(if (this.rollingTaps) "tap_rows_tap_ring" else "tap_rows", kernelArgs().pointer(ws.buffer, x).pointer(this.taps).pointer(posBuf, posOff).u32(n).u32(if (visit == 5) 0 else if (visit == 23) 1 else 2).u32(4).u32(tokens), [n, tokens])
     }
     ok = ok && opCopy(backend, ws.buffer, x, ws.buffer, inpSA, tokens * n)
 
@@ -478,7 +478,7 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     // KV store, attention
     val cache = this.cacheOffsets[visit]
     val ring = this.ringVisit(visit)
-    val suffix = if (ring) "_ring" else ""
+    val suffix = kvKernelSuffix(ring, this.kvElementBytes == 2, this.quantizedGlobalKv && !isSwa)
     val scale = f64ToF32(1.0 / sqrt(f64FromInt(c.headDim)))
     val att = ws.o("att")
     // Store one segment before computing its attention. Other operations still
@@ -776,7 +776,7 @@ private fun InklingModel.prefillChunk(var backend: Backend, ws: PrefillWorkspace
     if (!withLogits && !this.tapsOn) return true
     ok = this.mixRows(backend, ws, ws.blocks, blocks, x, "output_res_query.weight", 1, x, n, tokens)
     ok = ok && this.normRows(backend, ws, "output_norm.weight", x, x, tokens)
-    if (this.tapsOn) ok = ok && backend.launch("tap_rows", kernelArgs().pointer(ws.buffer, x).pointer(this.taps).pointer(posBuf, posOff).u32(n).u32(3).u32(4).u32(tokens), [n, tokens])
+    if (this.tapsOn) ok = ok && backend.launch(if (this.rollingTaps) "tap_rows_tap_ring" else "tap_rows", kernelArgs().pointer(ws.buffer, x).pointer(this.taps).pointer(posBuf, posOff).u32(n).u32(3).u32(4).u32(tokens), [n, tokens])
     if (!withLogits) return ok
     val output = this.wr("output.weight")
     val outputKind = weightKind(output.type)

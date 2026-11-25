@@ -155,7 +155,7 @@ extern "C" __global__ void scale_tau_rows(float *x, unsigned rowLen, const unsig
 
 // Stores the K and V of tokens firstPos .. firstPos + tokens - 1 ([token][kvHead][headDim]) into the caches [kvHead][maxCtx][headDim]. problem [kvDim, tokens].
 val kernelPrefillKvStore = kvAddressing + "\n" + """
-extern "C" __global__ void kv_store_batch(const float *k, const float *v, float *kCache, float *vCache, unsigned firstPos,
+extern "C" __global__ void kv_store_batch(const float *k, const float *v, kv_element *kCache, kv_element *vCache, unsigned firstPos,
                                           unsigned nKvHead, unsigned headDim, unsigned maxCtx, unsigned tokens) {
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned t = blockIdx.y;
@@ -163,14 +163,14 @@ extern "C" __global__ void kv_store_batch(const float *k, const float *v, float 
     unsigned head = i / headDim;
     unsigned d = i % headDim;
     unsigned long long at = (static_cast<unsigned long long>(head) * KV_STRIDE(maxCtx) + KV_SLOT(firstPos + t)) * headDim + d;
-    kCache[at] = k[static_cast<unsigned long long>(t) * nKvHead * headDim + i];
-    vCache[at] = v[static_cast<unsigned long long>(t) * nKvHead * headDim + i];
+    kv_put(kCache, at, k[static_cast<unsigned long long>(t) * nKvHead * headDim + i]);
+    kv_put(vCache, at, v[static_cast<unsigned long long>(t) * nKvHead * headDim + i]);
 }
 """
 
 // The same with the first position read from device memory (graph-static verification).
 val kernelPrefillKvStorePtr = kvAddressing + "\n" + """
-extern "C" __global__ void kv_store_batch_ptr(const float *k, const float *v, float *kCache, float *vCache, const unsigned *posPtr,
+extern "C" __global__ void kv_store_batch_ptr(const float *k, const float *v, kv_element *kCache, kv_element *vCache, const unsigned *posPtr,
                                           unsigned nKvHead, unsigned headDim, unsigned maxCtx, unsigned tokens) {
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned t = blockIdx.y;
@@ -179,8 +179,8 @@ extern "C" __global__ void kv_store_batch_ptr(const float *k, const float *v, fl
     unsigned head = i / headDim;
     unsigned d = i % headDim;
     unsigned long long at = (static_cast<unsigned long long>(head) * KV_STRIDE(maxCtx) + KV_SLOT(firstPos + t)) * headDim + d;
-    kCache[at] = k[static_cast<unsigned long long>(t) * nKvHead * headDim + i];
-    vCache[at] = v[static_cast<unsigned long long>(t) * nKvHead * headDim + i];
+    kv_put(kCache, at, k[static_cast<unsigned long long>(t) * nKvHead * headDim + i]);
+    kv_put(vCache, at, v[static_cast<unsigned long long>(t) * nKvHead * headDim + i]);
 }
 """
 
@@ -438,12 +438,12 @@ extern "C" __global__ void matmul_bf16_exact_split(const unsigned short *w, cons
 // firstPos + t; it sees cache positions max(0, pos + 1 - window) .. pos (window 0 = all). q, out [token][head][dim]; table [token][head][extent + 1].
 // The K and V of the whole chunk must already be in the caches. problem [nHead, tokens].
 // The drafter taps of a batch: taps[(pos + t) * slots + slot][0 .. n) = src[t][0 .. n) with pos = *posPtr. problem [n, tokens].
-val kernelPrefillTapRows = """
+val kernelPrefillTapRows = kvAddressing + "\n" + """
 extern "C" __global__ void tap_rows(const float *src, float *taps, const unsigned *posPtr, unsigned n, unsigned slot, unsigned slots, unsigned tokens) {
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned t = blockIdx.y;
     if (i >= n || t >= tokens) return;
-    taps[(static_cast<unsigned long long>(*posPtr + t) * slots + slot) * n + i] = src[static_cast<unsigned long long>(t) * n + i];
+    taps[(static_cast<unsigned long long>(KV_SLOT(*posPtr + t)) * slots + slot) * n + i] = src[static_cast<unsigned long long>(t) * n + i];
 }
 """
 
@@ -483,7 +483,7 @@ extern "C" __global__ void rel_table_rows(const float *relBias, const float *r, 
 """
 
 val kernelPrefillAttention = kernelAttentionDecode + """
-extern "C" __global__ void attention_prefill_rel(const float *q, const float *k, const float *v, const float *table, float *out,
+extern "C" __global__ void attention_prefill_rel(const float *q, const kv_element *k, const kv_element *v, const float *table, float *out,
     unsigned nHead, unsigned nKvHead, unsigned dim, unsigned window, unsigned firstPos, unsigned extent, unsigned maxCtx, float scale) {
     unsigned t = blockIdx.y;
     unsigned pos = firstPos + t;

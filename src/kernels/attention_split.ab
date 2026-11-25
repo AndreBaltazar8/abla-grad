@@ -7,7 +7,7 @@ import "kv_layout.ab"
 // Partial layout per (head, split): acc[dim], then m, then total (dim + 2 floats).
 val kernelAttentionSplit = kvAddressing + "\n" + """
 extern "C" __global__ void attention_rel_split_step(
-    const float *q, const float *k, const float *v, const float *table, float *part,
+    const float *q, const kv_element *k, const kv_element *v, const float *table, float *part,
     const unsigned *step, unsigned nHead, unsigned nKvHead, unsigned dim,
     unsigned window, unsigned extent, unsigned maxCtx, float scale, unsigned nSplit) {
     const unsigned pos = step[1];
@@ -38,7 +38,7 @@ extern "C" __global__ void attention_rel_split_step(
         #pragma unroll
         for (unsigned i = 0; i < 8; ++i) {
             unsigned index = lane + i * 32;
-            if (index < dim) score = fmaf(query[index], k[base + index], score);
+            if (index < dim) score = fmaf(query[index], kv_load(k, base + index), score);
         }
         for (unsigned width = 16; width; width /= 2) score += __shfl_down_sync(0xffffffffu, score, width);
         score = __shfl_sync(0xffffffffu, score, 0) * scale;
@@ -52,7 +52,7 @@ extern "C" __global__ void attention_rel_split_step(
         #pragma unroll
         for (unsigned i = 0; i < 8; ++i) {
             unsigned index = lane + i * 32;
-            if (index < dim) accumulated[i] = fmaf(current, v[base + index], accumulated[i] * history);
+            if (index < dim) accumulated[i] = fmaf(current, kv_load(v, base + index), accumulated[i] * history);
         }
     }
     if (lane == 0) {

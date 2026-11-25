@@ -240,8 +240,10 @@ private fun argmaxOf(a: array<f32>): int {
 fun cmdVerifyCheck(args: array<string>): int {
     // the check compares prefill against decode to rounding: the f16 experts (the int8 experts add Q8_1-style activation noise, about 4% in the first tap slot)
     setPrefillInt8Experts(false)
-    if (args.size != 2) {
-        println("usage: abla-grad verify-check <model.gguf> <ids-file>   (at least 104 ids)")
+    val half = args.size == 3 && args[2] == "--f16-kv"
+    val quantized = args.size == 3 && args[2] == "--q8-kv"
+    if (args.size != 2 && !half && !quantized) {
+        println("usage: abla-grad verify-check <model.gguf> <ids-file> [--f16-kv|--q8-kv]   (at least 104 ids)")
         return 2
     }
     val idsText = Path(args[1]).readTextResult()
@@ -262,7 +264,7 @@ fun cmdVerifyCheck(args: array<string>): int {
         return 2
     }
     var backend = cudaBackend() ?? return 2
-    var model = inklingLoad(backend, file, config, 160) ?? return loadFailed()
+    var model = inklingLoad(backend, file, config, 160, 5, half, quantized) ?? return loadFailed()
     val first: array<int> = []
     for (i in 0 until 100) first.append(ids[i])
     val rows: array<int> = []

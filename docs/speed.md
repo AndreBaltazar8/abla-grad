@@ -584,3 +584,22 @@ A second diagnostic saved the 256-element Markov state at each primary proposal,
 Fog and Museum spent the entire measured 512-token chat continuations in the thinking channel. Ferry used a raw prose continuation. Applying 0.25 of the previous rejected verifier row’s logits to the next draft reduced fixed-four cycles on Fog from 260 to 250, but increased Museum from 212 to 223. Applying a 0.10 prior only to the next first proposal took 256 and 209 cycles. Each comparison used the same target chain.
 
 Verifying through the first of the initial three proposals whose margin fell below a cutoff, or all four if none did, gave 153.94 tok/s on Fog with a two-logit cutoff, and 174.77 on Museum with a one-logit cutoff. The corresponding fixed-two baselines on the same IDs were 149.88 and 170.89 tok/s. These are prompt-specific diagnostic settings. The production controller still uses the released adaptive policy. The per-run logs, exact IDs, trace replays and fork-policy calculations are in `~/archive/abla-grad-prose-1249/`.
+
+## 64k–128k serving and KV precision
+
+With a 131,072-token limit the Q4_K_M target and Q8_0 DSpark drafter processed a 105,878-token chat request and returned eight greedy tokens. A repeat served the identical completion and reused 105,877 prompt tokens. On the release candidate the first token took 50.13 s cold and 0.765 s on the repeat. The server selected a 512-token prefill chunk and reported 1,211 MiB to spare after loading with 21,698 MiB free. At the 65,536-token limit, a 54,571-token prompt returned eight tokens, reproduced the same choices on repeat, and reused 54,570 tokens. First-token times were 22.57 s and 0.396 s, with 1,732 MiB to spare. Eight generated tokens establish that the request completes, but are too few for a sustained decode measurement.
+
+At 131,072 positions the target's forty sliding F16 visits and eight global Q8 visits need 2.484375 GiB of K and V. Each global block holds 32 signed bytes and one FP32 scale. Full F16 on the target required 4.234375 GiB and ran out of memory while instantiating the plain graph in the same serving experiment. DSpark retains one full F16 cache and two 2,048-slot F16 sliding caches, including space for its noise block. The four FP32 target taps now occupy 72 MiB. The server injects them into the drafter as each prompt chunk finishes.
+
+The numerical gate compared every vocabulary logit at every input position, using contiguous token prefixes of the Standard Ebooks edition of Dickens’s *A Tale of Two Cities* (source commit `4411856fa18102aafeebb573357dae474045efd5`). Both llama.cpp engines used the original GGUF, F16 K/V, one sequence, GPU offload and compact sliding caches. The 32,768-row run used batch and microbatch 256. The 102,400-row run used 64 in all engines after the pinned mainline CUDA build requested a 5.29 GB prefill compute buffer at 256.
+
+| Positions | Engine against mainline CUDA | Rows KL > .04 | Argmax differences | Worst KL | Max absolute logit difference |
+|---:|---|---:|---:|---:|---:|
+| 32,768 | Unsloth b12649 | 136 | 806 | .676532 | 12.669900 |
+| 32,768 | Abla F16 | 149 | 799 | .581824 | 13.264651 |
+| 32,768 | Abla global Q8, sliding F16 | 142 | 786 | .612149 | 13.850366 |
+| 102,400 | Unsloth b12649 | 356 | 2,331 | 1.418658 | 16.690143 |
+| 102,400 | Abla F16 | 358 | 2,331 | .662612 | 15.573454 |
+| 102,400 | Abla global Q8, sliding F16 | 350 | 2,330 | .824671 | 18.409976 |
+
+Both Abla cache modes passed at 32,768 and 102,400 positions under the calibrated long-prompt rule. On fixed step prompt 06, F16 had 24 rows over the KL threshold, 110 argmax differences and worst KL .175718. Mixed Q8/F16 had 29, 94 and .287230. Both also passed prompt 05. At the 131,072-token allocation, adaptive nmax 2 matched 256 plain greedy IDs on each of prompts 01–04. Prompt 05 first differed at token 98 with a target margin of .139292, inside the speculation gate. The input hashes, fixed 05/06 rules and calibration limits are in `tests/tolerances-inkling-long.txt`. Commands and raw logs are in `~/archive/abla-grad-128k-1251/`. The reusable producers and streaming comparator are described in `tools/oracle/README.md`.

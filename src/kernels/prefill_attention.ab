@@ -47,7 +47,7 @@ static __device__ __forceinline__ void at_mma(float (&c)[4], const unsigned (&a)
 enum { AT_KEYS = 32, AT_DIM = 128, AT_PITCH = 136, AT_WARPS = 2 };
 
 extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc(
-    const float *q, const float *kCache, const float *vCache, const float *table, float *out, unsigned nHead, unsigned nKvHead,
+    const float *q, const kv_element *kCache, const kv_element *vCache, const float *table, float *out, unsigned nHead, unsigned nKvHead,
     unsigned window, const unsigned *posPtr, unsigned extent, unsigned maxCtx, float scale, unsigned tokens) {
     const unsigned firstPos = *posPtr;
     __shared__ __align__(16) unsigned short ks[AT_KEYS * AT_PITCH];
@@ -67,8 +67,8 @@ extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc(
     const bool validB = rowB < tokens;
     const unsigned posA = firstPos + rowA;
     const unsigned posB = firstPos + rowB;
-    const float *kBase = kCache + static_cast<unsigned long long>(kvHead) * KV_STRIDE(maxCtx) * AT_DIM;
-    const float *vBase = vCache + static_cast<unsigned long long>(kvHead) * KV_STRIDE(maxCtx) * AT_DIM;
+    const kv_element *kBase = KV_HEAD(kCache, static_cast<unsigned long long>(kvHead) * KV_STRIDE(maxCtx) * AT_DIM);
+    const kv_element *vBase = KV_HEAD(vCache, static_cast<unsigned long long>(kvHead) * KV_STRIDE(maxCtx) * AT_DIM);
 
     // Q fragments (A operand, 8 k-steps of 16 dims)
     unsigned qa[8][4];
@@ -112,8 +112,8 @@ extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc(
             float4 kv = make_float4(0.f, 0.f, 0.f, 0.f);
             float4 vv = kv;
             if (key <= posLast) {
-                kv = *reinterpret_cast<const float4 *>(kBase + static_cast<unsigned long long>(KV_SLOT(key)) * AT_DIM + c4);
-                vv = *reinterpret_cast<const float4 *>(vBase + static_cast<unsigned long long>(KV_SLOT(key)) * AT_DIM + c4);
+                kv = kv_load4(kBase, static_cast<unsigned long long>(KV_SLOT(key)) * AT_DIM + c4);
+                vv = kv_load4(vBase, static_cast<unsigned long long>(KV_SLOT(key)) * AT_DIM + c4);
             }
             unsigned h0, l0, h1, l1;
             at_split(kv.x, kv.y, h0, l0);
@@ -220,7 +220,7 @@ extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc(
     }
 }
 extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc_split(
-    const float *q, const float *kCache, const float *vCache, const float *table, float *out, unsigned nHead, unsigned nKvHead,
+    const float *q, const kv_element *kCache, const kv_element *vCache, const float *table, float *out, unsigned nHead, unsigned nKvHead,
     unsigned window, const unsigned *posPtr, unsigned extent, unsigned maxCtx, float scale, unsigned tokens, unsigned splits, float *partO, float *partML) {
     const unsigned firstPos = *posPtr;
     __shared__ __align__(16) unsigned short ks[AT_KEYS * AT_PITCH];
@@ -241,8 +241,8 @@ extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc_split(
     const bool validB = rowB < tokens;
     const unsigned posA = firstPos + rowA;
     const unsigned posB = firstPos + rowB;
-    const float *kBase = kCache + static_cast<unsigned long long>(kvHead) * KV_STRIDE(maxCtx) * AT_DIM;
-    const float *vBase = vCache + static_cast<unsigned long long>(kvHead) * KV_STRIDE(maxCtx) * AT_DIM;
+    const kv_element *kBase = KV_HEAD(kCache, static_cast<unsigned long long>(kvHead) * KV_STRIDE(maxCtx) * AT_DIM);
+    const kv_element *vBase = KV_HEAD(vCache, static_cast<unsigned long long>(kvHead) * KV_STRIDE(maxCtx) * AT_DIM);
 
     // Q fragments (A operand, 8 k-steps of 16 dims)
     unsigned qa[8][4];
@@ -292,8 +292,8 @@ extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc_split(
             float4 kv = make_float4(0.f, 0.f, 0.f, 0.f);
             float4 vv = kv;
             if (key < endKey) {
-                kv = *reinterpret_cast<const float4 *>(kBase + static_cast<unsigned long long>(KV_SLOT(key)) * AT_DIM + c4);
-                vv = *reinterpret_cast<const float4 *>(vBase + static_cast<unsigned long long>(KV_SLOT(key)) * AT_DIM + c4);
+                kv = kv_load4(kBase, static_cast<unsigned long long>(KV_SLOT(key)) * AT_DIM + c4);
+                vv = kv_load4(vBase, static_cast<unsigned long long>(KV_SLOT(key)) * AT_DIM + c4);
             }
             unsigned h0, l0, h1, l1;
             at_split(kv.x, kv.y, h0, l0);
