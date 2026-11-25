@@ -140,6 +140,7 @@ fun cmdSpecBench(args: array<string>): int {
         var plainTokens = 0
         var cycleTokens = 0
         var switches = 0
+        var warm = true
         var acceptedBefore = 0
         while (position < length + count) {
             val before = position
@@ -157,20 +158,23 @@ fun cmdSpecBench(args: array<string>): int {
             position = model.readStepWord(backend, 1) ?? return 1
             val seconds = f64FromInt(monotonicNanoseconds() - t0) / 1000000000.0
             val rate = f64FromInt(position - before) / seconds
+            // the first batch after a switch (graph warm-up, the drafter's catch-up) only counts tokens
             if (useCycle) {
-                rateCycle = if (rateCycle == 0.0) rate else 0.5 * rateCycle + 0.5 * rate
+                if (!warm) rateCycle = if (rateCycle == 0.0) rate else 0.5 * rateCycle + 0.5 * rate
                 cycleTokens = cycleTokens + (position - before)
             } else {
-                ratePlain = if (ratePlain == 0.0) rate else 0.5 * ratePlain + 0.5 * rate
+                if (!warm) ratePlain = if (ratePlain == 0.0) rate else 0.5 * ratePlain + 0.5 * rate
                 plainTokens = plainTokens + (position - before)
                 sinceProbe = sinceProbe + (position - before)
             }
             // decide the next batch
             var next = useCycle
-            if (ratePlain == 0.0) next = false
+            if (warm) next = useCycle
+            else if (ratePlain == 0.0) next = false
             else if (rateCycle == 0.0) next = true
             else if (useCycle) next = rateCycle >= ratePlain * 0.97
             else next = sinceProbe >= 160 || rateCycle > ratePlain * 1.03
+            warm = false
             if (next && !useCycle) {
                 // back to the cycle graph: the drafter catches up on the plain tokens' taps
                 if (!drafter.resume(backend, model.taps, position)) {
@@ -179,6 +183,7 @@ fun cmdSpecBench(args: array<string>): int {
                 }
                 sinceProbe = 0
                 rateCycle = 0.0
+                warm = true
             }
             if (next != useCycle) switches = switches + 1
             useCycle = next
