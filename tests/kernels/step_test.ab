@@ -57,6 +57,43 @@ fun run(var backend: Backend): bool {
         println("step_advance: expected [77, 5], got [${after[0]}, ${after[1]}]")
         ok = false
     }
+
+    // spec cycle: spec_begin, spec_accept for every (count, matching rows) combination, copy_select
+    for (n in 0 until 3) {
+        for (matches in 0 until 3) {
+            // proposals p1 = 11, p2 = 12; argmax rows: row0 = 11 (or 90 if no match), row1 = 12 (or 91), row2 = 33
+            val argmax0 = if (matches >= 1) 11 else 90
+            val argmax1 = if (matches >= 2) 12 else 91
+            val stepWords = uploadWords(backend, [77, 5, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) ?? return false
+            val spec = uploadWords(backend, [0, 11, 12, n, argmax0, argmax1, 33, 0]) ?? return false
+            if (!backend.launch("spec_begin", kernelArgs().pointer(stepWords).pointer(spec), [1])) return false
+            if (!backend.launch("spec_accept", kernelArgs().pointer(stepWords).pointer(spec).u32(12), [1])) return false
+            val s = downloadWords(backend, stepWords, 16) ?? return false
+            val sp = downloadWords(backend, spec, 8) ?? return false
+            // reference
+            var a = 0
+            if (n >= 1 && argmax0 == 11) {
+                a = 1
+                if (n >= 2 && argmax1 == 12) a = 2
+            }
+            val rows = [argmax0, argmax1, 33]
+            var good = sp[0] == 77 && s[1] == 5 + a + 1 && s[3] == a && s[0] == rows[a]
+            for (k in 0 until a + 1) if (s[4 + 5 + k] != rows[k]) good = false
+            if (!good) {
+                println("spec_accept n=$n matches=$matches: step [${s[0]}, ${s[1]}, ${s[2]}, ${s[3]}] log ${s[9]} ${s[10]} ${s[11]}, expected a=$a")
+                ok = false
+            }
+            // copy_select: three snapshots of 5 floats
+            val snaps = uploadFloats(backend, [1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0, 3.0]) ?? return false
+            val dst = uploadFloats(backend, [0.0, 0.0, 0.0, 0.0, 0.0]) ?? return false
+            if (!backend.launch("copy_select_f32", kernelArgs().pointer(snaps).pointer(dst).pointer(stepWords).u32(5).u32(5), [5])) return false
+            val copied = downloadFloats(backend, dst, 5) ?? return false
+            for (i in 0 until 5) if (copied[i] != f64ToF32(f64FromInt(a + 1))) {
+                println("copy_select a=$a: element $i is ${copied[i]}")
+                ok = false
+            }
+        }
+    }
     ok
 }
 

@@ -332,3 +332,13 @@ fun opTapStoreStep(
 ): bool = backend.launch(
     "tap_store_step", kernelArgs().pointer(src, srcOffset).pointer(tap, 0).pointer(step, 0).u32(n).u32(slot).u32(slots), [n]
 )
+
+// ---- speculation cycle (docs/spec-cycle.md) ----
+fun opSpecBegin(var backend: Backend, step: DeviceBuffer, spec: DeviceBuffer): bool =
+    backend.launch("spec_begin", kernelArgs().pointer(step, 0).pointer(spec, 0), [1])
+
+fun opSpecAccept(var backend: Backend, step: DeviceBuffer, spec: DeviceBuffer, maxCtx: int): bool =
+    backend.launch("spec_accept", kernelArgs().pointer(step, 0).pointer(spec, 0).u32(maxCtx), [1])
+
+fun opCopySelect(var backend: Backend, src: DeviceBuffer, srcOffset: int, dst: DeviceBuffer, dstOffset: int, step: DeviceBuffer, n: int, strideFloats: int): bool =
+    backend.launch("copy_select_f32", kernelArgs().pointer(src, srcOffset).pointer(dst, dstOffset).pointer(step, 0).u32(n).u32(strideFloats), [n])

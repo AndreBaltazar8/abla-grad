@@ -51,3 +51,44 @@ extern "C" __global__ void tap_store_step(const float *src, float *tap, const un
     tap[at] = src[i];
 }
 """
+
+// ---- speculation cycle kernels (docs/spec-cycle.md) ----
+// `spec` is u32[8]: [0..2] the verification rows' token ids (anchor, p1, p2), [3] the number of proposals n (0..2), [4..6] the target's argmax after each
+// row, [7] unused. The token log is the step buffer's word 4 + position: log[j] = the token at position j + 1 (as in the decode graph).
+
+// spec[0] = the anchor (step[0]); the drafter writes p1, p2 and n after this.
+val kernelSpecBegin = """
+extern "C" __global__ void spec_begin(const unsigned *step, unsigned *spec) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) spec[0] = step[0];
+}
+"""
+
+// Greedy acceptance: a proposal is accepted when the target's argmax after the previous row equals it. Logs the argmax of the committed rows (and the one
+// after the last), moves the anchor to the argmax after the last accepted row, advances the position by a + 1 and leaves a in step[3].
+val kernelSpecAccept = """
+extern "C" __global__ void spec_accept(unsigned *step, const unsigned *spec, unsigned maxCtx) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    unsigned pos = step[1];
+    unsigned n = spec[3];
+    unsigned a = 0;
+    if (n >= 1 && spec[4] == spec[1]) {
+        a = 1;
+        if (n >= 2 && spec[5] == spec[2]) a = 2;
+    }
+    for (unsigned k = 0; k <= a; ++k) {
+        if (pos + k < maxCtx) step[4 + pos + k] = spec[4 + k];
+    }
+    step[0] = spec[4 + a];
+    step[3] = a;
+    step[1] = pos + a + 1;
+}
+"""
+
+// dst[0..n) = src[step[3] * strideFloats ..): the snapshot of the conv histories after the last committed row replaces the live histories.
+val kernelCopySelect = """
+extern "C" __global__ void copy_select_f32(const float *src, float *dst, const unsigned *step, unsigned n, unsigned strideFloats) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = src[(unsigned long long)step[3] * strideFloats + i];
+}
+"""

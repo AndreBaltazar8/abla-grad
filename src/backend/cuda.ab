@@ -299,6 +299,10 @@ private val cudaArgsKvStoreStep = [
 private val cudaArgsScaleTau = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_F32, KERNEL_ARG_F32, KERNEL_ARG_U32]
 private val cudaArgsStepAdvance = [KERNEL_ARG_POINTER]
 private val cudaArgsStepRecord = [KERNEL_ARG_POINTER]
+private val cudaArgsSpecBegin = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER]
+private val cudaArgsSpecAccept = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32]
+private val cudaArgsCopySelect = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32]
+private fun cudaCopySelectShape(args: KernelArgs, problem: array<int>): bool = args.words[3] == problem[0]
 private val cudaArgsTapStore = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32]
 private fun cudaTapStoreShape(args: KernelArgs, problem: array<int>): bool = args.words[3] == problem[0] && args.words[4] < args.words[5]
 private fun cudaKvStoreStepShape(args: KernelArgs, problem: array<int>): bool = args.words[5] * args.words[6] == problem[0]
@@ -478,6 +482,9 @@ private val cudaKernels = [
     CudaKernelSpec("scale_tau", kernelScaleTau, 256, 256, cudaArgsScaleTau, cudaScaleTauShape),
     CudaKernelSpec("step_advance", kernelStepAdvance, 1, 1, cudaArgsStepAdvance, cudaStepAdvanceShape),
     CudaKernelSpec("step_record", kernelStepRecord, 1, 1, cudaArgsStepRecord, cudaStepAdvanceShape),
+    CudaKernelSpec("spec_begin", kernelSpecBegin, 1, 1, cudaArgsSpecBegin, cudaStepAdvanceShape),
+    CudaKernelSpec("spec_accept", kernelSpecAccept, 1, 1, cudaArgsSpecAccept, cudaStepAdvanceShape),
+    CudaKernelSpec("copy_select_f32", kernelCopySelect, 256, 256, cudaArgsCopySelect, cudaCopySelectShape),
     CudaKernelSpec("tap_store_step", kernelTapStoreStep, 256, 256, cudaArgsTapStore, cudaTapStoreShape),
     CudaKernelSpec("attention_rel_split_step", kernelAttentionSplit, 1, 256, cudaArgsAttentionSplit, cudaAttentionSplitShape),
     CudaKernelSpec("attention_rel_merge", kernelAttentionSplit, 1, 256, cudaArgsAttentionMerge, cudaAttentionMergeShape),
