@@ -11,7 +11,7 @@ contracts between the parts and who owns what). Local repo only until André OKs
 ## Layers (nothing above a layer touches the one below it)
 
 ```
-src/main.ab, src/cli/        commands: info, tokenize, logits, compare, generate
+src/main.ab, src/cli/        commands: info, tokenize, logits, compare, generate, chat (+ benchmarks and checks, see docs/speed.md)
 src/model/                   config from GGUF metadata, weights, KV cache, the graph (llama-family, then Inkling)
 src/ops.ab                   typed ops over Backend: matvec(format, ...), rmsnorm, rope, attention, moe, ...
 src/backend/backend.ab       the backend interface: buffers, kernel launch, synchronisation
@@ -40,6 +40,30 @@ user message with the model’s text chat template. The embedded GGUF tokenizer 
 `--tokenizer PATH` selects its separate `tokenizer.json`. Generation is greedy by default. Use `--temp T` with
 `--top-p P` and `--seed S` for reproducible sampling. `--ctx N` sets the total prompt and continuation budget.
 Output streams to stdout as complete UTF-8 and ends at the model’s end-of-turn token or the token limit.
+
+## Chatting with Inkling
+
+```
+nix-shell shell.nix --run 'abla-grad chat ~/models/inkling-2-mini/Inkling-2-Mini-UD-Q4_K_M.gguf --tokenizer ~/models/inkling-2-mini/tokenizer.json'
+```
+
+A multi-turn chat on the 4090. What you type is read line by line; the reply streams as it is decoded. The model, the
+drafter and the whole conversation stay on the GPU between turns: the KV caches, the short-convolution histories and the
+drafter's taps are kept, so a turn processes only its own new tokens (a few dozen for a typical message, a chat-length paste
+through the batched prefill) and never the history again. Replies are greedy and use speculative decoding with the DSpark
+drafter (`docs/speculation.md`): a cycle drafts a few tokens and the target verifies them in one batch, and a controller
+falls back to plain decoding whenever the text does not repay speculation. Typical speeds on a 4090: about 125-130 tok/s
+on prose, 150-250 tok/s on predictable text such as lists and code. The first turn also loads the model (about ten seconds).
+
+- The drafter file `dspark-Inkling-2-Mini-Q8_0.gguf` is looked up next to the model (or `--drafter PATH`; Unsloth's
+  `Mainline_Support/dspark-Inkling-2-Mini-Q8_0.gguf`, Apache-2.0, sha256 `3da00cf7c31bbe5662b3c0d373ecf782d74d32ef43990acc158ce60c2add72e0`).
+- Thinking is hidden (shown as a dim `...` while it runs); `--show-thinking` prints it in grey.
+- `--system TEXT` sets a system message, `--ctx N` the conversation budget in tokens (default 8192), `--max-tokens N` the longest reply (default 1024),
+  `--speculate off` plain decoding only.
+- At the prompt: `/reset` starts a new conversation, `/quit` leaves (so does end of input), `/help` lists them. A conversation that no longer fits
+  `--ctx` is refused until `/reset`.
+- After every turn a line on stderr reports the tokens processed, the tokens generated and the decode speed.
+- Piped input works (`printf 'Hi\n/quit\n' | abla-grad chat ...`): one line per turn.
 
 ## Rules
 

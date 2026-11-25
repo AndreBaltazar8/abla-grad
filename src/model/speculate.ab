@@ -18,7 +18,9 @@ private var speculateError = ""
 
 fun speculateLastError(): string = if (speculateError != "") speculateError else dsparkLastError()
 
-class SpecStats(var cycleTokens: int = 0, var plainTokens: int = 0, var cycles: int = 0, var switches: int = 0, var loopNanos: int = 0)
+class SpecStats(
+    var cycleTokens: int = 0, var plainTokens: int = 0, var cycles: int = 0, var switches: int = 0, var loopNanos: int = 0, var feedNanos: int = 0, var fedTokens: int = 0
+)
 
 // Extra positions the context needs beyond prompt + generated tokens (a batch of cycles can overshoot the last token by up to 3 rows each).
 val SPEC_CONTEXT_SLACK = 40
@@ -27,9 +29,9 @@ val SPEC_CONTEXT_SLACK = 40
 val SPEC_DEFAULT_PROPOSALS = 2
 
 private val SPEC_BATCH_CYCLES = 2          // while sweeping or probing; the steady state uses twice that
-private val SPEC_BATCH_CYCLES_RUN = 4
+private val SPEC_BATCH_CYCLES_RUN = 3
 private val SPEC_BATCH_TOKENS = 8
-private val SPEC_BATCH_TOKENS_RUN = 32
+private val SPEC_BATCH_TOKENS_RUN = 16
 // The drafter attends to at most this many recent taps (dspark_config: sliding window 1025); older prompt positions may come from the batched prefill.
 private val SPEC_EXACT_WINDOW = 1025
 
@@ -42,53 +44,125 @@ private trusted fun specZero(var backend: Backend, spec: DeviceBuffer): bool {
     ok
 }
 
-/** Generates up to `maxTokens` greedy tokens after `prompt` (not including stop tokens), calling `emit` for each as soon as a batch commits it.
- *  The model must be freshly reset and loaded with a context of at least prompt.size + maxTokens + SPEC_CONTEXT_SLACK. */
-fun speculativeGenerate(
-    var backend: Backend, var model: InklingModel, draftFile: GgufFile, prompt: array<int>, maxTokens: int, stops: array<int>,
-    adaptive: bool, maxProposals: int, var stats: SpecStats, var emit: FnMut(int) -> void
-): bool {
+/** A speculative-decoding session over one model: the drafter, the verification workspace and the recorded graphs (plain decode and the cycles), plus the
+ *  conversation so far. Turns can follow each other: the model's KV caches, convolution histories and taps stay, and a turn feeds only what is new.
+ *  `seq` holds the tokens of positions 0 .. seq.size - 1 (the prompt and what was generated); `position` is how many of them the model has processed
+ *  (state restored to the last batch boundary after a turn, so the tokens from there on are fed again at the start of the next turn). */
+resource class SpecSession(
+    var drafter: DsparkDrafter,
+    val ws: PrefillWorkspace,
+    val spec: DeviceBuffer,
+    val snap: DeviceBuffer,
+    val plain: Recording,
+    val cycle2: Recording,
+    val cycle3: Recording?,
+    val cycle4: Recording?,
+    val maxProposals: int,
+    val seq: array<int> = [],
+    var position: int = 0,
+    val tc: array<f64> = [0.0, 0.0, 0.0, 0.0],
+    var tp: f64 = 0.0,
+    val hist: array<f64> = [],
+    val histTick: array<int> = [0, 0, 0, 0],
+    val deviceHist: array<int> = [0, 0, 0, 0, 0],
+    var tick: int = 0,
+    var sweepDone: bool = false,
+    var sweepArm: int = 0,
+    var lastArm: int = 0,
+    var refreshEvery: int = 64,
+    // feeds longer than this many tokens go through the batched prefill except for their last `exactWindow` tokens (step mode: exact taps for the drafter)
+    var exactWindow: int = SPEC_EXACT_WINDOW
+)
+
+/** Creates a session: enables the taps, loads the drafter and records the graphs (nothing runs). The model must be reset. */
+fun specSessionCreate(var backend: Backend, var model: InklingModel, draftFile: GgufFile, maxProposals: int): SpecSession? {
     speculateError = ""
-    val config = model.config
-    val length = prompt.size
-    if (length == 0 || maxTokens <= 0 || model.maxCtx < length + maxTokens + SPEC_CONTEXT_SLACK) {
-        speculateError = "the context must hold the prompt, the generated tokens and ${SPEC_CONTEXT_SLACK} positions of slack"
-        return false
-    }
     model.useStep = true
     if (!model.enableTaps(backend)) {
         speculateError = inklingLastError()
-        return false
+        return null
     }
-    var drafter = dsparkLoad(backend, draftFile, model.maxCtx, maxProposals) ?? return false
-    val ws = prefillWorkspace(backend, config, 5, true, 5)
+    var drafter = dsparkLoad(backend, draftFile, model.maxCtx, maxProposals) ?? return null
+    val ws = prefillWorkspace(backend, model.config, 5, true, 5)
     if (ws == null) {
         speculateError = inklingPrefillLastError()
-        return false
+        return null
     }
     val spec = backend.allocate(128)
     if (spec == null || !specZero(backend, spec)) {
         speculateError = "device memory for the speculation state is not available"
+        return null
+    }
+    val snap = backend.allocate(model.history.bytes + 16)
+    if (snap == null) {
+        speculateError = "device memory for the history snapshot is not available"
+        return null
+    }
+    // the graphs: kernels are loaded as the recording launches them; recording runs nothing
+    val plain = model.capture(backend)
+    if (plain == null) {
+        speculateError = inklingLastError()
+        return null
+    }
+    val cycle2 = recordCycle(backend, model, drafter, ws, spec, 2)
+    val cycle3 = if (maxProposals >= 3) recordCycle(backend, model, drafter, ws, spec, 3) else null
+    val cycle4 = if (maxProposals >= 4) recordCycle(backend, model, drafter, ws, spec, 4) else null
+    if (cycle2 == null || (maxProposals >= 3 && cycle3 == null) || (maxProposals >= 4 && cycle4 == null)) {
+        speculateError = "recording a cycle failed: ${dsparkLastError()} ${inklingLastError()}"
+        return null
+    }
+    val session = SpecSession(move(drafter), move(ws), move(spec), move(snap), move(plain), move(cycle2), move(cycle3), move(cycle4), maxProposals)
+    for (i in 0 until 20) session.hist.append(0.0)
+    session
+}
+
+/** Forgets the conversation (the model must be reset by the caller); the controller's measurements stay. */
+fun SpecSession.restart(): void {
+    this.seq.clear()
+    this.position = 0
+}
+
+/** Appends tokens to the conversation without generating them (fed at the start of the next turn). */
+fun SpecSession.append(tokens: array<int>): void {
+    for (token in tokens) this.seq.append(token)
+}
+
+/** Processes the tokens not yet in the model's state, then generates up to `maxTokens` greedy tokens (not including stop tokens), calling `emit` for each as
+ *  soon as a batch commits it. The generated tokens (and the stop token, if one ended the turn) join `seq`. The model's context must hold seq.size + maxTokens
+ *  + SPEC_CONTEXT_SLACK positions. With `adaptive` the controller chooses between the plain graph and the cycles; otherwise the top cycle arm runs. */
+fun SpecSession.turn(
+    var backend: Backend, var model: InklingModel, maxTokens: int, stops: array<int>, adaptive: bool, plainOnly: bool, var stats: SpecStats, var emit: FnMut(int) -> void
+): bool {
+    speculateError = ""
+    val config = model.config
+    val start = this.position
+    val length = this.seq.size
+    if (length == 0 || maxTokens <= 0 || model.maxCtx < length + maxTokens + SPEC_CONTEXT_SLACK) {
+        speculateError = "the context must hold the conversation, the generated tokens and ${SPEC_CONTEXT_SLACK} positions of slack"
         return false
     }
-    // seed: the older prompt positions through the batched prefill, the last SPEC_EXACT_WINDOW in step mode (exact taps)
-    var seeded = 0
-    if (length - 1 > SPEC_EXACT_WINDOW) {
+    // the drafter forgets everything from `start` on (its taps are pushed again for the tokens fed below)
+    val fed = monotonicNanoseconds()
+    this.drafter.committed = start
+    this.drafter.stepPrepared = false
+    // feed: older positions through the batched prefill when there are many, the last SPEC_EXACT_WINDOW in step mode (exact taps)
+    var seeded = start
+    if (length - 1 - start > this.exactWindow) {
         val seedWs = prefillWorkspace(backend, config, 512, false)
         if (seedWs == null) {
             speculateError = inklingPrefillLastError()
             return false
         }
         val head: array<int> = []
-        for (i in 0 until length - 1 - SPEC_EXACT_WINDOW) head.append(prompt[i])
-        if (!model.prefill(backend, seedWs, head, 0)) {
+        for (i in start until length - 1 - this.exactWindow) head.append(this.seq[i])
+        if (!model.prefill(backend, seedWs, head, start)) {
             speculateError = inklingPrefillLastError()
             return false
         }
-        seeded = head.size
+        seeded = start + head.size
     }
-    for (position in seeded until length) {
-        if (!model.forward(backend, prompt[position], position)) {
+    for (p in seeded until length) {
+        if (!model.forward(backend, this.seq[p], p)) {
             speculateError = inklingLastError()
             return false
         }
@@ -97,23 +171,13 @@ fun speculativeGenerate(
         speculateError = "the first token could not be chosen"
         return false
     }
-    if (!drafter.pushTaps(backend, model.taps, 0, length) || !drafter.prepareStep(backend) || !backend.synchronize()) {
+    if (!this.drafter.pushTaps(backend, model.taps, start, length - start) || !this.drafter.prepareStep(backend) || !backend.synchronize()) {
         speculateError = dsparkLastError()
         return false
     }
-    // the plain graph and one cycle graph per n-max (n proposals, n + 1 verification rows): kernels are loaded by the seeding; recording runs nothing
-    val plain = model.capture(backend)
-    if (plain == null) {
-        speculateError = inklingLastError()
-        return false
-    }
-    val cycle2 = recordCycle(backend, model, drafter, ws, spec, 2)
-    val cycle3 = if (maxProposals >= 3) recordCycle(backend, model, drafter, ws, spec, 3) else null
-    val cycle4 = if (maxProposals >= 4) recordCycle(backend, model, drafter, ws, spec, 4) else null
-    if (cycle2 == null || (maxProposals >= 3 && cycle3 == null) || (maxProposals >= 4 && cycle4 == null)) {
-        speculateError = "recording a cycle failed: ${dsparkLastError()} ${inklingLastError()}"
-        return false
-    }
+    this.position = length
+    stats.feedNanos = stats.feedNanos + (monotonicNanoseconds() - fed)
+    stats.fedTokens = stats.fedTokens + (length - start)
     // the first generated token is the anchor chosen above (position `length`); later ones come from the token log (log[j] = the token at position j + 1)
     val anchor = model.readStepWord(backend, 0)
     if (anchor == null) {
@@ -121,6 +185,7 @@ fun speculativeGenerate(
         return false
     }
     var produced = 0
+    this.seq.append(anchor)
     for (stop in stops) if (stop == anchor) return true
     emit(anchor)
     produced = 1
@@ -130,38 +195,39 @@ fun speculativeGenerate(
     // scores every arm in tokens/s from two stable costs and one text-dependent quantity: seconds per plain token (tp) and per cycle of each arm (tc, they do
     // not depend on the text), and the tokens per cycle, which the device's histogram of accepted proposals gives: a cycle with n proposals accepts
     // min(a, n) of the proposals a cycle with more proposals would have accepted, so one histogram from the top arm prices every smaller arm.
-    val arms = if (maxProposals >= 4) 4 else if (maxProposals >= 3) 3 else 2
+    // Costs and histograms stay in the session: later turns start on the best arm without a sweep.
+    val arms = if (this.maxProposals >= 4) 4 else if (this.maxProposals >= 3) 3 else 2
     val top = arms - 1
-    val tc: array<f64> = [0.0, 0.0, 0.0, 0.0]
-    var tp = 0.0
-    val hist: array<f64> = []
-    for (i in 0 until 20) hist.append(0.0)
-    val histTick: array<int> = [0, 0, 0, 0]
-    val deviceHist: array<int> = [0, 0, 0, 0, 0]
-    var tick = 0
-    var arm = if (adaptive) 0 else top
-    var sweeping = adaptive
+    var arm = if (plainOnly) 0 else if (!adaptive) top else if (this.sweepDone) this.lastArm else this.sweepArm
+    var sweeping = adaptive && !plainOnly && !this.sweepDone
     var refreshing = false
     var batchesOnArm = 0
     var sinceRefresh = 0
-    var refreshEvery = 64
     var armBeforeRefresh = 0
+    val floats = model.history.bytes / 4
     val started = monotonicNanoseconds()
+    var batchStart = position
     while (produced < maxTokens) {
         val before = position
+        batchStart = position
+        // the conversation can end inside this batch: the convolution histories are restored to this point afterwards
+        if (!backend.launch("copy_f32", kernelArgs().pointer(model.history).pointer(this.snap).u32(floats), [floats])) {
+            speculateError = "the history snapshot failed"
+            return false
+        }
         val warm = batchesOnArm == 0
         val small = sweeping || refreshing || warm
         val t0 = monotonicNanoseconds()
         var batchCycles = 0
         if (arm == 0) {
-            if (!model.replayMany(backend, plain, specBound(if (small) SPEC_BATCH_TOKENS else SPEC_BATCH_TOKENS_RUN, maxTokens - produced))) {
+            if (!model.replayMany(backend, this.plain, specBound(if (small) SPEC_BATCH_TOKENS else SPEC_BATCH_TOKENS_RUN, maxTokens - produced))) {
                 speculateError = inklingLastError()
                 return false
             }
         } else {
             batchCycles = specBound(if (small) SPEC_BATCH_CYCLES else SPEC_BATCH_CYCLES_RUN, (maxTokens - produced + 2) / 3)
             for (b in 0 until batchCycles) {
-                val replayed = if (arm == 1) backend.replay(cycle2) else if (arm == 2) replayOptional(backend, cycle3) else replayOptional(backend, cycle4)
+                val replayed = if (arm == 1) backend.replay(this.cycle2) else if (arm == 2) replayOptional(backend, this.cycle3) else replayOptional(backend, this.cycle4)
                 if (!replayed) {
                     speculateError = "replaying a cycle failed"
                     return false
@@ -188,35 +254,52 @@ fun speculativeGenerate(
             return false
         }
         logged = position
+        var ended = false
         for (token in fresh) {
-            for (stop in stops) if (stop == token) {
-                stats.loopNanos = monotonicNanoseconds() - started
-                return true
+            this.seq.append(token)
+            var isStop = false
+            for (stop in stops) if (stop == token) isStop = true
+            if (isStop) {
+                ended = true
+                break
             }
             emit(token)
             produced = produced + 1
             if (produced >= maxTokens) {
-                stats.loopNanos = monotonicNanoseconds() - started
-                return true
+                ended = true
+                break
             }
         }
-        if (!adaptive) continue
+        if (ended) {
+            // the state is back at the start of this batch (convolution histories from the snapshot); the tokens from there on are fed again next turn
+            if (!backend.launch("copy_f32", kernelArgs().pointer(this.snap).pointer(model.history).u32(floats), [floats]) || !backend.synchronize()) {
+                speculateError = "restoring the history failed"
+                return false
+            }
+            this.position = batchStart
+            this.lastArm = arm
+            this.sweepDone = adaptive && !plainOnly && !sweeping
+            this.sweepArm = arm
+            stats.loopNanos = stats.loopNanos + (monotonicNanoseconds() - started)
+            return true
+        }
+        if (!adaptive || plainOnly) continue
         // learn: costs (not from the warm-up batch) and the accepted-proposal histogram
-        tick = tick + 1
+        this.tick = this.tick + 1
         if (arm == 0) {
-            if (!warm && position > before) tp = if (tp == 0.0) seconds / f64FromInt(position - before) else 0.5 * tp + 0.5 * seconds / f64FromInt(position - before)
+            if (!warm && position > before) this.tp = if (this.tp == 0.0) seconds / f64FromInt(position - before) else 0.5 * this.tp + 0.5 * seconds / f64FromInt(position - before)
         } else {
-            if (!warm && batchCycles > 0) tc[arm] = if (tc[arm] == 0.0) seconds / f64FromInt(batchCycles) else 0.5 * tc[arm] + 0.5 * seconds / f64FromInt(batchCycles)
-            val words = model.readSpecHist(backend, spec)
+            if (!warm && batchCycles > 0) this.tc[arm] = if (this.tc[arm] == 0.0) seconds / f64FromInt(batchCycles) else 0.5 * this.tc[arm] + 0.5 * seconds / f64FromInt(batchCycles)
+            val words = model.readSpecHist(backend, this.spec)
             if (words == null) {
                 speculateError = inklingLastError()
                 return false
             }
             for (a in 0 until 5) {
-                hist[arm * 5 + a] = hist[arm * 5 + a] * 0.97 + f64FromInt(words[a] - deviceHist[a])
-                deviceHist[a] = words[a]
+                this.hist[arm * 5 + a] = this.hist[arm * 5 + a] * 0.97 + f64FromInt(words[a] - this.deviceHist[a])
+                this.deviceHist[a] = words[a]
             }
-            histTick[arm] = tick
+            this.histTick[arm] = this.tick
         }
         batchesOnArm = batchesOnArm + 1
         // choose the next arm
@@ -230,24 +313,25 @@ fun speculativeGenerate(
                     next = arm + 1
                 } else {
                     sweeping = false
-                    next = specBest(arms, tp, tc, hist, histTick)
+                    next = specBest(arms, this.tp, this.tc, this.hist, this.histTick)
                     sinceRefresh = 0
                 }
             }
         } else if (refreshing) {
             if (batchesOnArm >= 3) {
                 refreshing = false
-                next = specBest(arms, tp, tc, hist, histTick)
+                next = specBest(arms, this.tp, this.tc, this.hist, this.histTick)
                 // a refresh that changed nothing makes the next one rarer; one that changed the arm makes it sooner
-                refreshEvery = if (next == armBeforeRefresh) (if (refreshEvery * 2 > 768) 768 else refreshEvery * 2) else 192
+                this.refreshEvery = if (next == armBeforeRefresh) (if (this.refreshEvery * 2 > 768) 768 else this.refreshEvery * 2) else 192
                 sinceRefresh = 0
             }
         } else {
-            val best = specBest(arms, tp, tc, hist, histTick)
+            val best = specBest(arms, this.tp, this.tc, this.hist, this.histTick)
             // hysteresis: leaving plain needs 5% more, leaving a cycle arm for plain 10% more, between cycle arms 8%
             val margin = if (arm == 0) 1.05 else if (best == 0) 1.10 else 1.08
-            if (best != arm && batchesOnArm >= 3 && specScore(best, tp, tc, hist, histTick) > specScore(arm, tp, tc, hist, histTick) * margin) next = best
-            if (next == arm && sinceRefresh >= refreshEvery && arm != top) {
+            if (best != arm && batchesOnArm >= 3 &&
+                specScore(best, this.tp, this.tc, this.hist, this.histTick) > specScore(arm, this.tp, this.tc, this.hist, this.histTick) * margin) next = best
+            if (next == arm && sinceRefresh >= this.refreshEvery && arm != top) {
                 armBeforeRefresh = arm
                 // the histogram of the top arm is stale: run it for a few batches
                 next = top
@@ -258,7 +342,7 @@ fun speculativeGenerate(
         if (next != arm) {
             if (arm == 0) {
                 // back to a cycle graph: the drafter catches up on the plain tokens' taps
-                if (!drafter.resume(backend, model.taps, position)) {
+                if (!this.drafter.resume(backend, model.taps, position)) {
                     speculateError = dsparkLastError()
                     return false
                 }
@@ -268,8 +352,21 @@ fun speculativeGenerate(
             batchesOnArm = 0
         }
     }
-    stats.loopNanos = monotonicNanoseconds() - started
+    // the token budget ended exactly at the anchor (maxTokens 1): the state is the fed prompt
+    this.lastArm = arm
+    stats.loopNanos = stats.loopNanos + (monotonicNanoseconds() - started)
     true
+}
+
+/** One conversation turn in a new session: generates up to `maxTokens` greedy tokens after `prompt` (not including stop tokens). The model must be freshly reset
+ *  and loaded with a context of at least prompt.size + maxTokens + SPEC_CONTEXT_SLACK. */
+fun speculativeGenerate(
+    var backend: Backend, var model: InklingModel, draftFile: GgufFile, prompt: array<int>, maxTokens: int, stops: array<int>,
+    adaptive: bool, maxProposals: int, var stats: SpecStats, var emit: FnMut(int) -> void
+): bool {
+    var session = specSessionCreate(backend, model, draftFile, maxProposals) ?? return false
+    session.append(prompt)
+    session.turn(backend, model, maxTokens, stops, adaptive, false, stats, emit)
 }
 
 // Tokens per second of an arm from the measured costs: plain 1 / tp; a cycle arm with n proposals yields 1 + sum_{j <= n} P(accepted >= j) tokens per cycle, with the
