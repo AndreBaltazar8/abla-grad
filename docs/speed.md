@@ -172,3 +172,35 @@ flags, sample count/statistic, GPU, gate outcome and raw artifact path in
 one short note if they differ from the existing setup. Use a dash for a
 missing cell. Keep exploratory runs, profiles and private captures in the
 local artifact archive. Older results remain in Git history.
+
+## Long-context retrieval by KV precision
+
+One fixed Inkling UD-Q4_K_M fixture per context on the RTX 4090. Both
+engines received identical prompt token IDs. Four records at roughly
+6%, 28%, 53% and 79% of each prompt supply a badge lookup and a
+three-fact question that joins a dispatch, ticket and site directory.
+A deterministic scorer checks the final JSON, with 512 tokens reserved
+for greedy generation. Table cells show badge retrieval and facts
+retrieved.
+
+| Input tokens | Abla global F32 | Abla global F16 | Abla global Q8 | llama.cpp F16 | llama.cpp Q8_0 |
+|---:|:---:|:---:|:---:|:---:|:---:|
+| 32,256 | 1/1, 3/3 | 1/1, 3/3 | 1/1, 3/3 | 1/1, 3/3 | 1/1, 3/3 |
+| 65,024 | 1/1, 3/3 | 1/1, 3/3 | 1/1, 3/3 | 1/1, 3/3 | 1/1, 3/3 |
+| 130,560 | Unscored (out of memory) | 1/1, 3/3 | 1/1, 3/3 | 1/1, 3/3 | 1/1, 3/3 |
+
+Abla used `cf6578c`, target-only graph decode and 512-token prefill
+chunks. Sliding KV stayed F16 while global KV varied. Abla's Q8 stores
+a block of 32 signed bytes with an FP32 scale. llama.cpp `33aeb17`
+used its selected F16 or Q8_0 format for both global and sliding KV,
+with batch/microbatch 64. At 128k its F16 run required batch/microbatch
+32 after CUDA graph instantiation exhausted memory at 64. Abla's 128k
+global F32 attempt failed in KV allocation with `cuMemAlloc` status 2.
+
+The ID hashes, raw answers and launch commands are in
+`~/archive/abla-grad-context-quality/`. Generate the fixture and score
+answers with `tools/context-quality.mjs`. Run Abla with
+`decode-bench MODEL IDS --mode graph --ctx CONTEXT --batch-seed --f16-kv --global-kv 8 --n 512 --log answer.ids`
+under the GPU lock, selecting global KV 8, 16 or 32. Decode answer IDs
+with the vocabulary-only mode of `tools/oracle/context-greedy.c`.
+These results cover the fixed lookup and fact-join fixture at each depth.
