@@ -29,7 +29,7 @@ fun setPrefillRegisterDirect(on: bool): void {
 private var prefillVerifyRows = 0
 
 // The most rows the R-row matvec kernels take (3 until the 4/5-row union kernels land); more rows use the tile kernels.
-private val prefillRowsMax = 3
+private val prefillRowsMax = 5
 
 // false: the scalar attention kernel (f32 throughout), for A/B checks.
 private var prefillTensorAttention = true
