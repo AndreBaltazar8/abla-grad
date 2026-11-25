@@ -115,6 +115,10 @@ resource class InklingModel(
     val bank: DeviceBuffer,
     // u32[4]: token, position, reserved. Read by the *_step kernels when `useStep` is set (needed for a recorded token).
     val step: DeviceBuffer,
+    // Hidden-state taps for the speculative drafter, position-major [position][4][nEmbd] f32 (the inputs of visits 5, 23, 41 and the final-norm output);
+    // 16 bytes until `enableTaps`, then maxCtx records. Written by the step-mode forward only.
+    var taps: DeviceBuffer,
+    var tapsOn: bool = false,
     // Use the step-buffer kernels (token and position come from `step`, uploaded by `forward`); required for `inklingCapture`.
     var useStep: bool = false,
     // Split-position decode attention in step mode (--no-split restores the one-block-per-head kernel for A/B runs).
@@ -151,11 +155,12 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
     val blocks = backend.allocate((c.nLayer + 2) * c.nEmbd * 4)
     val bank = backend.allocate((c.nLayer + 2) * c.nEmbd * 4)
     val step = backend.allocate(16 + 4 * maxCtx)
-    if (scratch == null || kCache == null || vCache == null || history == null || blocks == null || bank == null || step == null) {
+    val taps = backend.allocate(16)
+    if (scratch == null || kCache == null || vCache == null || history == null || blocks == null || bank == null || step == null || taps == null) {
         inklingError = "device memory for the activations, KV caches and convolution histories is not available"
         return null
     }
-    InklingModel(c, plan, map, maxCtx, visits, move(arena), move(scratch), move(kCache), move(vCache), move(history), move(blocks), move(bank), move(step))
+    InklingModel(c, plan, map, maxCtx, visits, move(arena), move(scratch), move(kCache), move(vCache), move(history), move(blocks), move(bank), move(step), move(taps))
 }
 
 // Zeroes the convolution histories (a fresh sequence).
@@ -239,7 +244,11 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     val normed = this.so("normed")
     val mixed = this.so("mixed")
     var blocks = nBlocks
-    var ok = this.copy(backend, x, inpSA, n)
+    var ok = true
+    if (this.tapsOn && this.useStep && (visit == 5 || visit == 23 || visit == 41)) {
+        ok = opTapStoreStep(backend, this.scratch, x, this.taps, this.step, n, if (visit == 5) 0 else if (visit == 23) 1 else 2, 4)
+    }
+    ok = ok && this.copy(backend, x, inpSA, n)
 
     // attention inputs
     // The three attention inputs (q, k, v): the depth mix's rows (one shared row for sliding layers) or x itself; in later loop passes the
@@ -565,6 +574,7 @@ private fun InklingModel.run(var backend: Backend, token: int, pos: int): bool {
     // output: depth mix, norm, lm head, softcap
     ok = this.mix(backend, blocks, x, "output_res_query.weight", 1, x)
     ok = ok && this.norm(backend, "output_norm.weight", x, x)
+    if (this.tapsOn && this.useStep) ok = ok && opTapStoreStep(backend, this.scratch, x, this.taps, this.step, n, 3, 4)
     this.dump(backend, pos, "result_norm", x, n)
     val output = this.w("output.weight")
     val outputKind = weightKind(output.type)
@@ -665,4 +675,32 @@ trusted fun InklingModel.readStepWord(var backend: Backend, index: int): int? {
     val word = ablaUnsafeLoadU32(nativePointerFromAddress(address))
     host.close()
     word
+}
+
+// Allocates the tap records (position-major [position][4][nEmbd] f32, maxCtx positions) and turns tap capture on for the step-mode forward.
+fun InklingModel.enableTaps(var backend: Backend): bool {
+    val buffer = backend.allocate(this.maxCtx * 4 * this.config.nEmbd * 4)
+    if (buffer == null) {
+        inklingError = "device memory for the taps is not available"
+        return false
+    }
+    this.taps = move(buffer)
+    this.tapsOn = true
+    true
+}
+
+// The tap record of (`position`, `slot`) as host floats (slot 0..2 = inputs of visits 5, 23, 41; 3 = the final-norm output).
+trusted fun InklingModel.readTap(var backend: Backend, position: int, slot: int): array<f32>? {
+    val n = this.config.nEmbd
+    val host = nativeByteBuffer(n * 4 + 4)
+    val address = nativePointerAddress(host.address)
+    if (!backend.download(this.taps, (position * 4 + slot) * n * 4, address, n * 4)) {
+        inklingError = "downloading a tap failed"
+        host.close()
+        return null
+    }
+    val out: array<f32> = []
+    for (i in 0 until n) out.append(f32FromBits(u32(ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * i)))))
+    host.close()
+    out
 }

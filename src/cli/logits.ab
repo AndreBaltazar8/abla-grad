@@ -12,6 +12,8 @@ import "../model/llama_config.ab"
 import "../model/inkling.ab"
 import "../model/inkling_config.ab"
 import "../compare/grdl.ab"
+import "../model/dump.ab"
+import "abla/float"
 import "logits_prefill.ab"
 import "../model/inkling_prefill.ab"
 
@@ -45,6 +47,7 @@ fun cmdLogits(args: array<string>): int {
     var dumpDir = ""
     var useStep = false
     var noSplit = false
+    var tapsCheck = ""
     var prefill = false
     var chunk = 512
     var noFuse = false
@@ -53,6 +56,9 @@ fun cmdLogits(args: array<string>): int {
     while (index < args.size) {
         if (args[index] == "-o" && index + 1 < args.size) {
             out = args[index + 1]
+            index = index + 2
+        } else if (args[index] == "--taps-check" && index + 1 < args.size) {
+            tapsCheck = args[index + 1]
             index = index + 2
         } else if (args[index] == "--no-split") {
             noSplit = true
@@ -116,6 +122,10 @@ fun cmdLogits(args: array<string>): int {
         model.dumpDir = dumpDir
         model.useStep = useStep
         model.splitAttention = !noSplit
+        if (tapsCheck != "" && (!useStep || !model.enableTaps(backend))) {
+            println("logits: --taps-check needs --step and device memory for the taps")
+            return 2
+        }
         model.fused = !noFuse
         if (!model.reset(backend)) {
             println("logits: could not clear the convolution state (${cudaLastError()})")
@@ -136,6 +146,10 @@ fun cmdLogits(args: array<string>): int {
                 return 1
             }
             for (value in row) all.append(value)
+            if (tapsCheck != "" && position == 0) {
+                // the taps of position 0 against a direct run's dumps (logits --dump DIR on the same one-token prompt)
+                if (!tapCheck(backend, model, tapsCheck, 0, "l_out-4") || !tapCheck(backend, model, tapsCheck, 3, "result_norm")) return 1
+            }
         }
         vocab = config.nVocab
     } else {
@@ -169,4 +183,22 @@ fun cmdLogits(args: array<string>): int {
     }
     println("logits: ${ids.size} positions x $vocab written to $out")
     0
+}
+
+// `--taps-check DIR`: tap record (position 0, `slot`) against the direct run's dump DIR/name.f32.
+private fun tapCheck(var backend: Backend, model: InklingModel, dir: string, slot: int, name: string): bool {
+    val tap = model.readTap(backend, 0, slot)
+    val dumped = readFloatFile("$dir/$name.f32")
+    if (tap == null || dumped == null || tap.size != dumped.size) {
+        println("logits: taps-check: cannot read $name")
+        return false
+    }
+    var worst = 0.0
+    for (i in 0 until tap.size) {
+        val d = f32ToF64(tap[i]) - f32ToF64(dumped[i])
+        if (d > worst) worst = d
+        if (-d > worst) worst = -d
+    }
+    println("logits: taps-check $name: max abs difference $worst")
+    worst < 0.0001
 }

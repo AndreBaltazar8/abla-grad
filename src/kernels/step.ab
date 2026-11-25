@@ -41,3 +41,13 @@ extern "C" __global__ void step_record(unsigned *step) {
     if (blockIdx.x == 0 && threadIdx.x == 0) step[4 + step[1]] = step[0];
 }
 """
+
+// tap[step[1]][slot][0..n) = src[0..n): copies a hidden state into the tap record of the current position (tap is position-major [position][slots][n]).
+val kernelTapStoreStep = """
+extern "C" __global__ void tap_store_step(const float *src, float *tap, const unsigned *step, unsigned n, unsigned slot, unsigned slots) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned long long at = ((unsigned long long)step[1] * slots + slot) * n + i;
+    tap[at] = src[i];
+}
+"""

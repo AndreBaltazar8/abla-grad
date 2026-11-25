@@ -325,3 +325,10 @@ fun opGateUpSitu(
     if (useScales) args.pointer(scales, scalesOffset) else args.u64(0)
     backend.launch(inklingGateUpSitu.name, args.pointer(out, outOffset), [nFf, nUsed])
 }
+
+// Hidden-state taps for the speculative drafter: tap[pos][slot] = src (n floats), pos from the step buffer.
+fun opTapStoreStep(
+    var backend: Backend, src: DeviceBuffer, srcOffset: int, tap: DeviceBuffer, step: DeviceBuffer, n: int, slot: int, slots: int
+): bool = backend.launch(
+    "tap_store_step", kernelArgs().pointer(src, srcOffset).pointer(tap, 0).pointer(step, 0).u32(n).u32(slot).u32(slots), [n]
+)
