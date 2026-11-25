@@ -22,6 +22,7 @@ import "abla/process/environment"
 import "abla/process/time"
 import "../kernels/rmsnorm.ab"
 import "../kernels/abla_rmsnorm.ab"
+import "../kernels/abla_depth_mix.ab"
 import "abla/kernel"
 import "../kernels/rope.ab"
 import "../kernels/attention_decode.ab"
@@ -651,7 +652,7 @@ private val cudaKernels = [
     CudaKernelSpec("moe_route", kernelMoeRoute, 1, 32, cudaArgsMoeRoute, cudaMoeRouteShape, 1, 1),
     CudaKernelSpec("rel_table", kernelRelTable, 256, 256, cudaArgsRelTable, cudaRelTableShape),
     CudaKernelSpec("conv_step", kernelConvStep, 256, 256, cudaArgsConvStep, cudaConvStepShape, 1, 3),
-    CudaKernelSpec("depth_mix", kernelDepthMix, 1, 1024, cudaArgsDepthMix, cudaDepthMixShape),
+    CudaKernelSpec(ablaDepthMixKernel, kernelDepthMix, 1, 1024, cudaArgsDepthMix, cudaDepthMixShape, abla = true),
     // step-buffer kernels (60-2)
     CudaKernelSpec("kv_store_step", kernelKvStoreStep, 256, 256, cudaArgsKvStoreStep, cudaKvStoreStepShape),
     CudaKernelSpec("scale_tau", kernelScaleTau, 256, 256, cudaArgsScaleTau, cudaScaleTauShape),

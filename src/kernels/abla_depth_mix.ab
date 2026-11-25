@@ -1,0 +1,157 @@
+import "abla/float"
+import "abla/kernel"
+import "abla/simd"
+
+// The launch name of this kernel: the CudaKernelSpec that runs it, and its PTX entry (the function's own name).
+val ablaDepthMixKernel = "depth_mix"
+
+// Element `index` of state `s`: bank row `s` (n floats each) below nBank, else cur.
+fun depthMixLoad(bank: KernelF32Buffer, cur: KernelF32Buffer, s: int, nBank: int, n: int, index: int): f32 =
+    if (s < nBank) bank.load(s * n + index) else cur.load(index)
+
+// Elements `index` to `index + 3` of state `s` (see depthMixLoad).
+fun depthMixLoad4(bank: KernelF32Buffer, cur: KernelF32Buffer, s: int, nBank: int, n: int, index: int): f32x4 =
+    if (s < nBank) bank.load4(s * n + index) else cur.load4(index)
+
+// depth_mix as an Abla `@kernel` (ablac #1233), launched by the "depth_mix" spec in src/backend/cuda.ab in place of the
+// CUDA C one in depth_mix.ab; depth_mix_batch stays CUDA C and must keep matching it bit for bit
+// (tests/kernels/prefill_small_test.ab). One group of 1024 threads per query: the states are the nBank bank rows and
+// cur; each subgroup scores states (RMS-normalized dot with the query over sqrt(n)), the first subgroup takes the
+// softmax, and every thread mixes its elements of the normalized states into out (which may be cur when nQuery is 1:
+// a thread reads only the elements of cur it writes after the barriers).
+//
+// It computes what depth_mix.ab computes. The CUDA C one takes its float4 path when n is a multiple of 4 and every
+// pointer is 16-byte aligned, and the scalar one otherwise; this one takes the float4 arithmetic whenever n is a
+// multiple of 4 (load4 reads the same values at any alignment), so the two agree wherever abla-grad launches it (its
+// offsets are whole rows of n floats). The subgroup sums give lane 0 what CUDA's shuffle-down loop gives it; the max and
+// the total are the same butterflies; kernelRsqrt, kernelSqrt and kernelExp are rsqrtf, sqrtf and expf.
+@kernel
+fun depth_mix(bank: KernelF32Buffer, nBank: int, cur: KernelF32Buffer, queries: KernelF32Buffer, nQuery: int,
+    out: KernelF32Buffer, n: int, eps: f32) {
+    val q = kernelGroupId()
+    if (q >= nQuery || nBank >= 64) return
+    val scores = kernelSharedF32(64)
+    val inverse = kernelSharedF32(64)
+    val lane = kernelSubgroupLane()
+    val width = kernelSubgroupSize()
+    val warp = kernelLocalId() / width
+    val warps = kernelGroupSize() / width
+    val states = nBank + 1
+    val base = q * n
+    val packed = n % 4 == 0
+    var s = warp
+    while (s < states) {
+        var sumSquares = f32(0.0)
+        var dot = f32(0.0)
+        if (packed) {
+            var sum0 = f32(0.0)
+            var sum1 = f32(0.0)
+            var sum2 = f32(0.0)
+            var sum3 = f32(0.0)
+            var dot0 = f32(0.0)
+            var dot1 = f32(0.0)
+            var dot2 = f32(0.0)
+            var dot3 = f32(0.0)
+            var j = lane
+            while (j < n / 4) {
+                val value = depthMixLoad4(bank, cur, s, nBank, n, j * 4)
+                val query = queries.load4(base + j * 4)
+                sum0 = kernelFma(value.get(0), value.get(0), sum0)
+                dot0 = kernelFma(value.get(0), query.get(0), dot0)
+                sum1 = kernelFma(value.get(1), value.get(1), sum1)
+                dot1 = kernelFma(value.get(1), query.get(1), dot1)
+                sum2 = kernelFma(value.get(2), value.get(2), sum2)
+                dot2 = kernelFma(value.get(2), query.get(2), dot2)
+                sum3 = kernelFma(value.get(3), value.get(3), sum3)
+                dot3 = kernelFma(value.get(3), query.get(3), dot3)
+                j = j + width
+            }
+            sumSquares = (sum0 + sum1) + (sum2 + sum3)
+            dot = (dot0 + dot1) + (dot2 + dot3)
+        } else {
+            var j = lane
+            while (j < n) {
+                val value = depthMixLoad(bank, cur, s, nBank, n, j)
+                sumSquares = kernelFma(value, value, sumSquares)
+                dot = kernelFma(value, queries.load(base + j), dot)
+                j = j + width
+            }
+        }
+        sumSquares = kernelSubgroupSum(sumSquares)
+        dot = kernelSubgroupSum(dot)
+        if (lane == 0) {
+            val inv = kernelRsqrt(sumSquares / f32FromInt(n) + eps)
+            inverse.store(s, inv)
+            scores.store(s, dot * inv / kernelSqrt(f32FromInt(n)))
+        }
+        s = s + warps
+    }
+    kernelBarrier()
+    if (warp == 0) {
+        // Each lane owns states lane, lane + width, ... below 64 (on CUDA two: lane and lane + 32).
+        var maximum = f32FromBits(u32(4286578688))
+        var t = lane
+        while (t < 64) {
+            if (t < states) {
+                val score = scores.load(t)
+                if (score > maximum) maximum = score
+            }
+            t = t + width
+        }
+        maximum = kernelSubgroupMax(maximum)
+        var total = f32(0.0)
+        t = lane
+        while (t < states) {
+            val p = kernelExp(scores.load(t) - maximum)
+            scores.store(t, p)
+            total = total + p
+            t = t + width
+        }
+        total = kernelSubgroupSum(total)
+        t = lane
+        while (t < states) {
+            scores.store(t, scores.load(t) / total * inverse.load(t))
+            t = t + width
+        }
+    }
+    kernelBarrier()
+    if (packed) {
+        val quads = n / 4
+        var j = kernelLocalId()
+        while (j < quads) {
+            var sum0 = f32(0.0)
+            var sum1 = f32(0.0)
+            var sum2 = f32(0.0)
+            var sum3 = f32(0.0)
+            var r = 0
+            while (r < nBank) {
+                val value = bank.load4(r * n + j * 4)
+                val weight = scores.load(r)
+                sum0 = kernelFma(weight, value.get(0), sum0)
+                sum1 = kernelFma(weight, value.get(1), sum1)
+                sum2 = kernelFma(weight, value.get(2), sum2)
+                sum3 = kernelFma(weight, value.get(3), sum3)
+                r = r + 1
+            }
+            val value = cur.load4(j * 4)
+            val weight = scores.load(nBank)
+            out.store(base + j * 4, kernelFma(weight, value.get(0), sum0))
+            out.store(base + j * 4 + 1, kernelFma(weight, value.get(1), sum1))
+            out.store(base + j * 4 + 2, kernelFma(weight, value.get(2), sum2))
+            out.store(base + j * 4 + 3, kernelFma(weight, value.get(3), sum3))
+            j = j + kernelGroupSize()
+        }
+    } else {
+        var j = kernelLocalId()
+        while (j < n) {
+            var sum = f32(0.0)
+            var r = 0
+            while (r < nBank) {
+                sum = kernelFma(scores.load(r), bank.load(r * n + j), sum)
+                r = r + 1
+            }
+            out.store(base + j, kernelFma(scores.load(nBank), cur.load(j), sum))
+            j = j + kernelGroupSize()
+        }
+    }
+}
