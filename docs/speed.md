@@ -264,3 +264,36 @@ one extra current state in each case.
 
 On the 512-token model prefill benchmark, the five-run median was 4,682
 tok/s before and 4,669 tok/s after (−0.28%).
+
+## Host replay of a suffix-derived branch
+
+At `3fe9947`, `spec-accept --nmax 4 --trace FILE` logged DSpark's
+four proposals at each anchor of a plain greedy continuation. The replay
+compared a four-proposal chain with a five-row tree. Both include the
+anchor. The tree keeps the first three DSpark proposals and can spend the
+fourth edge on an alternative retrieved from the committed prefix.
+Lookup uses the longest matching suffix of 2–32 tokens, breaks ties by
+recency, and takes the first differing edge after the shared prefix.
+If there is no eligible branch it keeps the full chain. Each policy
+advances by its own committed length after each verification.
+
+| Prompt | Anchors | Chain, tokens/cycle | Suffix branch, tokens/cycle | Optimistic one-sibling bound |
+|---|---:|---:|---:|---:|
+| 03, multilingual greeting | 1,020 | 3.148 | 3.938 | 4.378 |
+| 05, Alice | 1,020 | 3.481 | 3.764 | 4.232 |
+| Fog explanation, chat with thinking | 508 | 1.946 | 1.961 | 3.006 |
+| Museum scene, chat with thinking | 508 | 2.330 | 2.341 | 3.320 |
+| Ferry clock, original story continuation | 508 | 2.363 | 2.442 | 3.342 |
+
+The last column grants perfect foresight. At every position it can repair
+the first draft miss with the correct sibling, end the path there, or take
+any shorter prefix. Dynamic programming minimizes total cycles under the
+five-row budget. A tree with descendants on multiple branches would need
+a separate analysis. These figures count accepted tokens on a fixed trace.
+They exclude tree execution costs and verifier-induced near-tie changes.
+
+Suffix branching saves two of 261 cycles on fog, one of 218 on the museum
+scene, and seven of 215 on the ferry continuation. Fixture 03 repeats its
+greeting, which makes its larger gain a poor estimate for original prose.
+Exact prompt text and IDs, traces, replay scripts and baseline R5
+`spec-bench` logs are in `~/archive/abla-grad-retrieval-1244/`.
