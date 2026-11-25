@@ -21,6 +21,8 @@ import "abla/fs"
 import "abla/process/environment"
 import "abla/process/time"
 import "../kernels/rmsnorm.ab"
+import "../kernels/abla_rmsnorm.ab"
+import "abla/kernel"
 import "../kernels/rope.ab"
 import "../kernels/attention_decode.ab"
 import "../kernels/prefill_matmul.ab"
@@ -143,7 +145,12 @@ private class CudaKernelSpec(
     val argumentKinds: array<int>,
     val validate: (KernelArgs, array<int>) -> bool,
     val problemDimensions: int = 1,
-    val nullablePointer: int = -1
+    val nullablePointer: int = -1,
+    // An Abla `@kernel` (ablac #1233): its PTX comes from the compiler (kernelPtx()), not from `source`, and a pointer
+    // parameter is passed as its address and its element count (KernelArgs.extents / ablaElementBytes).
+    val abla: bool = false,
+    // For an Abla kernel, the bytes of one element of each pointer parameter by position (0 or missing: 4).
+    val ablaElementBytes: array<int> = []
 )
 
 private class CudaFunction(val name: string, val module: int, val handle: int)
@@ -601,7 +608,7 @@ private val cudaKernels = [
     CudaKernelSpec("gather_row_f32", kernelMatvecF32, 128, 128, cudaGatherArguments, cudaGatherShape),
     CudaKernelSpec("gather_row_q4_k", kernelMatvecK, 128, 128, cudaGatherArguments, cudaKGatherShape),
     CudaKernelSpec("gather_row_q6_k", kernelMatvecK, 128, 128, cudaGatherArguments, cudaKGatherShape),
-    CudaKernelSpec("rmsnorm", kernelRmsnorm, 1, 128, cudaRmsnormArguments, cudaRmsnormShape, nullablePointer = 1),
+    CudaKernelSpec(ablaRmsnormKernel, kernelRmsnorm, 1, 128, cudaRmsnormArguments, cudaRmsnormShape, nullablePointer = 1, abla = true),
     CudaKernelSpec("rmsnorm_three", kernelRmsnorm, 1, 128, cudaRmsnormThreeArguments, cudaRmsnormThreeShape),
     CudaKernelSpec("rope", kernelRope, 128, 128, cudaRopeArguments, cudaRopeShape, nullablePointer = 1),
     CudaKernelSpec("attention_decode", kernelAttentionDecode, 1, 256, cudaAttentionArguments, cudaAttentionShape),
@@ -1091,6 +1098,11 @@ class CudaBackend(
 
     trusted fun loadKernel(spec: CudaKernelSpec): CudaFunction? {
         for (function in this.functions) if (function.name == spec.name) return function
+        if (spec.abla) {
+            val loaded = this.loadPtx(spec.name, kernelPtx())
+            if (loaded != null) this.functions.append(loaded)
+            return loaded
+        }
         val cache = cudaPtxCachePath(spec, this.architecture)
         if (cache != null) {
             val previous = cache.readText()
@@ -1130,11 +1142,12 @@ class CudaBackend(
         var ok = false
         if (function != null) {
             // The driver consumes the parameter bytes during cuLaunchKernel.
-            val values = nativeByteBuffer(args.words.size * 8)
-            val pointers = nativeByteBuffer(args.words.size * 8)
+            val words = if (spec.abla) cudaAblaKernelWords(spec, args) else args.words
+            val values = nativeByteBuffer(words.size * 8)
+            val pointers = nativeByteBuffer(words.size * 8)
             val base = nativePointerAddress(values.address)
-            for (index in 0 until args.words.size) {
-                values.storeI64(index * 8, args.words[index])
+            for (index in 0 until words.size) {
+                values.storeI64(index * 8, words[index])
                 pointers.storePointer(index * 8, nativePointerFromAddress(base + index * 8))
             }
             val gridX = u32((problem[0] + spec.itemsPerBlock - 1) / spec.itemsPerBlock)
@@ -1187,6 +1200,20 @@ class CudaBackend(
         if (cudaStatus(cuMemFree_v2(u64(handle)), "cuMemFree")) this.liveBuffers -= 1
         this.popContext()
     }
+}
+
+// The parameter words of an Abla `@kernel` launch: a pointer becomes its address and its element count (ablaElementBytes),
+// a null pointer (u64 0 where the spec allows one) an empty buffer; other values as they are.
+private fun cudaAblaKernelWords(spec: CudaKernelSpec, args: KernelArgs): array<int> {
+    val words: array<int> = []
+    for (index in 0 until args.words.size) {
+        words.append(args.words[index])
+        if (spec.argumentKinds[index] == KERNEL_ARG_POINTER) {
+            val element = if (index < spec.ablaElementBytes.size && spec.ablaElementBytes[index] > 0) spec.ablaElementBytes[index] else 4
+            words.append(if (args.kinds[index] == KERNEL_ARG_POINTER) args.extents[index] / element else 0)
+        }
+    }
+    words
 }
 
 private fun cudaLaunchShape(spec: CudaKernelSpec, args: KernelArgs, problem: array<int>): bool {

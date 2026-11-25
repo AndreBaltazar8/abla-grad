@@ -1,0 +1,41 @@
+import "abla/float"
+import "abla/kernel"
+
+// rmsnorm as an Abla `@kernel` (ablac #1233), launched by the "rmsnorm" spec in src/backend/cuda.ab in place of the CUDA C
+// one in rmsnorm.ab. One group of 128 threads per row of `n` values at `x` and `y` (row r at r * n); `w` may be empty
+// (a null pointer), then the row is only scaled. It computes the same bits as rmsnorm.ab's rmsnorm_row, so the CUDA C
+// rmsnorm_three still matches it: each thread sums its strided squares with fma, the halving tree adds the 128 sums in
+// the order of rmsnorm_factor's (s[l] + s[l+64]) + (s[l+32] + s[l+96]) and shuffle-down steps, and the factor is
+// rsqrt.approx (rsqrtf).
+// The launch name of this kernel: the CudaKernelSpec that runs it, and its PTX entry (the function's own name).
+val ablaRmsnormKernel = "rmsnorm"
+
+@kernel
+fun rmsnorm(x: KernelF32Buffer, w: KernelF32Buffer, y: KernelF32Buffer, n: int, eps: f32) {
+    val sums = kernelSharedF32(128)
+    val lane = kernelLocalId()
+    val size = kernelGroupSize()
+    val base = kernelGroupId() * n
+    var sum = f32(0.0)
+    var i = lane
+    while (i < n) {
+        val value = x.load(base + i)
+        sum = kernelFma(value, value, sum)
+        i = i + size
+    }
+    sums.store(lane, sum)
+    kernelBarrier()
+    var width = size / 2
+    while (width > 0) {
+        if (lane < width) sums.store(lane, sums.load(lane) + sums.load(lane + width))
+        kernelBarrier()
+        width = width / 2
+    }
+    val factor = kernelRsqrt(sums.load(0) / f32FromInt(n) + eps)
+    i = lane
+    while (i < n) {
+        val value = x.load(base + i) * factor
+        y.store(base + i, if (w.size() > 0) value * w.load(i) else value)
+        i = i + size
+    }
+}
