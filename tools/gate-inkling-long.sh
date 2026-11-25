@@ -4,7 +4,8 @@
 # Natural text is noisier than the four short prompts, so the rule counts instead of bounding every row: tests/tolerances-inkling-long.txt has the limits and the
 # measured noise floor they come from.
 # Usage: [LONG_PROMPTS="05 06"] tools/gate-inkling-long.sh [abla-grad binary]   (nix-shell shell.nix; run it WITHOUT gpu-lock.sh: it takes the lock for the
-# logits runs only; needs the GGUF and the oracle GRDLs in LONG_ORACLE_DIR, default ~/src/abla-grad-oracle/long-depth)
+# logits runs only; needs the GGUF and the oracle GRDLs in LONG_ORACLE_DIR, default ~/src/abla-grad-oracle/long-depth).
+# Override the step mode with GATE_LOGITS_FLAGS="--prefill --chunk 512" to apply the same limits to batched prefill.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 binary=${1:-build/abla-grad}
@@ -12,12 +13,13 @@ model=${INKLING_MODEL:-$HOME/models/inkling-2-mini/Inkling-2-Mini-UD-Q4_K_M.gguf
 oracle_dir=${LONG_ORACLE_DIR:-$HOME/src/abla-grad-oracle/long-depth}
 out=build/gate-inkling-long
 mkdir -p "$out"
+read -r -a logits_flags <<<"${GATE_LOGITS_FLAGS:---step}"
 # per prompt: positions, max rows over the .04 KL limit, max argmax differences in percent, max KL
 declare -A rule=([05]="1624 50 3 1.1" [06]="4300 40 3 0.3")
 for prompt in ${LONG_PROMPTS:-05 06}; do
     read -r positions max_rows max_percent max_kl <<<"${rule[$prompt]}"
     # only the logits run holds the GPU; the compare below is CPU-only
-    tools/gpu-lock.sh -t 3000 -- "$binary" logits "$model" "tests/prompts/$prompt.inkling.ids" --step --ctx $((positions + 100)) -o "$out/$prompt.grdl" > /dev/null
+    tools/gpu-lock.sh -t 3000 -- "$binary" logits "$model" "tests/prompts/$prompt.inkling.ids" "${logits_flags[@]}" --ctx $((positions + 100)) -o "$out/$prompt.grdl" > /dev/null
     "$binary" compare "$oracle_dir/$prompt.grdl" "$out/$prompt.grdl" --tolerances tests/tolerances-inkling.txt > "$out/$prompt.txt" || true
     summary=$(tail -1 "$out/$prompt.txt")
     echo "long prompt $prompt: $summary"

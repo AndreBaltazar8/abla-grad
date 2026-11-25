@@ -62,3 +62,7 @@ The NVFP4 expert matmuls of prefill quantize their activations to s8 (Q8_1 style
 down input) and run s8 `mma.m16n8k16` with the NVFP4 values expanded by a byte-permute lookup; the scales are applied to the int32 accumulators. pp512 4,934 -> 5,545 tok/s
 (`--no-int8-experts` selects the f16 kernels). Accuracy: `tools/gate-inkling.sh` with `--prefill --chunk 256` and `--chunk 512`: 324 positions within the tolerances, 1 argmax
 difference (the f16 experts give 0; llama.cpp's own CPU and CUDA builds differ by 1), worst KL 0.0144 against a limit of 0.04. Verification rows use the f32 row kernels, not this path.
+
+The long-prompt gate also passes for INT8 at chunk 512. Against the pinned llama.cpp CUDA logits, prompt 05 has 27 rows outside the per-row tolerances, 34 argmax
+differences, and worst KL 0.23859 over 1,624 positions. Prompt 06 has 23 outside, 95 argmax differences, and worst KL 0.19976 over 4,300 positions.
+Run `GATE_LOGITS_FLAGS="--prefill --chunk 512" tools/gate-inkling-long.sh` to apply the existing long-prompt limits to the default prefill path.
