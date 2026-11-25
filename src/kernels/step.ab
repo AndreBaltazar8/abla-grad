@@ -93,3 +93,23 @@ extern "C" __global__ void copy_select_f32(const float *src, float *dst, const u
     dst[i] = src[(unsigned long long)step[3] * strideFloats + i];
 }
 """
+
+// ---- speculation cycle with up to 4 proposals (layout v2) ----
+// `spec` is u32[16]: [0..4] the verification rows' token ids (anchor, p1..p4), [5] the number of proposals n (0..4), [6] running total of accepted proposals,
+// [8..12] the target's argmax after each row (0..4). Everything else as in the two-proposal cycle: step[3] = accepted proposals a, a + 1 rows commit.
+val kernelSpecAcceptN = """
+extern "C" __global__ void spec_accept_n(unsigned *step, unsigned *spec, unsigned maxCtx) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    unsigned pos = step[1];
+    unsigned n = spec[5];
+    unsigned a = 0;
+    while (a < n && a < 4 && spec[8 + a] == spec[1 + a]) ++a;
+    for (unsigned k = 0; k <= a; ++k) {
+        if (pos + k < maxCtx) step[4 + pos + k] = spec[8 + k];
+    }
+    step[0] = spec[8 + a];
+    step[3] = a;
+    step[1] = pos + a + 1;
+    spec[6] += a;
+}
+"""

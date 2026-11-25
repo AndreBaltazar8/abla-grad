@@ -562,6 +562,7 @@ private val cudaKernels = [
     CudaKernelSpec("step_record", kernelStepRecord, 1, 1, cudaArgsStepRecord, cudaStepAdvanceShape),
     CudaKernelSpec("spec_begin", kernelSpecBegin, 1, 1, cudaArgsSpecBegin, cudaStepAdvanceShape),
     CudaKernelSpec("spec_accept", kernelSpecAccept, 1, 1, cudaArgsSpecAccept, cudaStepAdvanceShape),
+    CudaKernelSpec("spec_accept_n", kernelSpecAcceptN, 1, 1, cudaArgsSpecAccept, cudaStepAdvanceShape),
     CudaKernelSpec("copy_select_f32", kernelCopySelect, 256, 256, cudaArgsCopySelect, cudaCopySelectShape),
     CudaKernelSpec("tap_store_step", kernelTapStoreStep, 256, 256, cudaArgsTapStore, cudaTapStoreShape),
     CudaKernelSpec("attention_rel_split_step", kernelAttentionSplit, 1, 256, cudaArgsAttentionSplit, cudaAttentionSplitShape),

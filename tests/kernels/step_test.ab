@@ -94,6 +94,27 @@ fun run(var backend: Backend): bool {
             }
         }
     }
+
+    // spec_accept_n: n proposals 0..4, the first `matches` rows agree
+    for (n in 0 until 5) {
+        for (matches in 0 until 5) {
+            val spec = uploadWords(backend, [0, 11, 12, 13, 14, n, 0, 0, if (matches >= 1) 11 else 90, if (matches >= 2) 12 else 91, if (matches >= 3) 13 else 92,
+                if (matches >= 4) 14 else 93, 55, 0, 0, 0]) ?? return false
+            val stepWords = uploadWords(backend, [77, 5, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) ?? return false
+            if (!backend.launch("spec_accept_n", kernelArgs().pointer(stepWords).pointer(spec).u32(16), [1])) return false
+            val s = downloadWords(backend, stepWords, 20) ?? return false
+            val sp = downloadWords(backend, spec, 16) ?? return false
+            var a = 0
+            while (a < n && a < matches) a = a + 1
+            val rows = [if (matches >= 1) 11 else 90, if (matches >= 2) 12 else 91, if (matches >= 3) 13 else 92, if (matches >= 4) 14 else 93, 55]
+            var good = s[1] == 5 + a + 1 && s[3] == a && s[0] == rows[a] && sp[6] == a
+            for (k in 0 until a + 1) if (s[4 + 5 + k] != rows[k]) good = false
+            if (!good) {
+                println("spec_accept_n n=$n matches=$matches: step [${s[0]}, ${s[1]}, ${s[2]}, ${s[3]}], expected a=$a")
+                ok = false
+            }
+        }
+    }
     ok
 }
 
