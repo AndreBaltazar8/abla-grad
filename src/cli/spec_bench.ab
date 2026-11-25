@@ -9,6 +9,8 @@ import "abla/integer"
 import "abla/float"
 import "abla/float/text"
 import "abla/process/time"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
 import "../backend/backend.ab"
 import "../backend/cuda.ab"
 import "../gguf/reader.ab"
@@ -22,6 +24,7 @@ fun cmdSpecBench(args: array<string>): int {
     var count = 128
     var batch = 4
     var logPath = ""
+    var adaptive = false
     var prefill = false
     val positional: array<string> = []
     var index = 0
@@ -34,6 +37,9 @@ fun cmdSpecBench(args: array<string>): int {
             index = index + 2
         } else if (args[index] == "--prefill") {
             prefill = true
+            index = index + 1
+        } else if (args[index] == "--adaptive") {
+            adaptive = true
             index = index + 1
         } else if (args[index] == "--log" && index + 1 < args.size) {
             logPath = args[index + 1]
@@ -75,6 +81,7 @@ fun cmdSpecBench(args: array<string>): int {
     var drafter = dsparkLoad(backend, draftFile, context) ?? return 1
     val ws = prefillWorkspace(backend, config, 3, true, 3) ?? return 1
     val spec = backend.allocate(64) ?? return 1
+    if (!zeroSpec(backend, spec)) return 1
     // prefill the prompt (taps for every position); the anchor is the greedy token after the last prompt token, at position `length`
     var seeded = 0
     if (prefill) {
@@ -114,9 +121,71 @@ fun cmdSpecBench(args: array<string>): int {
         return 1
     }
     var cycles = 0
-    val start = monotonicNanoseconds()
     var position = length
-    while (position < length + count) {
+    val start = monotonicNanoseconds()
+    if (adaptive) {
+        // Adaptive speculation: the cycle graph while its measured rate beats the plain decode graph's, the plain graph otherwise; each side is re-measured
+        // now and then. Both graphs share the step buffer (anchor token, position, token log), the KV caches, the conv histories and the taps.
+        val plain = model.capture(backend)
+        if (plain == null) {
+            println("spec-bench: recording the plain token failed: ${inklingLastError()}")
+            return 1
+        }
+        val batchCycles = batch
+        val batchTokens = 16
+        var rateCycle = 0.0
+        var ratePlain = 0.0
+        var useCycle = false
+        var sinceProbe = 0
+        var plainTokens = 0
+        var cycleTokens = 0
+        var switches = 0
+        var acceptedBefore = 0
+        while (position < length + count) {
+            val before = position
+            val t0 = monotonicNanoseconds()
+            if (useCycle) {
+                for (b in 0 until batchCycles) {
+                    if (!backend.replay(recording)) return 1
+                }
+                cycles = cycles + batchCycles
+            } else if (!model.replayMany(backend, plain, batchTokens)) {
+                println("spec-bench: ${inklingLastError()}")
+                return 1
+            }
+            if (!backend.synchronize()) return 1
+            position = model.readStepWord(backend, 1) ?? return 1
+            val seconds = f64FromInt(monotonicNanoseconds() - t0) / 1000000000.0
+            val rate = f64FromInt(position - before) / seconds
+            if (useCycle) {
+                rateCycle = if (rateCycle == 0.0) rate else 0.5 * rateCycle + 0.5 * rate
+                cycleTokens = cycleTokens + (position - before)
+            } else {
+                ratePlain = if (ratePlain == 0.0) rate else 0.5 * ratePlain + 0.5 * rate
+                plainTokens = plainTokens + (position - before)
+                sinceProbe = sinceProbe + (position - before)
+            }
+            // decide the next batch
+            var next = useCycle
+            if (ratePlain == 0.0) next = false
+            else if (rateCycle == 0.0) next = true
+            else if (useCycle) next = rateCycle >= ratePlain * 0.97
+            else next = sinceProbe >= 160 || rateCycle > ratePlain * 1.03
+            if (next && !useCycle) {
+                // back to the cycle graph: the drafter catches up on the plain tokens' taps
+                if (!drafter.resume(backend, model.taps, position)) {
+                    println("spec-bench: resume: ${dsparkLastError()}")
+                    return 1
+                }
+                sinceProbe = 0
+                rateCycle = 0.0
+            }
+            if (next != useCycle) switches = switches + 1
+            useCycle = next
+        }
+        println("spec-bench: adaptive: $cycleTokens tokens in cycles, $plainTokens plain, $switches switches; last rates cycle ${rateCycle} tok/s, plain ${ratePlain} tok/s")
+    }
+    while (!adaptive && position < length + count) {
         for (b in 0 until batch) {
             if (!backend.replay(recording)) {
                 println("spec-bench: replay failed (${cudaLastError()})")
@@ -141,4 +210,14 @@ fun cmdSpecBench(args: array<string>): int {
         Path(logPath).writeText(text)
     }
     0
+}
+
+// spec[0..15] = 0 (the accepted-proposal total in spec[7] starts at zero).
+private trusted fun zeroSpec(var backend: Backend, spec: DeviceBuffer): bool {
+    val host = nativeByteBuffer(72)
+    val address = nativePointerAddress(host.address)
+    for (i in 0 until 16) ablaUnsafeStoreU32(nativePointerFromAddress(address + 4 * i), 0)
+    val ok = backend.upload(spec, 0, address, 64)
+    host.close()
+    ok
 }

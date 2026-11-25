@@ -66,7 +66,7 @@ extern "C" __global__ void spec_begin(const unsigned *step, unsigned *spec) {
 // Greedy acceptance: a proposal is accepted when the target's argmax after the previous row equals it. Logs the argmax of the committed rows (and the one
 // after the last), moves the anchor to the argmax after the last accepted row, advances the position by a + 1 and leaves a in step[3].
 val kernelSpecAccept = """
-extern "C" __global__ void spec_accept(unsigned *step, const unsigned *spec, unsigned maxCtx) {
+extern "C" __global__ void spec_accept(unsigned *step, unsigned *spec, unsigned maxCtx) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     unsigned pos = step[1];
     unsigned n = spec[3];
@@ -80,6 +80,7 @@ extern "C" __global__ void spec_accept(unsigned *step, const unsigned *spec, uns
     }
     step[0] = spec[4 + a];
     step[3] = a;
+    spec[7] += a;  // running total of accepted proposals (the host reads it to estimate the acceptance)
     step[1] = pos + a + 1;
 }
 """

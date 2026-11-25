@@ -77,7 +77,7 @@ fun run(var backend: Backend): bool {
                 if (n >= 2 && argmax1 == 12) a = 2
             }
             val rows = [argmax0, argmax1, 33]
-            var good = sp[0] == 77 && s[1] == 5 + a + 1 && s[3] == a && s[0] == rows[a]
+            var good = sp[0] == 77 && s[1] == 5 + a + 1 && s[3] == a && s[0] == rows[a] && sp[7] == a
             for (k in 0 until a + 1) if (s[4 + 5 + k] != rows[k]) good = false
             if (!good) {
                 println("spec_accept n=$n matches=$matches: step [${s[0]}, ${s[1]}, ${s[2]}, ${s[3]}] log ${s[9]} ${s[10]} ${s[11]}, expected a=$a")
