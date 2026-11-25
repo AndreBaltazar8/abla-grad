@@ -23,6 +23,7 @@ fun cmdSpecAccept(args: array<string>): int {
     var maxCtx = 0
     var cost = false
     var union = false
+    var nmax = 2
     var prefillTaps = false
     var exactWindow = 0
     val positional: array<string> = []
@@ -37,6 +38,9 @@ fun cmdSpecAccept(args: array<string>): int {
         } else if (args[index] == "--prefill-taps") {
             prefillTaps = true
             index = index + 1
+        } else if (args[index] == "--nmax" && index + 1 < args.size) {
+            nmax = args[index + 1].parseInt() ?? 2
+            index = index + 2
         } else if (args[index] == "--union") {
             union = true
             index = index + 1
@@ -80,12 +84,14 @@ fun cmdSpecAccept(args: array<string>): int {
     model.useStep = true
     if (!model.enableTaps(backend)) return 1
     model.traceIds = union
-    var drafter = dsparkLoad(backend, draftFile, context) ?? return 1
+    var drafter = dsparkLoad(backend, draftFile, context, nmax) ?? return 1
     val total = ids.size + count
     // nxt[p] = the target's greedy token after position p (the anchor for the prefix [0, p])
     val nxt: array<int> = []
     val first: array<int> = []
     val second: array<int> = []
+    val third: array<int> = []
+    val fourth: array<int> = []
     var token = ids[0]
     var begin = 0
     if (prefillTaps) {
@@ -102,6 +108,8 @@ fun cmdSpecAccept(args: array<string>): int {
             nxt.append(-1)
             first.append(-1)
             second.append(-1)
+            third.append(-1)
+            fourth.append(-1)
         }
         begin = head.size
         token = ids[begin]
@@ -125,6 +133,8 @@ fun cmdSpecAccept(args: array<string>): int {
         }
         first.append(if (proposals.size > 0) proposals[0] else -1)
         second.append(if (proposals.size > 1) proposals[1] else -1)
+        third.append(if (proposals.size > 2) proposals[2] else -1)
+        fourth.append(if (proposals.size > 3) proposals[3] else -1)
         token = if (position + 1 < ids.size) ids[position + 1] else greedy
     }
     if (cost) {
@@ -185,17 +195,31 @@ fun cmdSpecAccept(args: array<string>): int {
     }
     // positions p >= ids.size - 1 have a greedy continuation: nxt[p+1] follows the anchor nxt[p]
     var cycles = 0
-    var firstOk = 0
-    var secondOk = 0
-    for (p in ids.size - 1 until nxt.size - 2) {
+    var ok1 = 0
+    var ok2 = 0
+    var ok3 = 0
+    var ok4 = 0
+    for (p in ids.size - 1 until nxt.size - 4) {
         cycles = cycles + 1
         if (first[p] == nxt[p + 1]) {
-            firstOk = firstOk + 1
-            if (second[p] == nxt[p + 2]) secondOk = secondOk + 1
+            ok1 = ok1 + 1
+            if (second[p] == nxt[p + 2]) {
+                ok2 = ok2 + 1
+                if (third[p] == nxt[p + 3]) {
+                    ok3 = ok3 + 1
+                    if (fourth[p] == nxt[p + 4]) ok4 = ok4 + 1
+                }
+            }
         }
     }
-    val a1 = f64FromInt(firstOk) / f64FromInt(cycles)
-    val a2 = if (firstOk > 0) f64FromInt(secondOk) / f64FromInt(firstOk) else 0.0
-    println("spec-accept: $cycles cycles; first proposal accepted ${a1 * 100.0}%, second (given the first) ${a2 * 100.0}%; tokens per verification cycle ${1.0 + a1 + a1 * a2}")
+    val c = f64FromInt(cycles)
+    val a1 = f64FromInt(ok1) / c
+    val a2 = if (ok1 > 0) f64FromInt(ok2) / f64FromInt(ok1) else 0.0
+    val a3 = if (ok2 > 0) f64FromInt(ok3) / f64FromInt(ok2) else 0.0
+    val a4 = if (ok3 > 0) f64FromInt(ok4) / f64FromInt(ok3) else 0.0
+    val t2 = 1.0 + a1 + a1 * a2
+    val t3 = t2 + a1 * a2 * a3
+    val t4 = t3 + a1 * a2 * a3 * a4
+    println("spec-accept: $cycles cycles; accepted given the previous ones: 1st ${a1 * 100.0}%, 2nd ${a2 * 100.0}%, 3rd ${a3 * 100.0}%, 4th ${a4 * 100.0}%; tokens per verification cycle at n-max 2: $t2, 3: $t3, 4: $t4")
     0
 }
