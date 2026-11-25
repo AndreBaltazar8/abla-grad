@@ -99,6 +99,23 @@ g="$HOME/archive/abla-grad-prefill-gemm-cx5.PYyfewbp"
 "$g/measure.sh" x5 "repeat-x5-64" "$n"
 ```
 
+The expert GEMM pass (`18752f2`) adds Q5_K int8 MMA, a three-block target
+for NVFP4, and fused NVFP4 gate/up plus SiTU. Both arms were built from
+`cf6578c` with the same fixed IDs, chunk 512 and 64-token expert tiles.
+The sample counts are the same as in the preceding table.
+
+| Prompt tokens | Before tok/s | Q5_K only tok/s | Full pass tok/s | Change |
+| ---: | ---: | ---: | ---: | ---: |
+| 8,192 | 4,771.38 | 4,858.75 | 5,178.37 | +8.53% |
+| 32,768 | 4,083.60 | 4,101.45 | 4,375.06 | +7.14% |
+| 131,072 | 2,636.43 | 2,635.70 | 2,755.95 | +4.53% |
+
+The full pass matched the grouped CUDA CPU-reference checks. Inkling
+prefill passed 324 positions with zero argmax differences. Llama passed
+266 positions with one argmax difference. All positions met the gates'
+tolerances. The logs are under `$g/prefill-r2-main-*.log`. Repeat with
+`"$g/measure.sh" prefill-r2-main-fused-tuned repeat-fused-tuned "$n" --moe-tile 64`.
+
 ## Serve TTFT
 
 First streamed output on `9aaccb1`, with Inkling and DSpark already loaded,
