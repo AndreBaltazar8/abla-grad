@@ -130,3 +130,78 @@ extern "C" __global__ void attention_rel_merge_gated(const float *part, float *o
     rel_merge(part, out, gate, dim, nSplit);
 }
 """
+
+// Three query heads share one physical K/V row. Each warp keeps the same key
+// partition and FP32 reduction order as attention_rel_split_step at 128 dimensions.
+val kernelAttentionGrouped = kvAddressing + "\n" + """
+extern "C" __global__ void attention_rel_grouped_step(const float *q, const kv_element *k, const kv_element *v,
+    const float *table, float *part, const unsigned *step, unsigned heads, unsigned kvHeads,
+    unsigned dim, unsigned window, unsigned extent, unsigned maxCtx, float scale, unsigned splits) {
+    const unsigned pos = step[1], group = blockIdx.x / splits, split = blockIdx.x % splits;
+    if (pos >= maxCtx) return;
+    const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const unsigned long long base = (unsigned long long)group * maxCtx * 128;
+    float query[3][4], accum[3][4] = {}, mx[3], total[3] = {};
+    #pragma unroll
+    for (int h=0; h<3; ++h) {
+        mx[h] = -__int_as_float(0x7f800000);
+        #pragma unroll
+        for (int d=0; d<4; ++d) query[h][d] = q[(group*3+h)*128 + lane + 32*d];
+    }
+    for (unsigned j=split*8+warp; j<=pos; j+=8*splits) {
+        const unsigned long long row = base + (unsigned long long)j*128 + lane;
+        float key[4], value[4];
+        #pragma unroll
+        for (int d=0; d<4; ++d) {
+            key[d] = kv_load(k, row+32*d);
+            value[d] = kv_load(v, row+32*d);
+        }
+        #pragma unroll
+        for (int h=0; h<3; ++h) {
+            float dot = 0.0f;
+            #pragma unroll
+            for (int d=0; d<4; ++d) dot = fmaf(key[d], query[h][d], dot);
+            #pragma unroll
+            for (int w=16; w; w>>=1) dot += __shfl_down_sync(0xffffffffu,dot,w);
+            float score = __shfl_sync(0xffffffffu,dot,0)*scale;
+            score += table[(group*3+h)*(extent+1) + min(pos-j,extent)];
+            const float m = fmaxf(mx[h],score);
+            const float a = total[h] == 0 ? 0 : expf(mx[h]-m), b = expf(score-m);
+            total[h] = total[h]*a+b;
+            mx[h] = m;
+            #pragma unroll
+            for (int d=0; d<4; ++d) accum[h][d] = fmaf(b,value[d],accum[h][d]*a);
+        }
+    }
+    __shared__ float values[3][8][128], sum[3][8], maxima[3][8], weight[3][8];
+    #pragma unroll
+    for (int h=0; h<3; ++h) {
+        if (lane==0) { sum[h][warp]=total[h]; maxima[h][warp]=mx[h]; }
+        #pragma unroll
+        for (int d=0; d<4; ++d) values[h][warp][lane+32*d] = accum[h][d];
+    }
+    __syncthreads();
+    if (threadIdx.x < 3) {
+        unsigned h=threadIdx.x;
+        float largest=-__int_as_float(0x7f800000), count=0;
+        #pragma unroll
+        for (int w=0; w<8; ++w) if (sum[h][w]!=0) largest=fmaxf(largest,maxima[h][w]);
+        #pragma unroll
+        for (int w=0; w<8; ++w) {
+            float a=sum[h][w]==0?0:expf(maxima[h][w]-largest);
+            weight[h][w]=a;
+            count=fmaf(a,sum[h][w],count);
+        }
+        float *out=part+((group*3+h)*splits+split)*130;
+        out[128]=largest; out[129]=count;
+    }
+    __syncthreads();
+    for (unsigned i=threadIdx.x; i<384; i+=256) {
+        unsigned h=i/128, d=i%128;
+        float value=0;
+        #pragma unroll
+        for (int w=0; w<8; ++w) value=fmaf(weight[h][w],values[h][w][d],value);
+        part[((group*3+h)*splits+split)*130+d]=value;
+    }
+}
+"""

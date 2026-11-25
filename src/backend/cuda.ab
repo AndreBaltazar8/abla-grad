@@ -515,6 +515,9 @@ private fun cudaAttentionMergeGatedShape(args: KernelArgs, problem: array<int>):
 private fun cudaAttentionSplitShape(args: KernelArgs, problem: array<int>): bool =
     cudaAttentionHeadShape(args.words[6], args.words[7], args.words[8], problem[0] / args.words[13]) &&
         args.words[13] > 0 && args.words[13] <= 64 && problem[0] == args.words[6] * args.words[13] && args.words[11] > 0
+private fun cudaAttentionGroupedShape(args: KernelArgs, problem: array<int>): bool =
+    args.words[6] == 3 * args.words[7] && args.words[8] == 128 && args.words[9] == 0 &&
+        args.words[13] > 0 && args.words[13] <= 64 && problem[0] == args.words[7] * args.words[13]
 private fun cudaAttentionMergeShape(args: KernelArgs, problem: array<int>): bool =
     args.words[2] == problem[0] && args.words[3] > 0 && args.words[3] <= 256 && args.words[4] > 0 && args.words[4] <= 64
 
@@ -672,6 +675,7 @@ private val cudaKernels = [
     CudaKernelSpec("spec_accept_n", kernelSpecAcceptN, 1, 1, cudaArgsSpecAccept, cudaStepAdvanceShape),
     CudaKernelSpec("copy_select_f32", kernelCopySelect, 256, 256, cudaArgsCopySelect, cudaCopySelectShape),
     CudaKernelSpec("tap_store_step", kernelTapStoreStep, 256, 256, cudaArgsTapStore, cudaTapStoreShape),
+    CudaKernelSpec("attention_rel_grouped_step", kernelAttentionGrouped, 1, 256, cudaArgsAttentionSplit, cudaAttentionGroupedShape),
     CudaKernelSpec("attention_rel_split_step", kernelAttentionSplit, 1, 256, cudaArgsAttentionSplit, cudaAttentionSplitShape),
     CudaKernelSpec("attention_rel_merge", kernelAttentionSplit, 1, 256, cudaArgsAttentionMerge, cudaAttentionMergeShape),
     CudaKernelSpec("attention_rel_merge_gated", kernelAttentionSplit, 1, 256, cudaArgsAttentionMergeGated, cudaAttentionMergeGatedShape),
@@ -848,6 +852,10 @@ private fun cudaRingSpecs(): array<CudaKernelSpec> {
             result.append(cudaKvVariant(spec, "_f16", 0, true))
             result.append(cudaKvVariant(spec, "_q8", 0, false))
             result.append(cudaKvVariant(spec, "_ring_f16", INKLING_KV_RING, true))
+        }
+        if (spec.name == "attention_rel_grouped_step") {
+            result.append(cudaKvVariant(spec, "_f16", 0, true))
+            result.append(cudaKvVariant(spec, "_q8", 0, false))
         }
         if (spec.name == "attention_decode" || spec.name == "dspark_attention_step" || spec.name == "dspark_kv_step") {
             result.append(cudaKvVariant(spec, "_f16", 0, true))

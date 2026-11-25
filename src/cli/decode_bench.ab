@@ -56,6 +56,8 @@ fun cmdDecodeBench(args: array<string>): int {
     var halfKv = false
     var batchSeed = false
     var globalBits = 0
+    var globalSplits = 0
+    var grouped = true
     var launches = false
     var splits = 16
     var noFuse = false
@@ -75,6 +77,13 @@ fun cmdDecodeBench(args: array<string>): int {
         } else if (args[index] == "--batch-seed") {
             batchSeed = true
             index = index + 1
+        } else if (args[index] == "--no-grouped-attention") {
+            grouped = false
+            index += 1
+        } else if (args[index] == "--global-splits" && index+1 < args.size) {
+            globalSplits = args[index+1].parseInt() ?? -1
+            if (globalSplits < 1 || globalSplits > ATTENTION_SPLITS_MAX) return 2
+            index += 2
         } else if (args[index] == "--global-kv" && index + 1 < args.size) {
             globalBits = args[index + 1].parseInt() ?? 0
             if (globalBits != 8 && globalBits != 16 && globalBits != 32) return 2
@@ -142,6 +151,8 @@ fun cmdDecodeBench(args: array<string>): int {
     model.useStep = true
     model.splitAttention = !noSplit
     model.attentionSplits = splits
+    model.globalAttentionSplits = globalSplits
+    model.groupedAttention = grouped
     model.fused = !noFuse
     model.fusedController = !noFuseController
     // prefill all but the last prompt token (this also loads every kernel module, which must happen before recording)

@@ -6,6 +6,7 @@ val INKLING_KV_RING = 1024 + INKLING_KV_SEGMENT
 // The full-cache specialization is the identity. All context checks, relative
 // distances and attention iteration use logical positions in both variants.
 val INKLING_DRAFT_RING = 2048
+val INKLING_GROUPED_CONTEXT = 8192
 val INKLING_HALF_KV_CONTEXT = 65536
 val INKLING_Q8_KV_CONTEXT = 98304
 

@@ -140,6 +140,8 @@ resource class InklingModel(
     var splitAttention: bool = true,
     // Blocks per head (1..ATTENTION_SPLITS_MAX); fixed once a token is recorded.
     var attentionSplits: int = 16,
+    var globalAttentionSplits: int = 0,
+    var groupedAttention: bool = true,
     // Use the generated fused gate/up + SiTU kernel for the experts when the shapes match (--no-fuse turns it off for A/B runs).
     var fused: bool = true,
     var fusedController: bool = true,
@@ -435,9 +437,11 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
             this.step, c.nHeadKv, c.headDim, this.maxCtx, ring, this.halfCache(isSwa), this.globalKvBits == 8 && !isSwa)
         val window = if (isSwa) c.nSwa else 0
         if (this.splitAttention) {
+            val grouped = this.groupedAttention && !isSwa && this.maxCtx >= INKLING_GROUPED_CONTEXT && c.nHead == 3 * c.nHeadKv && c.headDim == 128
+            val splits = if (!isSwa && this.globalAttentionSplits > 0) this.globalAttentionSplits else if (grouped) 64 else this.attentionSplits
             ok = ok && opAttentionRelSplitStep(backend, this.scratch, q, this.kCache, cache, this.vCache, cache,
                 this.scratch, table, this.scratch, this.so("attPart"), this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent,
-                this.maxCtx, scale, this.attentionSplits, this.scratch, this.so("gate"), true, ring, this.halfCache(isSwa), this.globalKvBits == 8 && !isSwa)
+                this.maxCtx, scale, splits, this.scratch, this.so("gate"), true, ring, this.halfCache(isSwa), this.globalKvBits == 8 && !isSwa, grouped)
         } else {
             ok = ok && opAttentionDecodeRelStep(backend, this.scratch, q, this.kCache, cache, this.vCache, cache,
                 this.scratch, table, this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent, this.maxCtx, scale, ring, this.halfCache(isSwa), this.globalKvBits == 8 && !isSwa)
