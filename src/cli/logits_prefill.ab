@@ -238,8 +238,9 @@ private fun argmaxOf(a: array<f32>): int {
 // abla-grad verify-check <model.gguf> <ids-file>: prefill 100 tokens, verify the next 3 as one batch and commit 2 or 0 of them, then continue with one decode step,
 // and compare with a plain prefill of the same tokens (rows, and the logits after the decode step).
 fun cmdVerifyCheck(args: array<string>): int {
-    // the check compares prefill against decode to rounding: the f16 experts (the int8 experts add Q8_1-style activation noise, about 4% in the first tap slot)
+    // Compare the same activation precision in the reference prefill and target step.
     setPrefillInt8Experts(false)
+    setPrefillInt8Projections(false)
     val half = args.size == 3 && args[2] == "--f16-kv"
     val quantized = args.size == 3 && args[2] == "--q8-kv"
     if (args.size != 2 && !half && !quantized) {

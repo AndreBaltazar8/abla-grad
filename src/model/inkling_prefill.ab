@@ -25,6 +25,11 @@ private var prefillRegisterDirect = false
 
 // NVFP4 experts through the int8 kernels (activations quantized to Q8_1-style s8 with one f32 scale per 32 values; ablac-90's `matmul_nvfp4_grouped_i8`). On by default (--no-int8-experts selects the f16 experts).
 private var prefillInt8Experts = true
+private var prefillInt8Projections = true
+
+fun setPrefillInt8Projections(on: bool): void {
+    prefillInt8Projections = on
+}
 
 fun setPrefillInt8Experts(on: bool): void {
     prefillInt8Experts = on
@@ -192,7 +197,7 @@ private fun InklingModel.dense(var backend: Backend, ws: PrefillWorkspace, name:
         return backend.launch("matvec_${kind}_rows", kernelArgs().pointer(this.arena, ref.offset).pointer(ws.buffer, xOffset).pointer(ws.buffer, yOffset)
             .u32(ref.rows).u32(ref.cols).u32(tokens), [ref.rows])
     }
-    if (!exact && prefillVerifyRows == 0 && kind == "q8_0" && tokens >= 64 && ref.cols % 64 == 0 && ref.cols <= max(this.config.nEmbd, this.config.nHead * this.config.headDim)) {
+    if (prefillInt8Projections && !exact && prefillVerifyRows == 0 && kind == "q8_0" && tokens >= 64 && ref.cols % 64 == 0 && ref.cols <= max(this.config.nEmbd, this.config.nHead * this.config.headDim)) {
         val qx = ws.o("denseQx")
         val sx = ws.o("denseSx")
         if (!backend.launch("quantize_rows_i8", kernelArgs().pointer(ws.buffer, xOffset).pointer(ws.buffer, qx).pointer(ws.buffer, sx)
@@ -246,7 +251,7 @@ private fun InklingModel.denseX5(var backend: Backend, ws: PrefillWorkspace, ip:
         return ok && this.dense(backend, ws, "blk.$ip.attn_gate.weight", normedQ, gate, tokens)
     }
     val tiles = (wq.rows + 127) / 128 + (wk.rows + 127) / 128 + (wv.rows + 127) / 128 + (wrel.rows + 127) / 128 + (wg.rows + 127) / 128
-    if (tokens >= 64 && wq.cols % 64 == 0 && wq.cols <= max(this.config.nEmbd, this.config.nHead * this.config.headDim)) {
+    if (prefillInt8Projections && tokens >= 64 && wq.cols % 64 == 0 && wq.cols <= max(this.config.nEmbd, this.config.nHead * this.config.headDim)) {
         val inputs = [normedQ, normedK, normedV]
         val qxOffsets = [ws.o("denseQx"), ws.o("denseQx") + tokens * wq.cols, ws.o("denseQx") + 2 * tokens * wq.cols]
         val sxOffsets = [ws.o("denseSx"), ws.o("denseSx") + tokens * wq.cols / 8, ws.o("denseSx") + 2 * tokens * wq.cols / 8]
