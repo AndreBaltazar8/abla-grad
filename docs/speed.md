@@ -6,18 +6,21 @@ Goal: beat mainline llama.cpp and Unsloth's build at every depth and in prefill,
 
 RTX 4090, Inkling UD-Q4_K_M, 128 timed greedy tokens. The Abla rows use
 the same Dickens prefixes and exclude loading, graph capture and prefix
-ingestion. Both use CUDA C RMSNorm and depth mix. Global attention uses
+ingestion. All use CUDA C RMSNorm and depth mix. Global attention uses
 Q8 and 64 partitions from an 8,192-position allocation.
 
 | Plain tg128, tok/s | d0 | d8,192 | d32,768 | d65,536 | d131,072 |
 |---|---:|---:|---:|---:|---:|
 | Initial grouped-Q8 run | 137.69 | 123.76 | 115.25 | 108.60 | 92.50 |
-| Integrated confirmation | **138.69** | **126.78** | **119.09** | **110.29** | **95.90** |
+| Confirmation before prefill GEMM change | 138.69 | 126.78 | 119.09 | 110.29 | 95.90 |
+| Release `cf6578c` | **138.57** | **126.72** | **119.01** | **111.35** | **95.58** |
 | Pinned Unsloth CUDA mix | 102.85 | 95.03 | 89.92 | — | 64.95 |
 
-Each Abla cell is one unprofiled run. The confirmation retains 85.9% of
-d0 throughput at 32k and 87.0% of 64k throughput at 128k. It reproduced
-all 128 generated IDs of the previous plain implementation at 128k.
+Each Abla cell is one unprofiled run. The release retained 85.9% of d0 throughput at 32k and 85.8% of 64k
+throughput at 128k. It was 0.99 tok/s short of 120 at 32k. The confirmation
+before the prefill GEMM change reproduced all 128 generated IDs of the
+previous plain implementation at 128k. With the new prefill arithmetic,
+the generated sequence first differed from that confirmation on token eight.
 The Unsloth results are three-run means with llama-bench synthetic
 inputs. The 64k reference was not measured in this series. Per-family
 timings, bandwidth and precision comparisons are in the
@@ -963,3 +966,48 @@ After integrating the int8 prefill projection GEMMs from `4bae40a`, the
 same 32,768-row external gate had 137 rows over KL .04, 778 argmax
 differences, worst KL .595350 at position 3,061 and max absolute logit
 difference 12.83186. This passes the same .726532 ceiling.
+
+### Global attention after the Q8 release
+
+A one-step node trace of the grouped-Q8 graph measured the following GPU
+times. K/V stores are counted in other kernels. The profiled binary used
+the grouped release kernels and the pre-`4bae40a` prefix arithmetic.
+
+| Cached tokens | Global split (ms) | Global merge (ms) | Global split, unique GB/s | Sliding split + merge (ms) | Other kernels (ms) | Idle (ms) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8,192 | .197 | .057 | 765 | .692 | 6.996 | .047 |
+| 65,536 | 1.422 | .060 | 850 | .577 | 6.992 | .047 |
+| 131,072 | 3.347 | .059 | 722 | .575 | 7.224 | .047 |
+
+Doubling the depth from 64k to 128k added 1.93 ms in the eight global
+visits. The forty sliding visits stayed within .003 ms. Bandwidth counts
+each global K/V cache element once, including block scales.
+
+Keeping global keys Q8, two experimental builds packed the values in
+blocks of 32 with one FP32 scale per block. The four-bit format used
+20 bytes per block and the six-bit format used 28. Both used the prefill
+arithmetic of release `cf6578c`. The following checks compared every
+logit row on the same 32,768 Dickens IDs with pinned llama.cpp CUDA.
+The argmax limit is 983 rows, the KL row limit is 327, and the calibrated
+worst-KL limit is .726532.
+
+| Global values | Rows above KL .04 | Argmax differences | Worst KL | Max absolute logit difference |
+|---|---:|---:|---:|---:|
+| Q8 | 137 | 778 | .595350 | 12.832 |
+| Four bits | 217 | 957 | .499146 | 17.419 |
+| Six bits | 143 | 838 | .380045 | 16.919 |
+
+At 8k, using 16, 32 and 64 global partitions measured 124.04, 125.00
+and 126.72 tok/s, respectively. All three generated the same 128 token
+IDs. At 128k, an experimental 128-partition graph measured 96.18 tok/s
+against 95.58 with 64 partitions. This single pair differed by .065 ms
+per token.
+
+| Global value cache | d65,536 tg128 | d131,072 tg128 |
+|---|---:|---:|
+| Q8 release | 111.35 | 95.58 |
+| Four bits | 105.72 | 85.88 |
+| Six bits | 101.34 | 79.41 |
+
+The packed values reduced bytes read and passed the 32k numerical screen,
+but both implementations slowed end-to-end decode. The release uses Q8 values.
