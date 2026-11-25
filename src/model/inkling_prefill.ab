@@ -99,7 +99,7 @@ fun prefillWorkspace(var backend: Backend, c: InklingConfig, chunk: int, allLogi
     at = wsAdd(offsets, "iota", pairs, at)
     at = wsAdd(offsets, "attPartO", 8 * chunk * c.nHead * 128, at)
     at = wsAdd(offsets, "attPartML", 8 * chunk * c.nHead * 2, at)
-    at = wsAdd(offsets, "expertMap", 4 * 3 * c.nExpertUsed, at)
+    at = wsAdd(offsets, "expertMap", 8 * 5 * c.nExpertUsed, at)
     at = wsAdd(offsets, "plan", c.nExpert + 2 + 2 * maxTiles, at)
     at = wsAdd(offsets, "gu", pairs * 2 * c.nFfExp, at)
     at = wsAdd(offsets, "act", pairs * c.nFfExp, at)
@@ -801,18 +801,21 @@ trusted fun InklingModel.verifyArgmax(var backend: Backend, ws: PrefillWorkspace
 // `spec` words: [0..2] the rows' token ids (anchor, proposal 1, proposal 2), [3] padding, [4..6] the argmax of rows 0..2 (written here); `step` words: [1] = P, the position
 // of row 0 (rows are P, P+1, P+2), [3] = the accepted proposals of the cycle, read by `commitStep`. Always 3 rows (padding rows run and are ignored). Only launches: it
 // can be recorded.
-fun InklingModel.verifyStep(var backend: Backend, ws: PrefillWorkspace, spec: DeviceBuffer, step: DeviceBuffer): bool {
+// `rows` (1 .. ws.verifyRows) rows with ids spec[0 .. rows - 1]. `layout` 1: the argmax of row r goes to spec[4 + r] (docs/spec-cycle.md); layout 2 (spec = u32[16], up to 5 rows):
+// to spec[8 + r]. Rows beyond 3 use the tile kernels where the R-row matvecs do not reach yet.
+fun InklingModel.verifyStep(var backend: Backend, ws: PrefillWorkspace, spec: DeviceBuffer, step: DeviceBuffer, rows: int = 3, layout: int = 1): bool {
     prefillError = ""
-    if (ws.verifyRows < 3 || ws.chunk < 3 || !ws.allLogits) {
-        prefillError = "verifyStep needs a workspace with allLogits, chunk >= 3 and verifyRows >= 3"
+    if (rows < 1 || ws.verifyRows < rows || ws.chunk < rows || !ws.allLogits || (layout != 1 && layout != 2) || (layout == 1 && rows > 3)) {
+        prefillError = "verifyStep needs a workspace with allLogits, chunk >= rows and verifyRows >= rows (layout 1: at most 3 rows)"
         return false
     }
-    prefillVerifyRows = 3
-    var ok = this.prefillChunk(backend, ws, 3, -1, true, spec, 0, step, 4)
+    prefillVerifyRows = rows
+    var ok = this.prefillChunk(backend, ws, rows, -1, true, spec, 0, step, 4)
     prefillVerifyRows = 0
-    for (row in 0 until 3) {
+    val argmaxAt = if (layout == 2) 8 else 4
+    for (row in 0 until rows) {
         ok = ok && backend.launch("argmax", kernelArgs().pointer(ws.buffer, ws.o("logits") + row * this.config.nVocabPadded * 4).u32(this.config.nVocab)
-            .pointer(spec, (4 + row) * 4), [1])
+            .pointer(spec, (argmaxAt + row) * 4), [1])
     }
     ok
 }

@@ -172,7 +172,7 @@ fun cmdVerifyCheck(args: array<string>): int {
     val ids: array<int> = []
     if (idsText.succeeded) for (line in idsText.text.split("\n")) if (line.trim() != "") ids.append(line.trim().parseInt() ?? 0)
     if (ids.size < 104) {
-        println("verify-check: need at least 104 token ids")
+        println("verify-check: need at least 104 token ids (106 for the five-row check)")
         return 2
     }
     val file = ggufOpen(args[0])
@@ -299,6 +299,42 @@ fun cmdVerifyCheck(args: array<string>): int {
         val decoded = model.readLogits(backend) ?? return 1
         println("verifyStep + commitStep (a = 1): decode step at position 102: argmax ${argmaxOf(decoded)} (reference ${argmaxOf(reference[2])}), max |dlogit| ${maxAbsDifference(decoded, reference[2])}")
         if (argmaxOf(decoded) != argmaxOf(reference[2])) ok = false
+    }
+    // five rows in buffer layout v2 (spec = u32[16], argmax at spec[8 + row]); commit by step[3] = 3 (rows 0..3 committed)
+    if (ids.size >= 106) {
+        val all5: array<int> = []
+        for (i in 0 until 105) all5.append(ids[i])
+        val wsR = prefillWorkspace(backend, config, 128, true) ?? return 1
+        if (!model.reset(backend) || !model.prefill(backend, wsR, all5, 0)) return 1
+        val ref5: array<array<f32>> = []
+        for (row in 100 until 105) ref5.append(model.readPrefillLogits(backend, wsR, row) ?? return 1)
+        val ws5 = prefillWorkspace(backend, config, 8, true, 5) ?? return 1
+        val spec5 = backend.allocate(64) ?? return 1
+        val step5 = backend.allocate(64) ?? return 1
+        val host5 = nativeByteBuffer(64)
+        val a5 = nativePointerAddress(host5.address)
+        for (i in 0 until 16) storeWord(a5, i, 0)
+        for (i in 0 until 5) storeWord(a5, i, ids[100 + i])
+        storeWord(a5, 5, 4)
+        if (!backend.upload(spec5, 0, a5, 64)) return 1
+        for (i in 0 until 16) storeWord(a5, i, 0)
+        storeWord(a5, 1, 100)
+        storeWord(a5, 3, 3)
+        if (!backend.upload(step5, 0, a5, 64)) return 1
+        if (!model.reset(backend) || !model.prefill(backend, ws5, first, 0) || !model.verifyStep(backend, ws5, spec5, step5, 5, 2)) {
+            println("verify-check: verifyStep 5 rows: ${inklingPrefillLastError()} (${cudaLastError()})")
+            return 1
+        }
+        if (!backend.download(spec5, 0, a5, 64)) return 1
+        for (row in 0 until 5) {
+            val got = loadWord(a5, 8 + row)
+            println("verifyStep 5 rows, row $row argmax $got (reference ${argmaxOf(ref5[row])})")
+            if (got != argmaxOf(ref5[row])) ok = false
+        }
+        if (!model.commitStep(backend, ws5, step5) || !model.forward(backend, ids[104], 104)) return 1
+        val decoded5 = model.readLogits(backend) ?? return 1
+        println("5 rows + commitStep (a = 3): decode step at position 104: argmax ${argmaxOf(decoded5)} (reference ${argmaxOf(ref5[4])}), max |dlogit| ${maxAbsDifference(decoded5, ref5[4])}")
+        if (argmaxOf(decoded5) != argmaxOf(ref5[4])) ok = false
     }
     println(if (ok) "verify-check: ok" else "verify-check: MISMATCH")
     if (ok) 0 else 1
