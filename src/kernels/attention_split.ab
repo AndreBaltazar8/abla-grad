@@ -10,6 +10,13 @@ extern "C" __global__ void attention_rel_split_step(
     const float *q, const kv_element *k, const kv_element *v, const float *table, float *part,
     const unsigned *step, unsigned nHead, unsigned nKvHead, unsigned dim,
     unsigned window, unsigned extent, unsigned maxCtx, float scale, unsigned nSplit) {
+#ifdef INKLING_SWA_GQA3_128
+    if (dim != 128 || nHead != 3 * nKvHead) return;
+    dim = 128;
+    const unsigned partialDim = 128;
+#else
+    const unsigned partialDim = 256;
+#endif
     const unsigned pos = step[1];
     if (pos >= maxCtx) return;
     const unsigned first = window && pos + 1 > window ? pos + 1 - window : 0;
@@ -17,13 +24,17 @@ extern "C" __global__ void attention_rel_split_step(
     const unsigned split = blockIdx.x % nSplit;
     const unsigned warp = threadIdx.x / 32;
     const unsigned lane = threadIdx.x % 32;
+#ifdef INKLING_SWA_GQA3_128
+    const unsigned kvHead = head / 3;
+#else
     const unsigned kvHead = head / (nHead / nKvHead);
+#endif
     const unsigned long long cacheBase = static_cast<unsigned long long>(kvHead) * KV_STRIDE(maxCtx) * dim;
     const unsigned long long headBase = static_cast<unsigned long long>(head) * dim;
     const float *query = q + headBase;
     __shared__ float warpMax[8];
     __shared__ float warpSum[8];
-    __shared__ float partials[8][256];
+    __shared__ float partials[8][partialDim];
     __shared__ float weights[8];
     __shared__ float blockMax;
     __shared__ float blockTotal;

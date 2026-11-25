@@ -515,6 +515,8 @@ private fun cudaAttentionMergeGatedShape(args: KernelArgs, problem: array<int>):
 private fun cudaAttentionSplitShape(args: KernelArgs, problem: array<int>): bool =
     cudaAttentionHeadShape(args.words[6], args.words[7], args.words[8], problem[0] / args.words[13]) &&
         args.words[13] > 0 && args.words[13] <= 64 && problem[0] == args.words[6] * args.words[13] && args.words[11] > 0
+private fun cudaSliding128Shape(args: KernelArgs, problem: array<int>): bool =
+    args.words[8] == 128 && args.words[6] == 3 * args.words[7] && args.words[13] > 0 && cudaAttentionSplitShape(args, problem)
 private fun cudaAttentionGroupedShape(args: KernelArgs, problem: array<int>): bool =
     args.words[6] == 3 * args.words[7] && args.words[8] == 128 && args.words[9] == 0 &&
         args.words[13] > 0 && args.words[13] <= 64 && problem[0] == args.words[7] * args.words[13]
@@ -854,8 +856,10 @@ private fun cudaKvVariant(spec: CudaKernelSpec, suffix: string, slots: int, half
     val name = spec.name + suffix
     val layout = (if (suffix == "_q8") "#define INKLING_Q8_KV\n" else if (suffix == "_fp8") "#define INKLING_FP8_KV\n" else "") + (if (half) "#define INKLING_HALF_KV\n" else "") +
         (if (slots > 0) "#define INKLING_RING_SLOTS ${slots}u\n" else "")
-    val source = layout + "#define ${spec.name} ${name}\n" + spec.source
-    CudaKernelSpec(name, source, spec.itemsPerBlock, spec.blockX, spec.argumentKinds, spec.validate, spec.problemDimensions, spec.nullablePointer)
+    val shape = if (suffix == "_ring_f16_128") "#define INKLING_SWA_GQA3_128\n" else ""
+    val source = layout + shape + "#define ${spec.name} ${name}\n" + spec.source
+    CudaKernelSpec(name, source, spec.itemsPerBlock, spec.blockX, spec.argumentKinds,
+        if (suffix == "_ring_f16_128") cudaSliding128Shape else spec.validate, spec.problemDimensions, spec.nullablePointer)
 }
 
 private fun cudaRingSpecs(): array<CudaKernelSpec> {
@@ -869,6 +873,7 @@ private fun cudaRingSpecs(): array<CudaKernelSpec> {
             result.append(cudaKvVariant(spec, "_q8", 0, false))
             result.append(cudaKvVariant(spec, "_fp8", 0, false))
             result.append(cudaKvVariant(spec, "_ring_f16", INKLING_KV_RING, true))
+            if (base == "attention_rel_split_step") result.append(cudaKvVariant(spec, "_ring_f16_128", INKLING_KV_RING, true))
         }
         if (spec.name == "attention_rel_grouped_step") {
             result.append(cudaKvVariant(spec, "_f16", 0, true))

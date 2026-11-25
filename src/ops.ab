@@ -308,8 +308,10 @@ fun opAttentionRelSplitStep(
     nHead: int, nKvHead: int, headDim: int, window: int, extent: int, maxCtx: int, scale: f32, nSplit: int,
     gate: DeviceBuffer, gateOffset: int, useGate: bool, ring: bool = false, half: bool = false, q8: bool = false, grouped: bool = false, fp8: bool = false
 ): bool {
+    val kernel = if (ring && half && !grouped && !q8 && !fp8 && headDim == 128 && nHead == 3 * nKvHead) "attention_rel_split_step_ring_f16_128"
+        else (if (grouped) "attention_rel_grouped_step" else "attention_rel_split_step") + kvKernelSuffix(ring, half, q8, fp8)
     val ok = backend.launch(
-        (if (grouped) "attention_rel_grouped_step" else "attention_rel_split_step") + kvKernelSuffix(ring, half, q8, fp8),
+        kernel,
         kernelArgs().pointer(q, qOffset).pointer(kCache, kCacheOffset).pointer(vCache, vCacheOffset).pointer(table, tableOffset)
             .pointer(part, partOffset).pointer(step, 0).u32(nHead).u32(nKvHead).u32(headDim).u32(window).u32(extent).u32(maxCtx).f32(scale).u32(nSplit),
         [(if (grouped) nKvHead else nHead) * nSplit]

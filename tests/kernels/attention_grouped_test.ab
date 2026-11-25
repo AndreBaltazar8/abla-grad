@@ -2,20 +2,23 @@ import "abla/float"
 import "abla/io"
 import "../../src/backend/backend.ab"
 import "../../src/backend/cuda.ab"
+import "../../src/kernels/kv_layout.ab"
 import "support.ab"
 
 private fun launch(var backend: Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, table: DeviceBuffer,
-    dest: DeviceBuffer, step: DeviceBuffer, splits: int, grouped: bool, suffix: string): bool {
+    dest: DeviceBuffer, step: DeviceBuffer, splits: int, specialized: bool, suffix: string): bool {
+    val sliding = suffix == "_ring_f16"
+    val grouped = specialized && !sliding
     val args = kernelArgs().pointer(q).pointer(k).pointer(v).pointer(table).pointer(dest).pointer(step)
-        .u32(6).u32(2).u32(128).u32(0).u32(64).u32(257).f32(0.125).u32(splits)
+        .u32(6).u32(2).u32(128).u32(if (sliding) 1024 else 0).u32(64).u32(if (sliding) 4096 else 257).f32(0.125).u32(splits)
     val name = if (grouped) "attention_rel_grouped_step" else "attention_rel_split_step"
-    backend.launch(name + suffix, args, [(if (grouped) 2 else 6) * splits])
+    backend.launch(name + suffix + (if (sliding && specialized) "_128" else ""), args, [(if (grouped) 2 else 6) * splits])
 }
 
 private fun cache(var backend: Backend, count: int, seed: int, suffix: string): DeviceBuffer? {
     if (suffix == "") return uploadFloats(backend, testSignal(count, seed))
     val words: array<int> = []
-    if (suffix == "_f16") {
+    if (suffix == "_f16" || suffix == "_ring_f16") {
         // Exactly represented FP16 values with different signs, exponents and mantissas.
         val halves = [0, 0xbc00, 0x3900, 0xc240, 0x4180, 0x3500, 0xbe80]
         for (i in 0 until count / 2) {
@@ -40,7 +43,7 @@ private fun check(var backend: Backend, pos: int, splits: int, suffix: string): 
     val heads = 6
     val kvHeads = 2
     val dim = 128
-    val ctx = 257
+    val ctx = if (suffix == "_ring_f16") INKLING_KV_RING else 257
     val extent = 64
     val q = uploadFloats(backend, testSignal(heads * dim, 7)) ?? return false
     val k = cache(backend, kvHeads * dim * ctx, 13, suffix) ?? return false
@@ -67,6 +70,10 @@ fun main: int {
         eprintln(cudaLastError())
         return 1
     }
-    println("grouped attention produces identical FP32 partials")
+    for (pos in [0, INKLING_KV_RING, 4095]) if (!check(backend, pos, 16, "_ring_f16")) {
+        eprintln(cudaLastError())
+        return 1
+    }
+    println("grouped and sliding attention produce identical FP32 partials")
     0
 }
