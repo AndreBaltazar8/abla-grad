@@ -140,7 +140,7 @@ and the server log. Source results are `raw/ttft-batch-d*.server.log`.
 Same private eight-request capture, original GGUF and DSpark. Session HTTP
 is the sum of the requests and excludes model load. Other columns describe
 the final request. Request 5 stopped after 261 tokens on `b22b960`
-and hit the 512-token limit from `cf6578c` through `6ef2608`.
+and hit the 512-token limit from `cf6578c` through `86df7a9`.
 
 | Main landing | Prompt tokens | Reused tokens | Generated tokens | First raw token (s) | Decode (tok/s) | Final HTTP (s) | Session HTTP (s) |
 |:---|---:|---:|---:|---:|---:|---:|---:|
@@ -151,6 +151,8 @@ and hit the 512-token limit from `cf6578c` through `6ef2608`.
 | `cf6578c` | 74917 | 56656 | 202 | 10.838 | 101.22 | 12.834 | 55.565 |
 | `9aaccb1` | 74917 | 56656 | 202 | 9.602 | 101.44 | 11.593 | 47.226 |
 | `6ef2608` | 74917 | 56656 | 202 | 9.354 | 101.30 | 11.349 | 45.760 |
+| `9785f44` | 74917 | 56662 | 202 | 9.040 | 105.41 | 10.956 | 45.178 |
+| `86df7a9` | 74917 | 56662 | 202 | 9.026 | 105.48 | 10.941 | 45.138 |
 
 ```sh
 capture="$HOME/archive/abla-grad-serve-replay/capture/requests.jsonl"
