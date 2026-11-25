@@ -68,7 +68,7 @@ on prose, 150-250 tok/s on predictable text such as lists and code. The first tu
 ## Serving Inkling over HTTP
 
 `abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N]` starts an OpenAI-compatible
-server on 127.0.0.1 (default port 8080, context 10240 tokens; the drafter `dspark-Inkling-2-Mini-Q8_0.gguf` is looked for next to the model). Point a coding
+server on 127.0.0.1 (default port 8080; without `--ctx` the context is chosen from the free device memory at startup and printed; the drafter `dspark-Inkling-2-Mini-Q8_0.gguf` is looked for next to the model). Point a coding
 tool at `http://127.0.0.1:8080/v1`; any API key works.
 
 - `GET /v1/models`, `GET /health`, `POST /v1/chat/completions` (JSON, or `"stream": true` as server-sent events with `stream_options.include_usage`).
