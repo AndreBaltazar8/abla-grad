@@ -85,6 +85,9 @@ fun cmdLogits(args: array<string>): int {
         } else if (args[index] == "--int8-experts") {
             setPrefillInt8Experts(true)
             index = index + 1
+        } else if (args[index] == "--no-int8-experts") {
+            setPrefillInt8Experts(false)
+            index = index + 1
         } else if (args[index] == "--chunk" && index + 1 < args.size) {
             chunk = args[index + 1].parseInt() ?? 512
             index = index + 2

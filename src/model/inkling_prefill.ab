@@ -21,8 +21,8 @@ private var prefillMoeTile = 64
 // NVFP4 experts through the register-direct kernel (64-token tiles only).
 private var prefillRegisterDirect = false
 
-// NVFP4 experts through the int8 kernels (activations quantized to Q8_1-style s8 with one f32 scale per 32 values; ablac-90's `matmul_nvfp4_grouped_i8`). Off by default.
-private var prefillInt8Experts = false
+// NVFP4 experts through the int8 kernels (activations quantized to Q8_1-style s8 with one f32 scale per 32 values; ablac-90's `matmul_nvfp4_grouped_i8`). On by default (--no-int8-experts selects the f16 experts).
+private var prefillInt8Experts = true
 
 fun setPrefillInt8Experts(on: bool): void {
     prefillInt8Experts = on

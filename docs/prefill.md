@@ -56,3 +56,9 @@ With `model.enableTaps` on, prefill and verify rows write the same position-majo
 slot 3 = the final-norm output (copied from the same vector the lm head reads). Measured against step-mode taps over 103 positions of prompt 04 (relative L2 error): slot 0
 3e-4, slot 1 up to 0.07, slot 2 up to 0.37, slot 3 up to 0.38 — while the logits of the same positions agree to KL 1e-5. A final-norm tap that disagrees by 38% cannot
 produce the same logits, so the deeper step-mode taps need a look (the prefill taps are copies of the vectors the prefill's own lm head used).
+
+## int8 experts (ablac-90's `matmul_nvfp4_grouped_i8`, default on)
+The NVFP4 expert matmuls of prefill quantize their activations to s8 (Q8_1 style, one f32 scale per 32 values; `quantize_rows_i8` once for the gate/up input and once for the
+down input) and run s8 `mma.m16n8k16` with the NVFP4 values expanded by a byte-permute lookup; the scales are applied to the int32 accumulators. pp512 4,934 -> 5,545 tok/s
+(`--no-int8-experts` selects the f16 kernels). Accuracy: `tools/gate-inkling.sh` with `--prefill --chunk 256` and `--chunk 512`: 324 positions within the tolerances, 1 argmax
+difference (the f16 experts give 0; llama.cpp's own CPU and CUDA builds differ by 1), worst KL 0.0144 against a limit of 0.04. Verification rows use the f32 row kernels, not this path.
