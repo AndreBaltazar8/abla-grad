@@ -177,6 +177,10 @@ private fun InklingModel.dense(var backend: Backend, ws: PrefillWorkspace, name:
     val kind = weightKind(ref.type)
     var kernel = ""
     var problem: array<int> = []
+    if (prefillVerifyRows > 0 && tokens <= 5 && kind == "bf16" && ref.rows <= 128 && ref.cols >= 1024) {
+        return backend.launch("matvec_bf16_output", kernelArgs().pointer(this.arena, ref.offset).pointer(ws.buffer, xOffset).pointer(ws.buffer, yOffset)
+            .u32(ref.rows).u32(ref.cols).u32(tokens), [ref.rows, tokens])
+    }
     if (prefillVerifyRows > 0 && tokens <= prefillRowsMax && (kind == "q8_0" || kind == "f32")) {
         // the few rows of a verification: one weight read for all of them (e7's R-row matvecs, exact f32 arithmetic on the activations)
         return backend.launch("matvec_${kind}_rows", kernelArgs().pointer(this.arena, ref.offset).pointer(ws.buffer, xOffset).pointer(ws.buffer, yOffset)

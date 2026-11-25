@@ -1,6 +1,8 @@
 import "../../src/backend/backend.ab"
 import "../../src/backend/cuda.ab"
 import "support.ab"
+import "device_test_support.ab"
+import "abla/float"
 import "abla/io"
 import "abla/process/arguments"
 import "abla/process/time"
@@ -93,6 +95,15 @@ private fun verifyDense(var backend: Backend, kind: string, rows: int, cols: int
             .u32(rows).u32(cols).u32(vectors)
         if (!backend.launch(newName, args, [rows]) || !backend.synchronize() ||
             !verifyEqual(backend, newName, vectors, y, ref, vectors * rows)) return false
+        if (kind == "bf16" && vectors <= 5) {
+            val projected = verifyOutput(backend, vectors * rows) ?? return false
+            val projectionArgs = kernelArgs().pointer(w, wOffset).pointer(x, xOffset).pointer(projected)
+                .u32(rows).u32(cols).u32(vectors)
+            if (!backend.launch("matvec_bf16_output", projectionArgs, [rows, vectors]) || !backend.synchronize()) return false
+            val got = downloadFloats(backend, projected, vectors * rows) ?? return false
+            val expected = downloadFloats(backend, ref, vectors * rows) ?? return false
+            for (i in 0 until got.size) if (!testNear("matvec_bf16_output", i, got[i], f32ToF64(expected[i]))) return false
+        }
         if (bench && !timeVerify(backend, newName, args, [rows], "${newName} ${rows}x${cols}", vectors)) return false
     }
     true
@@ -188,7 +199,7 @@ private fun verifyAll(var backend: Backend): bool {
             verifyIndexed(backend, 2304, 1152, 8, "mixed", 1152, 0, false, bench = true, kind = "q8_0")
     }
     verifyDense(backend, "f32", 7, 93) &&
-        verifyDense(backend, "bf16", 37, 256) &&
+        verifyDense(backend, "bf16", 37, 2304) &&
         verifyDense(backend, "q8", 7, 160) &&
         verifyDense(backend, "q8", 11, 96, xOffset = 4) &&
         verifyDense(backend, "q8", 11, 96, wOffset = 1) &&
@@ -216,6 +227,6 @@ fun main: int {
         eprintln("R-row CUDA matvec failed: ${cudaLastError()}")
         return 1
     }
-    println("R-row matvec matches independent single-row calls bit-for-bit")
+    println("R-row matvecs match independent single-row calls")
     0
 }

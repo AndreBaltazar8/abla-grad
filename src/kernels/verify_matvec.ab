@@ -364,3 +364,25 @@ val kernelVerifyQ8Indexed = verifyIndexedSource(kernelMatvecQ8_0 + "\n" + verify
     "VerifyQ8", "matvec_q8_0_indexed_rows")
 val kernelVerifyQ5Indexed = verifyIndexedSource(kernelMatvecK + "\n" + verifyWarpReduction + "\n" + verifyQ5Format,
     "VerifyQ5", "matvec_q5_k_indexed_rows")
+
+// One block reduces a full BF16 dot product for each (output, verifier token).
+val kernelVerifyBf16Output = """
+extern "C" __global__ void matvec_bf16_output(const unsigned short *w, const float *x, float *y,
+    unsigned rows, unsigned cols, unsigned tokens) {
+    const unsigned row = blockIdx.x, token = blockIdx.y, thread = threadIdx.x;
+    float sum = 0.0f;
+    for (unsigned col = thread; col < cols; col += blockDim.x) {
+        const float weight = __uint_as_float(unsigned(w[row * cols + col]) << 16);
+        sum = fmaf(weight, x[token * cols + col], sum);
+    }
+    for (unsigned offset = 16; offset; offset /= 2) sum += __shfl_down_sync(~0u, sum, offset);
+    __shared__ float warpSums[8];
+    if ((thread & 31) == 0) warpSums[thread / 32] = sum;
+    __syncthreads();
+    if (thread < 32) {
+        sum = thread < 8 ? warpSums[thread] : 0.0f;
+        for (unsigned offset = 4; offset; offset /= 2) sum += __shfl_down_sync(~0u, sum, offset);
+        if (thread == 0) y[token * rows + row] = sum;
+    }
+}
+"""

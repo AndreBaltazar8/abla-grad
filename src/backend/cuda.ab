@@ -519,6 +519,9 @@ private val cudaVerifyIndexedArguments = [
 private fun cudaVerifyDenseShape(args: KernelArgs, problem: array<int>): bool =
     cudaF32Shape(args, problem) && ((args.words[5] >= 1 && args.words[5] <= 5) || args.words[5] == 8)
 
+private fun cudaVerifyBf16OutputShape(args: KernelArgs, problem: array<int>): bool =
+    cudaVerifyDenseShape(args, problem) && args.words[0] % 2 == 0 && args.words[5] == problem[1] && problem[1] <= 5
+
 private fun cudaVerifyQ8Shape(args: KernelArgs, problem: array<int>): bool =
     cudaVerifyDenseShape(args, problem) && args.words[4] % 32 == 0
 
@@ -547,6 +550,7 @@ private fun cudaVerifyQ5IndexedShape(args: KernelArgs, problem: array<int>): boo
 
 private val cudaKernels = [
     CudaKernelSpec("matvec_f32_rows", kernelVerifyF32, 4, 128, cudaVerifyMatvecArguments, cudaVerifyDenseShape),
+    CudaKernelSpec("matvec_bf16_output", kernelVerifyBf16Output, 1, 256, cudaVerifyMatvecArguments, cudaVerifyBf16OutputShape, 2),
     CudaKernelSpec("matvec_bf16_rows", kernelVerifyF32, 4, 128, cudaVerifyMatvecArguments, cudaVerifyDenseShape),
     CudaKernelSpec("matvec_q8_0_rows", kernelVerifyQ8_0, 4, 128, cudaVerifyMatvecArguments, cudaVerifyQ8Shape),
     CudaKernelSpec("matvec_nvfp4_indexed_rows", kernelVerifyNvfp4, 4, 128,
