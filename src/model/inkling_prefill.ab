@@ -388,7 +388,7 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     ok = ok && backend.launch("rel_table_rows", kernelArgs().pointer(this.arena, relBias.offset).pointer(ws.buffer, r).pointer(ws.buffer, sinks)
         .pointer(ws.buffer, table).u32(c.nRel).u32(extent).u32(tokens * c.nHead), [extent + 1, tokens * c.nHead])
     val layerCacheBytes = c.nHeadKv * this.maxCtx * c.headDim * 4
-    ok = ok && backend.launch("kv_store_batch", kernelArgs().pointer(ws.buffer, k).pointer(ws.buffer, v).pointer(this.kCache, visit * layerCacheBytes)
+    ok = ok && backend.launch("kv_store_batch_ptr", kernelArgs().pointer(ws.buffer, k).pointer(ws.buffer, v).pointer(this.kCache, visit * layerCacheBytes)
         .pointer(this.vCache, visit * layerCacheBytes).pointer(posBuf, posOff).u32(c.nHeadKv).u32(c.headDim).u32(this.maxCtx).u32(tokens), [kvDim, tokens])
     val scale = f64ToF32(1.0 / sqrt(f64FromInt(c.headDim)))
     val att = ws.o("att")

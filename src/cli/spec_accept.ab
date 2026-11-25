@@ -23,12 +23,16 @@ fun cmdSpecAccept(args: array<string>): int {
     var maxCtx = 0
     var cost = false
     var union = false
+    var prefillTaps = false
     val positional: array<string> = []
     var index = 0
     while (index < args.size) {
         if (args[index] == "--n" && index + 1 < args.size) {
             count = args[index + 1].parseInt() ?? 0
             index = index + 2
+        } else if (args[index] == "--prefill-taps") {
+            prefillTaps = true
+            index = index + 1
         } else if (args[index] == "--union") {
             union = true
             index = index + 1
@@ -79,7 +83,25 @@ fun cmdSpecAccept(args: array<string>): int {
     val first: array<int> = []
     val second: array<int> = []
     var token = ids[0]
-    for (position in 0 until total - 1) {
+    var begin = 0
+    if (prefillTaps) {
+        // the prompt's state and taps come from the batched prefill (f16 tensor cores) instead of step-mode decode
+        val ws = prefillWorkspace(backend, config, 512, false) ?? return 1
+        val head: array<int> = []
+        for (i in 0 until ids.size - 1) head.append(ids[i])
+        if (!model.prefill(backend, ws, head, 0) || !drafter.pushTaps(backend, model.taps, 0, head.size)) {
+            println("spec-accept: prefill: ${inklingPrefillLastError()} ${dsparkLastError()}")
+            return 1
+        }
+        for (i in 0 until head.size) {
+            nxt.append(-1)
+            first.append(-1)
+            second.append(-1)
+        }
+        begin = head.size
+        token = ids[begin]
+    }
+    for (position in begin until total - 1) {
         if (!model.forward(backend, token, position)) {
             println("spec-accept: ${inklingLastError()} (${cudaLastError()})")
             return 1

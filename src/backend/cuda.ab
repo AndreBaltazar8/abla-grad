@@ -372,6 +372,7 @@ private val cudaArgsConvSeq = [prefillArgP, prefillArgP, prefillArgP, prefillArg
 private val cudaArgsConvHistory = [prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU]
 private val cudaArgsL2ClipRows = [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgF, prefillArgU]
 private val cudaArgsScaleTauRows = [prefillArgP, prefillArgU, prefillArgP, prefillArgU, prefillArgF, prefillArgU]
+private val cudaArgsKvStoreBatchValue = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgU]
 private val cudaArgsKvStoreBatch = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgU]
 private val cudaArgsMoeRouteBatch = [prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgP, prefillArgP, prefillArgF, prefillArgF, prefillArgU]
 private val cudaArgsMoeSort = [prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgP, prefillArgP, prefillArgP]
@@ -531,7 +532,8 @@ private val cudaPrefillKernels = [
     CudaKernelSpec("conv_history", kernelPrefillConvHistory, 256, 256, cudaArgsConvHistory, cudaPrefillConvHistoryShape),
     CudaKernelSpec("l2clip_rows", kernelPrefillL2Clip, 1, 128, cudaArgsL2ClipRows, cudaPrefillL2ClipRowsShape, 1, 1),
     CudaKernelSpec("scale_tau_rows", kernelPrefillScaleTau, 256, 256, cudaArgsScaleTauRows, cudaPrefillScaleTauShape, 2),
-    CudaKernelSpec("kv_store_batch", kernelPrefillKvStore, 256, 256, cudaArgsKvStoreBatch, cudaPrefillKvStoreShape, 2),
+    CudaKernelSpec("kv_store_batch", kernelPrefillKvStore, 256, 256, cudaArgsKvStoreBatchValue, cudaPrefillKvStoreShape, 2),
+    CudaKernelSpec("kv_store_batch_ptr", kernelPrefillKvStorePtr, 256, 256, cudaArgsKvStoreBatch, cudaPrefillKvStoreShape, 2),
     CudaKernelSpec("moe_route_batch", kernelPrefillMoeRoute, 4, 128, cudaArgsMoeRouteBatch, cudaPrefillMoeRouteShape, 1, 1),
     CudaKernelSpec("moe_sort", kernelPrefillMoeSort, 1, 1024, cudaArgsMoeSort, cudaPrefillMoeSortShape),
     CudaKernelSpec("moe_combine_batch", kernelPrefillMoeCombine, 256, 256, cudaArgsMoeCombineBatch, cudaPrefillMoeCombineShape, 2),
