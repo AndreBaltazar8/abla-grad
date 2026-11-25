@@ -642,9 +642,11 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     val downScales = this.wr("blk.$ip.ffn_down_exps.scale")
     val guStride = ggmlRowBytes(guRef.type, guRef.cols) * 2 * nFf
     val downStride = ggmlRowBytes(downRef.type, downRef.cols) * n
-    ok = ok && this.grouped(backend, ws, guKind, guRef.offset, x, sortedToken, ws.o("gu"), this.hasWeight("blk.$ip.ffn_gate_up_exps.scale"), guScales.offset, plan,
-        2 * nFf, n, c.nExpert, guStride, maxTiles, tokens, "A")
-    ok = ok && opSitu(backend, ws.buffer, ws.o("gu"), ws.buffer, ws.o("act"), pairs, nFf, c.situBeta, c.situLinear)
+    val fusedGateUp = guKind == "nvfp4" && prefillVerifyRows == 0 && prefillInt8Experts && prefillMoeTile == 64 && n % 64 == 0
+    ok = ok && this.grouped(backend, ws, guKind, guRef.offset, x, sortedToken,
+        ws.o(if (fusedGateUp) "act" else "gu"), this.hasWeight("blk.$ip.ffn_gate_up_exps.scale"), guScales.offset, plan,
+        2 * nFf, n, c.nExpert, guStride, maxTiles, tokens, "A", fusedGateUp)
+    if (!fusedGateUp) ok = ok && opSitu(backend, ws.buffer, ws.o("gu"), ws.buffer, ws.o("act"), pairs, nFf, c.situBeta, c.situLinear)
     ok = ok && this.grouped(backend, ws, downKind, downRef.offset, ws.o("act"), ws.o("iota"), ws.o("down"), this.hasWeight("blk.$ip.ffn_down_exps.scale"),
         downScales.offset, plan, n, nFf, c.nExpert, downStride, maxTiles, pairs, "B")
     ok = ok && backend.launch("moe_combine_batch", kernelArgs().pointer(ws.buffer, ws.o("down")).pointer(ws.buffer, slotOfPair).pointer(ws.buffer, weights)
@@ -687,7 +689,7 @@ private fun InklingModel.convRows(var backend: Backend, ws: PrefillWorkspace, in
 }
 
 private fun InklingModel.grouped(var backend: Backend, ws: PrefillWorkspace, kind: string, wOffset: int, x: int, xmap: int, y: int, useScales: bool, scalesOffset: int,
-    plan: int, rows: int, cols: int, nExpert: int, stride: int, maxTiles: int, xRows: int = 0, quantName: string = "A"): bool {
+    plan: int, rows: int, cols: int, nExpert: int, stride: int, maxTiles: int, xRows: int = 0, quantName: string = "A", fuseSitu: bool = false): bool {
     if ((kind == "nvfp4" || ((kind == "q8_0" || kind == "q5_k") && prefillVerifyRows == 0)) && prefillInt8Experts && prefillMoeTile == 64 && xRows > 0 && cols % 64 == 0) {
         // int8: quantize the f32 rows once (the kernel gathers rows through xmap), then the s8 grouped matmul
         val qx = ws.o("qx" + quantName)
@@ -701,6 +703,11 @@ private fun InklingModel.grouped(var backend: Backend, ws: PrefillWorkspace, kin
         iargs.u32(nExpert)
         iargs.u64(stride)
         iargs.pointer(ws.buffer, sx)
+        if (fuseSitu) {
+            iargs.f32(this.config.situBeta)
+            iargs.f32(this.config.situLinear)
+            return backend.launch("matmul_nvfp4_grouped_i8_situ", iargs, [rows / 2, maxTiles])
+        }
         val kernel = if (kind == "nvfp4") "matmul_nvfp4_grouped_i8"
             else "matmul_${kind}_grouped_i8"
         return backend.launch(kernel, iargs, [rows, maxTiles])

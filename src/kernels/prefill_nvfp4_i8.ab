@@ -1,3 +1,5 @@
+import "elementwise.ab"
+
 // NVFP4 weights stay packed in global memory. Activations use a Q8_1 D4 scale per 32 values.
 // Within each 16-byte group, qx interleaves the two eight-value halves so NVFP4 nibbles can
 // expand directly into the same order via signed byte LUTs. sx holds the ordinary row scales.
@@ -36,6 +38,9 @@ private val prefillNvfp4I8Body = """
 
 #ifndef I8_Q5
 #define I8_Q5 0
+#endif
+#ifndef I8_FUSED
+#define I8_FUSED 0
 #endif
 #ifndef I8_Q8
 #define I8_Q8 0
@@ -117,7 +122,11 @@ extern "C" __global__ void I8_LAUNCH_BOUNDS I8_KERNEL(
 #else
     const unsigned char *weights, const unsigned *qx, const unsigned *xmap, float *y,
     const float *expertScales, const unsigned *plan, unsigned rows, unsigned cols,
-    unsigned nExpert, unsigned long long expertStride, const float *sx) {
+    unsigned nExpert, unsigned long long expertStride, const float *sx
+#if I8_FUSED
+    , float beta, float lb
+#endif
+    ) {
     if (blockIdx.y >= plan[nExpert + 1]) return;
     const unsigned expert = plan[nExpert + 2 + 2 * blockIdx.y];
     const unsigned first = plan[nExpert + 3 + 2 * blockIdx.y];
@@ -127,12 +136,28 @@ extern "C" __global__ void I8_LAUNCH_BOUNDS I8_KERNEL(
     const unsigned char *w = weights + expert * expertStride;
     const float scale = expertScales ? expertScales[expert] : 1.0f;
 #endif
+#if I8_FUSED
+    const unsigned n0 = rowTile * (I8_ROWS / 2);
+    const unsigned features = rows / 2;
+#else
     const unsigned n0 = rowTile * I8_ROWS;
+#endif
     const unsigned long long rowBytes = I8_Q5 ? static_cast<unsigned long long>(cols / 256) * 176 :
         I8_Q8 ? static_cast<unsigned long long>(cols / 32) * 34 :
         static_cast<unsigned long long>(cols / 64) * 36;
 
+#if I8_FUSED
+    // The last GEMM barrier ends all reads from the weight slab. Reuse it
+    // for the paired gate values with a skew between adjacent token rows.
+    union WeightStorage {
+        unsigned matrix[I8_ROWS][I8_PITCH];
+        float gate[I8_TOKENS][I8_ROWS / 2 + 1];
+    };
+    __shared__ __align__(16) WeightStorage storage;
+    auto &wa = storage.matrix;
+#else
     __shared__ __align__(16) unsigned wa[I8_ROWS][I8_PITCH];
+#endif
     __shared__ __align__(16) unsigned xb[I8_TOKENS][I8_PITCH];
     __shared__ float saw[I8_ROWS][I8_K / 16];
     __shared__ float sbx[I8_TOKENS][I8_K / 32];
@@ -157,8 +182,16 @@ extern "C" __global__ void I8_LAUNCH_BOUNDS I8_KERNEL(
 #if I8_Q5
             float weightMin = 0.0f;
 #endif
-            if (n0 + r < rows && k + 16 * sub < cols) {
-                const unsigned char *row = w + static_cast<unsigned long long>(n0 + r) * rowBytes;
+#if I8_FUSED
+            const unsigned feature = n0 + r % (I8_ROWS / 2);
+            const unsigned weightRow = feature + (r >= I8_ROWS / 2 ? features : 0);
+            const bool validRow = feature < features;
+#else
+            const unsigned weightRow = n0 + r;
+            const bool validRow = weightRow < rows;
+#endif
+            if (validRow && k + 16 * sub < cols) {
+                const unsigned char *row = w + static_cast<unsigned long long>(weightRow) * rowBytes;
 #if I8_Q5
                 const unsigned column = k + 16 * sub;
                 const unsigned group = (column / 32) & 7u;
@@ -302,6 +335,44 @@ extern "C" __global__ void I8_LAUNCH_BOUNDS I8_KERNEL(
         __syncthreads();
     }
 
+#if I8_FUSED
+    const bool gateWarp = mr < I8_ROWS / 2;
+    const unsigned featureLane = mr % (I8_ROWS / 2) + g;
+    if (gateWarp) {
+        #pragma unroll
+        for (unsigned i = 0; i < 2; ++i) {
+            const unsigned feature = featureLane + 16 * i;
+            #pragma unroll
+            for (unsigned n = 0; n < 4; ++n) {
+                const unsigned col = mt + 8 * n + 2 * t;
+                storage.gate[col][feature] = acc[i][n][0] * scale;
+                storage.gate[col + 1][feature] = acc[i][n][1] * scale;
+                storage.gate[col][feature + 8] = acc[i][n][2] * scale;
+                storage.gate[col + 1][feature + 8] = acc[i][n][3] * scale;
+            }
+        }
+    }
+    __syncthreads();
+    if (!gateWarp) {
+        #pragma unroll
+        for (unsigned i = 0; i < 2; ++i) {
+            const unsigned feature = featureLane + 16 * i;
+            const unsigned r = n0 + feature;
+            #pragma unroll
+            for (unsigned n = 0; n < 4; ++n) {
+                const unsigned col = mt + 8 * n + 2 * t;
+                if (begin + col < end && r < features)
+                    y[static_cast<unsigned long long>(begin + col) * features + r] = grad_situ(storage.gate[col][feature], acc[i][n][0] * scale, beta, lb);
+                if (begin + col + 1 < end && r < features)
+                    y[static_cast<unsigned long long>(begin + col + 1) * features + r] = grad_situ(storage.gate[col + 1][feature], acc[i][n][1] * scale, beta, lb);
+                if (begin + col < end && r + 8 < features)
+                    y[static_cast<unsigned long long>(begin + col) * features + r + 8] = grad_situ(storage.gate[col][feature + 8], acc[i][n][2] * scale, beta, lb);
+                if (begin + col + 1 < end && r + 8 < features)
+                    y[static_cast<unsigned long long>(begin + col + 1) * features + r + 8] = grad_situ(storage.gate[col + 1][feature + 8], acc[i][n][3] * scale, beta, lb);
+            }
+        }
+    }
+#else
     #pragma unroll
     for (unsigned i = 0; i < 2; ++i) {
         const unsigned r = n0 + mr + 16 * i + g;
@@ -314,6 +385,7 @@ extern "C" __global__ void I8_LAUNCH_BOUNDS I8_KERNEL(
             if (col + 1 < end && r + 8 < rows) y[static_cast<unsigned long long>(col + 1) * rows + r + 8] = acc[i][n][3] * scale;
         }
     }
+#endif
 }
 """
 
@@ -325,3 +397,6 @@ val kernelPrefillQ8GroupedI8 = "#define I8_Q8 1\n#define I8_KERNEL matmul_q8_0_g
 val kernelPrefillQ8I8X5 = "#define I8_Q8 1\n#define I8_X5 1\n#define I8_KERNEL matmul_q8_0_i8_x5\n" + prefillNvfp4I8Body
 
 val kernelPrefillQ5GroupedI8 = "#define I8_Q5 1\n#define I8_KERNEL matmul_q5_k_grouped_i8\n" + prefillNvfp4I8Body
+
+val kernelPrefillInt8Situ = "#define I8_LAUNCH_BOUNDS __launch_bounds__(256, 3)\n#define I8_FUSED 1\n#define I8_KERNEL matmul_nvfp4_grouped_i8_situ\n" +
+    kernelSituDeviceSource + "\n" + prefillNvfp4I8Body

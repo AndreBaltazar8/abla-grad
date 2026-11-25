@@ -89,9 +89,33 @@ trusted fun testGrouped(backend: Backend, kind: string, elements: int, blockByte
         val qx = backend.allocate(tokens * cols)
         val sx = backend.allocate(tokens * (cols / 32) * 4)
         if (qx == null || sx == null) return false
-        backend.launch("quantize_rows_i8", kernelArgs().pointer(dx).pointer(qx).pointer(sx).u32(tokens).u32(cols), [cols / 4, tokens]) &&
-            backend.launch(if (kind != "nvfp4") "matmul_${kind}_grouped_i8" else "matmul_nvfp4_grouped_i8", kernelArgs().pointer(dw).pointer(qx).pointer(if (identityMap) diota else dsorted)
-                .pointer(dy).pointer(dscales).pointer(dplan).u32(rows).u32(cols).u32(nExpert).u64(stride).pointer(sx), [rows, maxTiles])
+        if (!backend.launch("quantize_rows_i8", kernelArgs().pointer(dx).pointer(qx).pointer(sx).u32(tokens).u32(cols), [cols / 4, tokens])) return false
+        val rawKernel = "matmul_${kind}_grouped_i8"
+        if (!backend.launch(rawKernel, kernelArgs().pointer(dw).pointer(qx).pointer(if (identityMap) diota else dsorted)
+            .pointer(dy).pointer(dscales).pointer(dplan).u32(rows).u32(cols).u32(nExpert).u64(stride).pointer(sx), [rows, maxTiles])) return false
+        if (!identityMap && kind == "nvfp4") {
+            val features = rows / 2
+            val bytes = pairs * features * 4
+            val fused = backend.allocate(bytes) ?? return false
+            val unfused = backend.allocate(bytes) ?? return false
+            val hFused = nativeByteBuffer(bytes)
+            val hUnfused = nativeByteBuffer(bytes)
+            val fa = nativePointerAddress(hFused.address)
+            val ua = nativePointerAddress(hUnfused.address)
+            val beta = f32(3.0)
+            val lb = if (blocks == 3) f32(1.5) else f32(0.0)
+            val fusedKernel = "matmul_nvfp4_grouped_i8_situ"
+            if (!backend.launch(fusedKernel, kernelArgs().pointer(dw).pointer(qx).pointer(if (identityMap) diota else dsorted)
+                .pointer(fused).pointer(dscales).pointer(dplan).u32(rows).u32(cols).u32(nExpert).u64(stride).pointer(sx).f32(beta).f32(lb),
+                [features, maxTiles]) ||
+                !backend.launch("situ", kernelArgs().pointer(dy).pointer(unfused).u32(pairs).u32(features).f32(beta).f32(lb), [pairs * features]) ||
+                !backend.download(fused, 0, fa, bytes) || !backend.download(unfused, 0, ua, bytes)) return false
+            for (i in 0 until pairs * features) {
+                if (!testNear("fused gate-up $tile", i, testLoadFloat(fa, i),
+                    f32ToF64(testLoadFloat(ua, i)), 0.000001, 0.000001)) return false
+            }
+        }
+        true
     } else if (identityMap) groupedLaunch(backend, "matmul_${kind}_grouped${suffix}", dw, dx, diota, dy, dscales, dplan, rows, cols, nExpert, stride, maxTiles)
         else groupedLaunch(backend, "matmul_${kind}_grouped${suffix}", dw, dx, dsorted, dy, dscales, dplan, rows, cols, nExpert, stride, maxTiles)
     if (!launched ||
@@ -153,8 +177,9 @@ fun verify(backend: Backend): bool {
     if (!testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, false, true) || !testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, true, true)) return false
     if (!testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, false, false, 3, true) ||
         !testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, true, false, 2, true)) return false
-    if (!testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, 64, false, false, 4, true)) return false
-    if (!testGrouped(backend, "q5_k", 256, 176, oracleQ5K, 64, false, false, 1, true)) return false
+    if (!testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, false, false, 2, true) ||
+        !testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, 64, false, false, 4, true) ||
+        !testGrouped(backend, "q5_k", 256, 176, oracleQ5K, 64, false, false, 1, true)) return false
     for (tile in [64, 32]) {
         if (!testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, tile, false) || !testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, tile, true)) return false
         if (!testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, tile, false) || !testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, tile, true)) return false
