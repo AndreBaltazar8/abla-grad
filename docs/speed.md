@@ -696,3 +696,24 @@ Both Abla cache modes passed at 32,768 and 102,400 positions under the calibrate
 At a 131,072-token capacity, the HTTP checkpoint regression started with 21,765 MiB free and selected a 512-token prefill workspace with 865 MiB to spare. Each of the two checkpoints occupies 207.66 MiB. This includes 160 MiB for the target sliding K/V, 8 MiB for the two sliding drafter visits, 36 MiB for rolling target taps and 3.66 MiB for convolution history.
 
 A 6,040-token prompt took 4.019 s to first token cold. After generating 2,304 tokens, its repeat reused 6,039 prompt tokens and took 0.060 s to first token. A 6,026-token edit within the preceding prompt reused the saved 4,096-token boundary and took 3.025 s, compared with 3.748 s for a cold request with the identical edit. Both restored requests returned the same eight-token choices as their cold references, including reasoning. These are single-request first-token times. The test is reproducible with `tools/test-serve.sh <model.gguf> --long-checkpoint` under the GPU lock.
+
+## OpenAI session replay
+
+One RTX 4090 run with Inkling UD-Q4_K_M, the Q8_0 DSpark drafter, and a 131,072-token context. The original opencode logs did not include HTTP bodies, so this
+capture uses a new opencode session with two read-tool calls and four follow-up turns containing inventory fixtures. Request 1 is opencode's title request.
+The capture and replay match on prompt, reused and generated token counts and finish reason for every request. Replay sends the recorded tool results as part
+of the chat history. It measures HTTP wall time after model startup, with first raw token and decode rate from the server.
+
+| Request | Prompt tokens | Reused tokens | Generated tokens | First raw token (s) | Decode (tok/s) | Total HTTP (s) | Finish |
+|---:|---:|---:|---:|---:|---:|---:|:---|
+| 1 | 513 | 0 | 167 | 3.333 | 182.70 | 4.247 | stop |
+| 2 | 861 | 0 | 67 | 3.511 | 188.51 | 3.867 | tool_calls |
+| 3 | 992 | 926 | 78 | 0.939 | 158.88 | 1.431 | tool_calls |
+| 4 | 1150 | 1068 | 136 | 1.220 | 176.82 | 1.990 | stop |
+| 5 | 19539 | 1279 | 215 | 8.448 | 114.39 | 10.327 | stop |
+| 6 | 38007 | 19748 | 202 | 9.727 | 89.35 | 11.988 | stop |
+| 7 | 56462 | 38206 | 202 | 11.594 | 78.61 | 14.163 | stop |
+| 8 | 74917 | 56660 | 202 | 13.820 | 62.11 | 17.073 | stop |
+
+Reproduce locally with `tools/serve-replay <capture.jsonl> <model.gguf> --ctx 131072 --max-tokens 512`. This run used an ablac 0.2.73 `--fast` build and cached
+CUDA compilation artifacts. The private capture and the capture driver are in `~/archive/abla-grad-serve-replay/`.

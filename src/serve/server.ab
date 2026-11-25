@@ -1,4 +1,4 @@
-// `abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N]`: an OpenAI-compatible server for
+// `abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N] [--capture-requests FILE]`: an OpenAI-compatible server for
 // Inkling on the GPU, on 127.0.0.1 only. One request at a time (the rest wait in the listen queue). Endpoints: GET /v1/models, POST /v1/chat/completions
 // (streaming SSE and plain JSON, tools and tool calls, usage), GET /health. The model's KV cache and state stay between requests: a request whose prompt shares
 // its beginning with the previous conversation (opencode resends the whole history every turn) only processes the tokens after the shared part.
@@ -8,6 +8,7 @@ import "abla/integer"
 import "abla/float"
 import "abla/float/text"
 import "abla/json"
+import "abla/fs/secure"
 import "abla/http"
 import "abla/net"
 import "abla/process/time"
@@ -211,12 +212,21 @@ private fun serveChat(
     connection.close()
     val rawTtft = if (run.firstRaw > 0) f64FromInt(run.firstRaw - started) / 1000000000.0 else seconds
     val ttft = if (run.firstToken > 0) f64FromInt(run.firstToken - started) / 1000000000.0 else seconds
-    eprintln("[serve] ${tokens.size} prompt tokens (${kept} reused), ${stats.generated} generated, first output after ${ttft} s (first token ${rawTtft} s), ${f64FromInt(stats.generated) / (if (decodeSeconds > 0.0) decodeSeconds else 1.0)} tok/s, finish $finish${if (streaming) ", streamed" else ""}")
+    eprintln("[serve] ${tokens.size} prompt tokens (${kept} reused), ${stats.generated} generated, first output after ${ttft} s (first token ${rawTtft} s), ${f64FromInt(stats.generated) / (if (decodeSeconds > 0.0) decodeSeconds else 1.0)} tok/s, finish $finish${if (streaming) ", streamed" else ""}, id $id")
 }
 
 private fun serveFail(message: string): int {
     eprintln("serve: $message")
     1
+}
+
+// Keep one exclusive descriptor open so later writes cannot follow a substituted path.
+private fun serveCaptureFile(path: string): SecureFile {
+    val slash = path.lastIndexOf("/")
+    val directory = if (slash < 0) "." else if (slash == 0) "/" else path.slice(0, slash)
+    val name = if (slash < 0) path else path.slice(slash + 1, path.size)
+    val parent = secureDirectory(directory)
+    parent.createFile(name, 0o600)
 }
 
 fun cmdServe(args: array<string>): int {
@@ -227,6 +237,7 @@ fun cmdServe(args: array<string>): int {
     var context = 0
     var maxTokens = SERVE_DEFAULT_MAX_TOKENS
     var modelName = "inkling-2-mini"
+    var capturePath = ""
     var index = 0
     while (index < args.size) {
         val flag = args[index]
@@ -248,6 +259,10 @@ fun cmdServe(args: array<string>): int {
         } else if (flag == "--max-tokens" && index + 1 < args.size) {
             maxTokens = args[index + 1].parseInt() ?? 0
             index = index + 2
+        } else if (flag == "--capture-requests" && index + 1 < args.size) {
+            capturePath = args[index + 1]
+            if (capturePath == "") return serveFail("--capture-requests needs a nonempty path")
+            index = index + 2
         } else if (modelPath == "" && !flag.startsWith("--")) {
             modelPath = flag
             index = index + 1
@@ -257,7 +272,7 @@ fun cmdServe(args: array<string>): int {
         }
     }
     if (modelPath == "" || port < 1 || port > 65535 || (context != 0 && context < 512) || maxTokens < 1) {
-        eprintln("usage: abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N]")
+        eprintln("usage: abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N] [--capture-requests FILE]")
         return 2
     }
     val file = ggufOpen(modelPath)
@@ -306,6 +321,8 @@ fun cmdServe(args: array<string>): int {
         eprintln("serve: cannot listen on 127.0.0.1:$port")
         return 1
     }
+    val capture = if (capturePath == "") null else serveCaptureFile(capturePath)
+    if (capture != null && capture.descriptor < 0) return serveFail("could not create a new request capture file at $capturePath")
     eprintln("serve: listening on http://127.0.0.1:$port (model '$modelName')")
     val counters = ServeCounters()
     val created = realtimeMilliseconds() / 1000
@@ -330,6 +347,11 @@ fun cmdServe(args: array<string>): int {
             serveWriteJson(connection, 200, "{\"status\":\"ok\"}")
             connection.close()
         } else if (request.method == "POST" && (path == "/v1/chat/completions" || path == "/chat/completions")) {
+            if (capture != null && !capture.write(jsonStringify(jsonObject(["body"], [jsonString(request.body)])) + "\n")) {
+                serveWriteError(connection, 500, "request capture failed", "server_error", "")
+                connection.close()
+                return serveFail("writing the request capture failed")
+            }
             serveChat(backend, model, session, connection, tokenizer, stops, ids, request.body, modelName, context, maxTokens, counters)
             connection.close()
         } else {

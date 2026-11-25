@@ -67,7 +67,7 @@ on prose, 150-250 tok/s on predictable text such as lists and code. The first tu
 
 ## Serving Inkling over HTTP
 
-`abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N]` starts an OpenAI-compatible
+`abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N] [--capture-requests FILE]` starts an OpenAI-compatible
 server on 127.0.0.1 (default port 8080; without `--ctx` the context is chosen from the free device memory at startup and printed; the drafter `dspark-Inkling-2-Mini-Q8_0.gguf` is looked for next to the model). Point a coding
 tool at `http://127.0.0.1:8080/v1`; any API key works.
 
@@ -82,6 +82,23 @@ tool at `http://127.0.0.1:8080/v1`; any API key works.
 - For an explicit long serving session, pass `--ctx 65536` or `--ctx 131072` to `serve`. Starting at 65,536 allocated positions, target K/V stores round to F16 and DSpark projects committed taps into its own cache as the prompt arrives. Above 98,304 allocated positions the eight global target visits use 32-channel blocks with signed 8-bit values and an FP32 scale. The forty sliding target visits keep F16 rings. DSpark keeps one full F16 visit, two sliding F16 rings and a 2,048-position buffer of FP32 taps. The target’s three passes through a repeated layer retain independent K/V.
 - The server saves a checkpoint immediately before the final prompt token, including convolution histories and the live sliding-cache windows. A repeat can reuse this prefix after long generation. With space for a second checkpoint, a prompt edit can also rewind to the most recent shared 4,096-token stride, aligned to a prefill chunk boundary. The server reports the number of tokens actually reused.
 - `tools/test-serve.sh` (under `tools/gpu-lock.sh`) checks the shapes, a tool-call round trip, prefix reuse and that greedy output equals `generate`.
+
+### Record and replay a session
+
+To record a session, start the server under `tools/gpu-lock.sh` with `--capture-requests /path/to/new.jsonl` and point the client at it. The server creates a new
+mode-0600 file and writes each chat POST body as a JSONL string in `body`. These bodies can contain private code, tool results and credentials pasted into messages.
+Keep the capture local. The capture contains neither HTTP authorization headers nor model responses. Stop the capture server by its listening PID before replaying.
+
+From the Nix shell, replay the capture with the same model and serving options.
+
+```sh
+tools/serve-replay /path/to/session.jsonl /path/to/model.gguf --ctx 131072 --port 18081
+```
+
+The tool takes the GPU lock, starts a fresh loopback server, sends the original bodies in order and stops its own listener on exit. It supports streaming and plain
+responses and never executes tool calls. Recorded tool results and assistant turns travel in subsequent request bodies. The Markdown table pairs server prompt
+and reused-token counts, first raw token and decode rate with client HTTP wall time. It excludes model startup. Set `ABLA_GRAD_BIN` to select a binary. The tool
+uses Bash, curl, jq and ss. Use an outer `tools/gpu-lock.sh -t SECONDS --` when the session needs longer than the default hold.
 
 ## Lossless packing for the Inkling target
 

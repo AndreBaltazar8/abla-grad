@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Replay an exact sequence of captured chat POSTs against a fresh local server.
+set -euo pipefail
+export LC_ALL=C
+usage() {
+    echo "usage: tools/serve-replay <capture.jsonl> <model.gguf> [--port N] [serve options...]" >&2
+    exit "${1:-2}"
+}
+fail() { printf 'serve-replay: %s\n' "$*" >&2; exit 1; }
+[[ ${1:-} != --help ]] || usage 0
+[[ $# -ge 2 ]] || usage
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+capture=$1
+model=$2
+shift 2
+[[ -r $capture && -s $capture ]] || fail "capture is empty or unreadable"
+port=18081
+serve_options=()
+while (($#)); do
+    case $1 in
+        --port) [[ $# -ge 2 ]] || usage; port=$2 ;;
+        --ctx|--tokenizer|--drafter|--model-name|--max-tokens)
+            [[ $# -ge 2 ]] || usage
+            serve_options+=("$1" "$2")
+            ;;
+        *) usage ;;
+    esac
+    shift 2
+done
+[[ $port =~ ^[1-9][0-9]{0,4}$ ]] && ((port <= 65535)) || fail "invalid port"
+bin=${ABLA_GRAD_BIN:-$root/build/abla-grad}
+[[ -x $bin ]] || fail "build abla-grad or set ABLA_GRAD_BIN"
+for tool in curl jq ss; do command -v "$tool" >/dev/null || fail "$tool is required"; done
+if [[ -z ${ABLA_GRAD_GPU_LOCK_HELD:-} ]]; then
+    exec "$root/tools/gpu-lock.sh" -- "$0" "$capture" "$model" --port "$port" "${serve_options[@]}"
+fi
+
+umask 077
+tmp=$(mktemp -d)
+log=$tmp/server.log
+pid=
+cleanup() {
+    if [[ -n $pid ]]; then
+        kill "$pid" 2>/dev/null || true
+        for _ in {1..50}; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        if jobs -p | grep -Fx "$pid" >/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
+        wait "$pid" 2>/dev/null || true
+    fi
+    rm -rf -- "$tmp"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+listen() { ss -Hlnpt "sport = :$port"; }
+[[ -z $(listen) ]] || fail "port $port is already listening"
+url=http://127.0.0.1:$port
+local_curl() { curl -q --noproxy '*' --silent --show-error --connect-timeout 2 "$@"; }
+"$bin" serve "$model" --port "$port" "${serve_options[@]}" >"$log" 2>&1 &
+pid=$!
+ready=false
+for _ in {1..600}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+        cat "$log" >&2
+        fail "server exited before it was ready"
+    fi
+    # Before using the port, check that the new server PID is the listener.
+    if [[ $(listen) == *"pid=$pid,"* ]] && local_curl --fail --max-time 2 "$url/health" >/dev/null; then
+        ready=true
+        break
+    fi
+    sleep 0.2
+done
+$ready || fail "server did not listen on port $port"
+
+metrics='^\[serve\] ([0-9]+) prompt tokens \(([0-9]+) reused\), ([0-9]+) generated, first output after ([^ ]+) s \(first token ([^ ]+) s\), ([^ ]+) tok/s, finish ([^, ]+)(, streamed)?, id ([^ ]+)$'
+echo '| Request | Prompt tokens | Reused tokens | Generated tokens | First raw token (s) | Decode (tok/s) | Total HTTP (s) | Finish |'
+echo '|---:|---:|---:|---:|---:|---:|---:|:---|'
+request=0
+while IFS= read -r line || [[ -n $line ]]; do
+    ((request += 1))
+    # -j preserves the recorded body exactly, including trailing newlines.
+    jq -erj '.body | if type == "string" then . else error("expected string body") end' \
+        <<<"$line" >"$tmp/request" 2>/dev/null || fail "invalid capture at record $request"
+    streamed=$(jq -er 'if type == "object" then (.stream == true | tostring) else error("expected object") end' \
+        "$tmp/request" 2>/dev/null) || fail "invalid chat body at record $request"
+    duration=$(local_curl --fail --output "$tmp/response" --write-out '%{time_total}' \
+        --header 'Content-Type: application/json' --data-binary "@$tmp/request" \
+        "$url/v1/chat/completions") || fail "HTTP request $request failed"
+    if [[ $streamed == true ]]; then
+        grep -E $'^data: \\[DONE\\]\r?$' "$tmp/response" >/dev/null || fail "request $request ended without SSE DONE"
+        id=$(sed -n 's/^data: \({.*\)/\1/p' "$tmp/response" |
+            jq -ner 'reduce inputs as $chunk (null; $chunk.id // .) | select(type == "string")') ||
+            fail "request $request has no completion ID"
+    else
+        id=$(jq -er '.id | select(type == "string")' "$tmp/response") ||
+            fail "request $request has no completion ID"
+    fi
+    [[ $id =~ ^chatcmpl-[0-9]+-[0-9]+$ ]] || fail "invalid completion ID at request $request"
+    stat=
+    # The server logs after closing the response, so briefly wait for its matching line.
+    for _ in {1..150}; do
+        stat=$(tail -n 1 "$log")
+        [[ $stat == *", id $id" ]] && break
+        sleep 0.2
+    done
+    [[ $stat =~ $metrics && ${BASH_REMATCH[9]} == "$id" ]] || fail "missing metrics for request $request ($id)"
+    prompt=${BASH_REMATCH[1]} reused=${BASH_REMATCH[2]} generated=${BASH_REMATCH[3]}
+    raw=${BASH_REMATCH[5]} rate=${BASH_REMATCH[6]} finish=${BASH_REMATCH[7]}
+    if ((generated > 0)); then printf -v raw '%.3f' "$raw"; else raw='–'; fi
+    printf '| %d | %d | %d | %d | %s | %.2f | %.3f | %s |\n' \
+        "$request" "$prompt" "$reused" "$generated" "$raw" "$rate" "$duration" "$finish"
+done <"$capture"
