@@ -5,6 +5,7 @@ import "abla/text"
 import "abla/integer"
 import "abla/process/time"
 import "abla/float"
+import "abla/math"
 import "abla/float/text"
 import "../backend/backend.ab"
 import "../backend/cuda.ab"
@@ -127,6 +128,27 @@ private fun maxAbsDifference(a: array<f32>, b: array<f32>): f64 {
     largest
 }
 
+// |a - b|_2 / |b|_2
+private fun relativeL2(a: array<f32>, b: array<f32>): f64 {
+    var difference = 0.0
+    var norm = 0.0
+    for (i in 0 until a.size) {
+        val d = f32ToF64(a[i]) - f32ToF64(b[i])
+        difference += d * d
+        norm += f32ToF64(b[i]) * f32ToF64(b[i])
+    }
+    sqrt(difference / (norm + 0.000000000001))
+}
+
+private fun maxAbsOf(a: array<f32>): f64 {
+    var largest = 0.0
+    for (v in a) {
+        val m = if (f32ToF64(v) < 0.0) -f32ToF64(v) else f32ToF64(v)
+        if (m > largest) largest = m
+    }
+    largest
+}
+
 private fun argmaxOf(a: array<f32>): int {
     var best = 0
     for (i in 1 until a.size) if (a[i] > a[best]) best = i
@@ -174,13 +196,57 @@ fun cmdVerifyCheck(args: array<string>): int {
     val reference: array<array<f32>> = []
     for (row in 100 until 103) reference.append(model.readPrefillLogits(backend, wsA, row - 0) ?? return 1)
     var ok = true
+    // the drafter's taps: step-mode decode of the 103 tokens is the reference for what prefill and verify write
+    if (!model.enableTaps(backend)) {
+        println("verify-check: ${inklingLastError()}")
+        return 1
+    }
+    model.useStep = true
+    if (!model.reset(backend)) return 1
+    for (position in 0 until 103) {
+        if (!model.forward(backend, ids[position], position)) {
+            println("verify-check: ${inklingLastError()}")
+            return 1
+        }
+    }
+    val tapReference: array<array<f32>> = []
+    for (position in 0 until 103) for (slot in 0 until 4) tapReference.append(model.readTap(backend, position, slot) ?? return 1)
+    if (!model.reset(backend) || !model.prefill(backend, wsA, all, 0)) {
+        println("verify-check: ${inklingPrefillLastError()}")
+        return 1
+    }
+    for (slot in 0 until 4) {
+        var worst = 0.0
+        var worstAt = 0
+        for (position in 0 until 103) {
+            val tap = model.readTap(backend, position, slot) ?? return 1
+            val relative = relativeL2(tap, tapReference[position * 4 + slot])
+            if (relative > worst) {
+                worst = relative
+                worstAt = position
+            }
+        }
+        println("taps from prefill, slot $slot: worst relative L2 error over 103 positions = $worst at position $worstAt")
+        if (worst > 0.05) ok = false
+    }
     for (accepted in [2, 0]) {
+
         val wsV = prefillWorkspace(backend, config, 4, true, 3) ?? return 1
         if (!model.reset(backend) || !model.prefill(backend, wsV, first, 0) || !model.verify(backend, wsV, rows, 100)) {
             println("verify-check: ${inklingPrefillLastError()} (${cudaLastError()})")
             return 1
         }
         val ids3 = model.verifyArgmax(backend, wsV, 3) ?? return 1
+        for (slot in 0 until 4) {
+            var worst = 0.0
+            for (row in 0 until 3) {
+                val tap = model.readTap(backend, 100 + row, slot) ?? return 1
+                val relative = relativeL2(tap, tapReference[(100 + row) * 4 + slot])
+                if (relative > worst) worst = relative
+            }
+            println("accepted $accepted: taps of the verified rows, slot $slot: worst relative difference $worst")
+            if (worst > 0.05) ok = false
+        }
         for (row in 0 until 3) {
             val logits = model.readPrefillLogits(backend, wsV, row) ?? return 1
             println("accepted $accepted: row $row argmax ${ids3[row]} (reference ${argmaxOf(reference[row])}), max |dlogit| vs the plain prefill ${maxAbsDifference(logits, reference[row])}")

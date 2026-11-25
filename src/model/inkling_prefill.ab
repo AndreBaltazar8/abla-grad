@@ -286,7 +286,12 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     val mixed = ws.o("mixed")
     val rowBytes = tokens * nb
     var blocks = nBlocks
-    var ok = opCopy(backend, ws.buffer, x, ws.buffer, inpSA, tokens * n)
+    var ok = true
+    if (this.tapsOn && (visit == 5 || visit == 23 || visit == 41)) {
+        // the drafter's tap: the layer input of this visit, position-major [position][4][n]
+        ok = this.copyRows(backend, ws.buffer, x, n, this.taps, (firstPos * 4 + (if (visit == 5) 0 else if (visit == 23) 1 else 2)) * nb, 4 * n, n, tokens)
+    }
+    ok = ok && opCopy(backend, ws.buffer, x, ws.buffer, inpSA, tokens * n)
 
     // attention inputs. A sliding-window layer outside the loop's later passes feeds the same normalized vector to q, k, v: one mix row, one norm.
     val sharedInput = isSwa && loopPass == 0
@@ -583,10 +588,13 @@ private fun InklingModel.prefillChunk(var backend: Backend, ws: PrefillWorkspace
         visit = visit + 1
         if (blocks < 0) return false
     }
-    // output: only chunks that end the prompt need logits (every chunk with allLogits)
-    if (!last && !ws.allLogits) return true
+    // output: only chunks that end the prompt need logits (every chunk with allLogits); with taps on, every chunk needs the final norm output for its positions
+    val withLogits = last || ws.allLogits
+    if (!withLogits && !this.tapsOn) return true
     ok = this.mixRows(backend, ws, ws.blocks, blocks, x, "output_res_query.weight", 1, x, n, tokens)
     ok = ok && this.normRows(backend, ws, "output_norm.weight", x, x, tokens)
+    if (this.tapsOn) ok = ok && this.copyRows(backend, ws.buffer, x, n, this.taps, (firstPos * 4 + 3) * nb, 4 * n, n, tokens)
+    if (!withLogits) return ok
     val output = this.wr("output.weight")
     val outputKind = weightKind(output.type)
     if (outputKind != "q8_0") {
