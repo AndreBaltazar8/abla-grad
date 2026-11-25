@@ -1,7 +1,7 @@
 # Speculative verification matvecs
 
 The dense CUDA kernels accept one to five or eight activation vectors per
-launch. Indexed kernels accept one to three. Each weight is reused across the
+launch. Indexed kernels accept one to five. Each weight is reused across the
 vectors that need it. The vector count and launch dimensions stay fixed during
 graph capture.
 
@@ -14,7 +14,10 @@ Dense inputs and outputs are contiguous FP32 arrays of shape `[vectors][cols]`
 and `[vectors][rows]`, respectively. Weight packing is the same as for
 the single-vector kernels.
 
-For indexed matvecs, each map entry is four u32s `{expertId, slot0, slot1, slot2}`.
+For indexed matvecs with one to three vectors, each entry is four u32s
+`{expertId, slot0, slot1, slot2}`. With four or five vectors, each entry is
+six u32s `{expertId, slot0, slot1, slot2, slot3, slot4}`. With eight slots
+per vector, capacity 40 covers the largest five-vector union.
 Use one entry per distinct expert and write `0xffffffff` for absent slots.
 Entries with no valid slots are skipped, including padding up to the graph's
 fixed capacity. The producer must supply in-range expert IDs for active

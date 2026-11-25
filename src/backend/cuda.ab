@@ -474,7 +474,7 @@ private fun cudaVerifyQ8Shape(args: KernelArgs, problem: array<int>): bool =
     cudaVerifyDenseShape(args, problem) && args.words[4] % 32 == 0
 
 private fun cudaVerifyIndexedShape(args: KernelArgs, problem: array<int>, blockElements: int, blockBytes: int): bool {
-    if (!cudaF32Shape(args, problem) || args.words[5] < 1 || args.words[5] > 3 || args.words[4] % blockElements != 0 ||
+    if (!cudaF32Shape(args, problem) || args.words[5] < 1 || args.words[5] > 5 || args.words[4] % blockElements != 0 ||
         args.words[7] != problem[1]) return false
     val cols = args.words[4]
     val rowBytes = cols / blockElements * blockBytes

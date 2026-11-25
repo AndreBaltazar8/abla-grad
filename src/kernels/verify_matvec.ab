@@ -13,7 +13,14 @@ static __device__ __forceinline__ void verify_reduce(float (&sums)[R]) {
 """
 
 private val verifyExpertUnion = """
-template <typename Format>
+template <typename Format, unsigned R>
+static __device__ __forceinline__ void verify_indexed_dot(const unsigned char *weights,
+    const float *const *x, float *const *y, unsigned cols, float scale, bool scaled, bool aligned) {
+    if (aligned) Format::template batch<R, true>(weights, x, y, cols, scale, scaled);
+    else Format::template batch<R, false>(weights, x, y, cols, scale, scaled);
+}
+
+template <typename Format, unsigned MaxVectors>
 static __device__ __forceinline__ void verify_indexed(const unsigned char *w, const float *x,
     float *y, unsigned rows, unsigned cols, unsigned vectors, const unsigned *map,
     unsigned capacity, unsigned long long expertStrideBytes, unsigned slotsPerVector,
@@ -22,25 +29,24 @@ static __device__ __forceinline__ void verify_indexed(const unsigned char *w, co
     const unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     const unsigned entry = blockIdx.y;
     if (row >= rows || entry >= capacity) return;
-    const unsigned *record = map + static_cast<unsigned long long>(entry) * 4;
-    const unsigned slots[3] = {record[1], record[2], record[3]};
-    const bool has0 = slots[0] < slotsPerVector;
-    const bool has1 = vectors >= 2 && slots[1] < slotsPerVector;
-    const bool has2 = vectors >= 3 && slots[2] < slotsPerVector;
-    const unsigned used = unsigned(has0) + unsigned(has1) + unsigned(has2);
-    if (used == 0) return;
-    // Compact participating vectors without dynamically indexing the pointer arrays.
-    const unsigned indices[3] = {has0 ? 0u : has1 ? 1u : 2u, has0 && has1 ? 1u : 2u, 2u};
-    const unsigned picked[3] = {has0 ? slots[0] : has1 ? slots[1] : slots[2],
-        has0 && has1 ? slots[1] : slots[2], slots[2]};
-    const float *inputs[3] = {};
-    float *outputs[3] = {};
-    unsigned long long addresses = 0;
+    const unsigned *record = map + static_cast<unsigned long long>(entry) * (MaxVectors + 1);
+    unsigned remaining = 0;
     #pragma unroll
-    for (unsigned i = 0; i < 3; ++i) {
+    for (unsigned v = 0; v < MaxVectors; ++v) {
+        if (v < vectors && record[v + 1] < slotsPerVector) remaining |= 1u << v;
+    }
+    if (!remaining) return;
+    const unsigned used = __popc(remaining);
+    const float *inputs[MaxVectors] = {};
+    float *outputs[MaxVectors] = {};
+    unsigned long long addresses = 0;
+    // Compaction keeps one dot accumulator per participating vector.
+    #pragma unroll
+    for (unsigned i = 0; i < MaxVectors; ++i) {
         if (i >= used) break;
-        const unsigned v = indices[i];
-        const unsigned slot = picked[i];
+        const unsigned v = __ffs(remaining) - 1;
+        const unsigned slot = record[v + 1];
+        remaining &= remaining - 1;
         inputs[i] = x + static_cast<unsigned long long>(v) * xVectorStride +
             static_cast<unsigned long long>(slot) * xSlotStride;
         outputs[i] = y + (static_cast<unsigned long long>(v) * slotsPerVector + slot) * rows + row;
@@ -49,16 +55,27 @@ static __device__ __forceinline__ void verify_indexed(const unsigned char *w, co
     const unsigned expert = record[0];
     const unsigned char *weights = w + expert * expertStrideBytes +
         static_cast<unsigned long long>(row) * Format::row_bytes(cols);
-    const float scale = expertScales ? expertScales[expert] : 1.0f;
-    if (used == 1) {
+    const bool scaled = expertScales != nullptr;
+    const float scale = scaled ? expertScales[expert] : 1.0f;
+    const bool aligned = (addresses & 15u) == 0;
+    switch (used) {
+    case 1: {
         const float sum = Format::single(weights, inputs[0], cols);
-        if (lane == 0) *outputs[0] = expertScales ? sum * scale : sum;
-    } else if (used == 2) {
-        if (addresses & 15) Format::template batch<2, false>(weights, inputs, outputs, cols, scale, expertScales != nullptr);
-        else Format::template batch<2, true>(weights, inputs, outputs, cols, scale, expertScales != nullptr);
-    } else {
-        if (addresses & 15) Format::template batch<3, false>(weights, inputs, outputs, cols, scale, expertScales != nullptr);
-        else Format::template batch<3, true>(weights, inputs, outputs, cols, scale, expertScales != nullptr);
+        if (lane == 0) *outputs[0] = scaled ? sum * scale : sum;
+        break;
+    }
+    case 2:
+        verify_indexed_dot<Format, 2>(weights, inputs, outputs, cols, scale, scaled, aligned);
+        break;
+    case 3:
+        verify_indexed_dot<Format, 3>(weights, inputs, outputs, cols, scale, scaled, aligned);
+        break;
+    case 4:
+        if (MaxVectors >= 4) verify_indexed_dot<Format, 4>(weights, inputs, outputs, cols, scale, scaled, aligned);
+        break;
+    case 5:
+        if (MaxVectors >= 5) verify_indexed_dot<Format, 5>(weights, inputs, outputs, cols, scale, scaled, aligned);
+        break;
     }
 }
 """
@@ -332,8 +349,13 @@ extern "C" __global__ void VERIFY_KERNEL(const unsigned char *w, const float *x,
     float *y, unsigned rows, unsigned cols, unsigned vectors, const unsigned *map,
     unsigned capacity, unsigned long long expertStrideBytes, unsigned slotsPerVector,
     unsigned xVectorStride, unsigned xSlotStride, const float *expertScales) {
-    verify_indexed<VERIFY_FORMAT>(w, x, y, rows, cols, vectors, map, capacity, expertStrideBytes,
-        slotsPerVector, xVectorStride, xSlotStride, expertScales);
+    if (vectors <= 3) {
+        verify_indexed<VERIFY_FORMAT, 3>(w, x, y, rows, cols, vectors, map, capacity, expertStrideBytes,
+            slotsPerVector, xVectorStride, xSlotStride, expertScales);
+    } else {
+        verify_indexed<VERIFY_FORMAT, 5>(w, x, y, rows, cols, vectors, map, capacity, expertStrideBytes,
+            slotsPerVector, xVectorStride, xSlotStride, expertScales);
+    }
 }
 """
 
