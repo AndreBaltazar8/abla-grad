@@ -172,3 +172,28 @@ byte-for-byte, including the final batch.
 ## GPU etiquette
 Every model run, gate and benchmark goes through `tools/gpu-lock.sh [-t hold-seconds] -- command...` (flock on /tmp/abla-grad-gpu.lock, waits for 20 GB free, hard hold timeout, one run per hold). Timings taken next to another run are not trustworthy.
 - attention splits 16 (--splits N): d512 93.7 -> 95.7, d15 unchanged; 32 and 64 no better. The context cost is now ~0.3 ms/token between d15 and d512, near Unsloth's 0.1; what remains is kernel time elsewhere (RMSNorm, F32 matvec, depth_mix, copy_f32).
+
+### Depth mix and attention input normalization
+
+On the 4090, prompt 04 with 300 cached positions and 128 graph-decoded
+tokens went from 119.3 to 128.2 tok/s with identical generated IDs.
+The layer saves 96 launches per token by grouping the three attention-input
+norms in one launch, or using one shared norm for sliding-window
+visits without the loop controller. Total recorded kernel launches went from 2,235 to 2,139 per token.
+
+The decode and batched depth-mix entries share a warp-per-state scoring
+implementation. The decode launch uses 1,024 threads and the batch launch
+uses 256, which also performed well at 128 rows. CUDA event measurements on
+resident synthetic inputs (width 2,304, three queries) give the median
+microseconds per launch below. The count includes only bank states, with
+one extra current state in each case.
+
+| Bank states | Decode before → after | 3-row batch before → after | 128-row batch before → after |
+| ---: | ---: | ---: | ---: |
+| 1 | 5.95 → 3.38 | 5.05 → 3.87 | 7.87 → 6.39 |
+| 6 | 16.95 → 3.85 | 6.17 → 4.40 | 13.65 → 12.82 |
+| 12 | 29.30 → 4.40 | 12.53 → 7.83 | 21.91 → 20.99 |
+| 24 | 54.14 → 7.19 | 22.46 → 13.28 | 39.36 → 36.70 |
+
+On the 512-token model prefill benchmark, the five-run median was 4,682
+tok/s before and 4,669 tok/s after (−0.28%).

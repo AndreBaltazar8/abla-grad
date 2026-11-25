@@ -28,7 +28,7 @@ times the expert's scale; SiTU runs over the sorted rows; the down projection re
 8 weighted rows of each token.
 
 ## Other batched kernels (src/kernels/prefill_small.ab)
-`gather_rows_q8_0`, `copy_rows` (strided row copy: the block bank, slicing mixed queries), `depth_mix_batch` (bank `[token][block][n]`), `conv_seq` +
+`gather_rows_q8_0`, `copy_rows` (strided row copy: the block bank, slicing mixed queries), `depth_mix_batch` (shared with decode in `src/kernels/depth_mix.ab`; bank `[token][block][n]`), `conv_seq` +
 `conv_history` (the causal convolution over the sequence with the history in and out), `l2clip_rows` (the per-head scale repeats per token), `scale_tau`,
 `kv_store_batch`, `attention_prefill_rel` (the decode kernel with the token as a grid dimension).
 Existing elementwise kernels (`add`, `situ`, `sigmoid_mul`, `softcap`, `control_mix`, `rmsnorm`, `rel_table`, `copy_f32`) take their size as `n`/`rows` and run
