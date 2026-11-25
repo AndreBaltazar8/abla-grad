@@ -23,6 +23,7 @@ fun main: int {
     if (command == "tokenize") return cmdTokenize(args)
     if (command == "prefill-bench") return cmdPrefillBench(args)
     if (command == "verify-check") return cmdVerifyCheck(args)
+    if (command == "verify-argmax") return cmdVerifyArgmax(args)
     if (command == "generate") return cmdGenerate(args)
     if (command == "spec-accept") return cmdSpecAccept(args)
     if (command == "spec-bench") return cmdSpecBench(args)
