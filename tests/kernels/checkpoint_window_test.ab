@@ -1,0 +1,43 @@
+import "abla/io"
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "support.ab"
+
+private fun check(var backend: Backend, slots: int, savedRows: int, position: int): bool {
+    val heads = 3
+    val columns = 8
+    val live = if (position < savedRows) position else savedRows
+    val start = position - live
+    val initial: array<int> = []
+    val empty: array<int> = []
+    for (i in 0 until heads * slots * columns) {
+        initial.append(0x78000000 + i)
+        empty.append(0)
+    }
+    val cache = uploadWords(backend, initial) ?? return false
+    val restored = uploadWords(backend, empty) ?? return false
+    val snap = backend.allocate(heads * savedRows * columns * 4) ?? return false
+    for (read in [0, 1]) {
+        val args = kernelArgs().pointer(if (read == 0) cache else restored).pointer(snap)
+            .u32(start).u32(live).u32(savedRows).u32(slots).u32(columns / 4).u32(heads).u32(read)
+        if (!backend.launch("checkpoint_window", args, [heads * live * (columns / 4)])) return false
+    }
+    val got = downloadWords(backend, restored, empty.size) ?? return false
+    for (h in 0 until heads) for (slot in 0 until slots) {
+        val inside = (slot - start % slots + slots) % slots < live
+        for (d in 0 until columns) {
+            val i = (h * slots + slot) * columns + d
+            if (got[i] != (if (inside) initial[i] else 0)) return false
+        }
+    }
+    true
+}
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    for (n in [1536, 2048]) for (pos in [1, 1024, n - 1, n, n + 1, 3 * n + 73]) {
+        if (!check(backend, n, 1024, pos)) { eprintln("checkpoint mismatch, ring $n position $pos"); return 1 }
+    }
+    println("checkpoint live-window copies match in every head")
+    0
+}

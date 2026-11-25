@@ -16,6 +16,7 @@ import "../ops.ab"
 import "inkling.ab"
 import "inkling_prefill.ab"
 import "dspark.ab"
+import "prompt_checkpoint.ab"
 
 private var speculateError = ""
 
@@ -67,9 +68,12 @@ resource class SpecSession(
     val cycle3: Recording?,
     val cycle4: Recording?,
     val maxProposals: int,
+    val checkpointBytes: int,
+    val durablePrompt: bool,
+    var stridePos: int = 0,
     val seq: array<int> = [],
     var position: int = 0,
-    // the length of the prompt of the last turn (positions < promptPos hold its state; promptSnap the convolution histories at that point)
+    // Exclusive position immediately before the previous prompt’s final token.
     var promptPos: int = 0,
     val tc: array<f64> = [0.0, 0.0, 0.0, 0.0],
     var tp: f64 = 0.0,
@@ -86,7 +90,7 @@ resource class SpecSession(
 )
 
 /** Creates a session: enables the taps, loads the drafter and records the graphs (nothing runs). The model must be reset. */
-fun specSessionCreate(var backend: Backend, var model: InklingModel, draftFile: GgufFile, maxProposals: int): SpecSession? {
+fun specSessionCreate(var backend: Backend, var model: InklingModel, draftFile: GgufFile, maxProposals: int, persistent: bool = false): SpecSession? {
     speculateError = ""
     model.useStep = true
     if (!model.enableTaps(backend, model.maxCtx >= INKLING_HALF_KV_CONTEXT)) {
@@ -122,12 +126,15 @@ fun specSessionCreate(var backend: Backend, var model: InklingModel, draftFile: 
         speculateError = "recording a cycle failed: ${dsparkLastError()} ${inklingLastError()}"
         return null
     }
-    val promptSnap = backend.allocate(model.history.bytes + 16)
+    val slotBytes = if (persistent) promptCheckpointBytes(model) else model.history.bytes
+    val wantStride = persistent && model.maxCtx > PROMPT_CHECKPOINT_STRIDE + SPEC_CONTEXT_SLACK
+    val promptSnap = if (wantStride) backend.allocate(2 * slotBytes) ?? backend.allocate(slotBytes)
+        else backend.allocate(slotBytes)
     if (promptSnap == null) {
         speculateError = "device memory for the prompt snapshot is not available"
         return null
     }
-    val session = SpecSession(move(drafter), move(ws), move(spec), move(snap), move(promptSnap), move(plain), move(cycle2), move(cycle3), move(cycle4), maxProposals)
+    val session = SpecSession(move(drafter), move(ws), move(spec), move(snap), move(promptSnap), move(plain), move(cycle2), move(cycle3), move(cycle4), maxProposals, slotBytes, persistent)
     for (i in 0 until 20) session.hist.append(0.0)
     session
 }
@@ -135,16 +142,42 @@ fun specSessionCreate(var backend: Backend, var model: InklingModel, draftFile: 
 /** Forgets the conversation (the model must be reset by the caller); the controller's measurements stay. */
 fun SpecSession.restart(): void {
     this.seq.clear()
+    this.stridePos = 0
     this.position = 0
     this.promptPos = 0
 }
 
-/** Prepares the session for a conversation whose full token list is `tokens` (the prompt of a request): keeps the longest usable prefix of what the model
- *  already holds, resets the rest, and queues the remaining tokens (fed by the next `turn`). Returns the number of leading tokens that are reused (not fed
- *  again). The state is valid at `position` (the start of the last batch of the last turn) and at `promptPos` (the last prompt token's position): a request that
- *  shares at least that many leading tokens continues from the later of them; otherwise the model starts from zero. At least the last token is always fed.
- *  
- *  The caller keeps the model's context in mind: seq.size + maxTokens + SPEC_CONTEXT_SLACK <= model.maxCtx. */
+// Only positions within the caller's common prefix may be restored. Any newer
+// checkpoint belongs to a discarded suffix. Global K/V before the chosen
+// boundary is still resident, including the global DSpark visit.
+fun SpecSession.restoreCheckpoint(var backend: Backend, model: InklingModel, common: int): int {
+    if (this.promptPos > common) this.promptPos = 0
+    if (this.stridePos > common) this.stridePos = 0
+    val stride = this.stridePos > this.promptPos
+    val pos = if (stride) this.stridePos else this.promptPos
+    if (pos <= 0) return -1
+    val offset = if (stride) this.checkpointBytes else 0
+    if (!transferPromptCheckpoint(backend, model, this.drafter, this.promptSnap, offset, pos, true, this.durablePrompt) ||
+        !backend.synchronize()) return -1
+    this.drafter.committed = pos
+    this.drafter.stepPrepared = false
+    pos
+}
+
+private fun SpecSession.saveCheckpoint(var backend: Backend, model: InklingModel, pos: int, stride: bool): bool {
+    if (stride) this.stridePos = 0 else this.promptPos = 0
+    val offset = if (stride) this.checkpointBytes else 0
+    if (!transferPromptCheckpoint(backend, model, this.drafter, this.promptSnap, offset, pos, false, this.durablePrompt)) {
+        speculateError = "saving the prompt checkpoint failed"
+        return false
+    }
+    if (stride) this.stridePos = pos else this.promptPos = pos
+    true
+}
+
+/** Queues a request's remaining tokens after its latest recoverable shared boundary.
+ *  The current batch boundary is live. Persistent sessions can also restore the
+ *  previous prompt or stride checkpoint. At least the last token is fed again. */
 fun SpecSession.reuse(var backend: Backend, var model: InklingModel, tokens: array<int>): int {
     var common = 0
     while (common < tokens.size && common < this.seq.size && tokens[common] == this.seq[common]) common = common + 1
@@ -153,18 +186,16 @@ fun SpecSession.reuse(var backend: Backend, var model: InklingModel, tokens: arr
     var kept = 0
     if (this.position > 0 && common >= this.position) {
         kept = this.position
-    } else if (this.promptPos > 0 && common >= this.promptPos) {
-        // back to the end of the last prompt: the convolution histories come from its snapshot
-        val floats = model.history.bytes / 4
-        if (backend.launch("copy_f32", kernelArgs().pointer(this.promptSnap).pointer(model.history).u32(floats), [floats]) && backend.synchronize()) {
-            this.position = this.promptPos
-            kept = this.promptPos
+    } else {
+        val restored = this.restoreCheckpoint(backend, model, common)
+        if (restored > 0) {
+            this.position = restored
+            kept = restored
         }
     }
     if (kept == 0) {
         model.reset(backend)
-        this.position = 0
-        this.promptPos = 0
+        this.restart()
     }
     while (this.seq.size > kept) this.seq.removeLast()
     for (i in kept until tokens.size) this.seq.append(tokens[i])
@@ -198,6 +229,9 @@ fun SpecSession.turn(
     // feed: older positions through the batched prefill when there are many, the last SPEC_EXACT_WINDOW in step mode (exact taps)
     var seeded = start
     var injected = start
+    var strideAt = if (this.durablePrompt && this.promptSnap.bytes >= 2 * this.checkpointBytes)
+        ((length - 2) / PROMPT_CHECKPOINT_STRIDE) * PROMPT_CHECKPOINT_STRIDE else 0
+    if (strideAt <= start) strideAt = 0
     if (length - 1 - start > this.exactWindow) {
         val seedWs = specSeedWorkspace(backend, config)
         if (seedWs == null) {
@@ -205,8 +239,15 @@ fun SpecSession.turn(
             return false
         }
         val end = length - 1 - this.exactWindow
+        // Retain the last stride boundary that matches the existing prefill chunk
+        // schedule. Splitting the input within a tile could change its logits.
+        if (strideAt > start && strideAt < end) {
+            strideAt = start + ((strideAt - start) / seedWs.chunk) * seedWs.chunk
+            if (strideAt <= start) strideAt = 0
+        }
         while (seeded < end) {
-            val count = if (model.rollingTaps && end - seeded > seedWs.chunk) seedWs.chunk else end - seeded
+            val stop = if (strideAt > seeded && strideAt < end) strideAt else end
+            val count = if (model.rollingTaps && stop - seeded > seedWs.chunk) seedWs.chunk else stop - seeded
             val head: array<int> = []
             for (i in seeded until seeded + count) head.append(this.seq[i])
             if (!model.prefill(backend, seedWs, head, seeded)) {
@@ -218,22 +259,25 @@ fun SpecSession.turn(
                 injected = seeded + count
             }
             seeded = seeded + count
+            if (seeded == strideAt) {
+                if (!this.saveCheckpoint(backend, model, seeded, true)) return false
+                strideAt = 0
+            }
         }
     }
     for (p in seeded until length) {
-        if (p == length - 1) {
-            // the state before the last prompt token: a later request that shares the prompt continues from here (its last token is always fed again)
-            val historyFloats = model.history.bytes / 4
-            if (!backend.launch("copy_f32", kernelArgs().pointer(model.history).pointer(this.promptSnap).u32(historyFloats), [historyFloats])) {
-                speculateError = "the prompt snapshot failed"
-                return false
-            }
-            this.promptPos = length - 1
-        }
-        if (model.rollingTaps && p - injected == INKLING_DRAFT_RING) {
+        val saveStride = strideAt > 0 && p == strideAt
+        val savePrompt = p == length - 1
+        // Bring the projected drafter rings to the same exclusive position
+        // before copying them. turn always feeds at least one new tap before
+        // preparing the next Markov context and device cursor.
+        if (model.rollingTaps && p > injected && (p - injected == INKLING_DRAFT_RING ||
+            (this.durablePrompt && (saveStride || savePrompt)))) {
             if (!this.drafter.pushTaps(backend, model.taps, injected, p - injected)) { speculateError = dsparkLastError(); return false }
             injected = p
         }
+        if (saveStride && !this.saveCheckpoint(backend, model, p, true)) return false
+        if (savePrompt && !this.saveCheckpoint(backend, model, p, false)) return false
         if (!model.forward(backend, this.seq[p], p)) {
             speculateError = inklingLastError()
             return false
@@ -326,7 +370,7 @@ fun SpecSession.turn(
         // The final verify cycle can write up to n rejected slots past now.
         // Once one overwrites a key from the old prompt, reuse() must refill.
         val writtenEnd = now + (if (arm == 0) 0 else arm + 1)
-        if (this.promptPos > 0 && !model.canRestoreKv(this.promptPos, writtenEnd)) {
+        if (!this.durablePrompt && this.promptPos > 0 && !model.canRestoreKv(this.promptPos, writtenEnd)) {
             if (!model.canRestoreKv(this.promptPos, now)) this.promptPos = 0
             else {
                 // Only the speculative tail straddles the boundary. The final cycle's

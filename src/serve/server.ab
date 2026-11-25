@@ -189,6 +189,7 @@ private fun serveChat(
         events.clear()
     })
     if (!ok) {
+        session.restart()
         eprintln("serve: generation failed: ${speculateLastError()}")
         if (!streaming) serveWriteError(connection, 500, "generation failed: ${speculateLastError()}", "server_error", "")
         else run.send("data: ${serveErrorBody("generation failed", "server_error", "")}\n\n")
@@ -294,7 +295,7 @@ fun cmdServe(args: array<string>): int {
     eprintln("serve: ${freeBefore / 1048576} MiB of device memory free; loading the model (context $context tokens)...")
     var model = inklingLoad(backend, file, config, context + SPEC_CONTEXT_SLACK) ?? return serveFail("loading the model failed (context $context): ${inklingLastError()} ${cudaLastError()}; try a smaller --ctx")
     if (!model.reset(backend)) return serveFail("clearing the model state failed: ${cudaLastError()}")
-    var session = specSessionCreate(backend, model, draftFile, SPEC_DEFAULT_PROPOSALS) ?? return serveFail("setting up speculation failed: ${speculateLastError()} ${cudaLastError()}; try a smaller --ctx")
+    var session = specSessionCreate(backend, model, draftFile, SPEC_DEFAULT_PROPOSALS, true) ?? return serveFail("setting up speculation failed: ${speculateLastError()} ${cudaLastError()}; try a smaller --ctx")
     session.exactWindow = 192
     // the prompt feed needs a prefill workspace of its own on every request: check now that one fits, so a too large --ctx fails here and not on every request
     if (!serveCheckWorkspace(backend, config, context)) return 1

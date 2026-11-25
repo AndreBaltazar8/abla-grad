@@ -72,3 +72,16 @@ static __device__ __forceinline__ float4 kv_read4(const kv_element *ptr) { retur
 #endif
 #endif
 """
+
+val kernelCheckpointWindow = """
+extern "C" __global__ void checkpoint_window(uint4 *cache, uint4 *snapshot,
+    unsigned first, unsigned live, unsigned window, unsigned slots, unsigned vectorsPerRow, unsigned heads, unsigned restore) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= heads * live * vectorsPerRow) return;
+    const unsigned row = i / vectorsPerRow, head = row / live, pos = row % live;
+    const unsigned channel = i % vectorsPerRow;
+    const unsigned ring = (head * slots + (first + pos) % slots) * vectorsPerRow + channel;
+    const unsigned saved = (head * window + pos) * vectorsPerRow + channel;
+    if (restore) cache[ring] = snapshot[saved]; else snapshot[saved] = cache[ring];
+}
+"""

@@ -1,0 +1,65 @@
+import "../backend/backend.ab"
+import "../kernels/kv_layout.ab"
+import "../ops.ab"
+import "dspark.ab"
+import "dspark_config.ab"
+import "inkling.ab"
+
+// Absolute caches retain the prefix through any later generation. Ranges that
+// wrap need independent backing. All offsets are in bytes and preserve KV bits.
+val PROMPT_CHECKPOINT_STRIDE = 4096
+
+fun promptCheckpointBytes(model: InklingModel): int {
+    val c = model.config
+    var bytes = model.history.bytes
+    for (visit in 0 until model.visits) if (model.ringVisit(visit)) {
+        bytes = bytes + 2 * c.nSwa * c.nHeadKv * c.headDim * model.kvElementBytes
+    }
+    if (model.rollingTaps) {
+        val rows = DSPARK_WINDOW - 1
+        bytes = bytes + rows * DSPARK_TAP_BYTES + 2 * 2 * rows * DSPARK_KV_HEADS * DSPARK_HEAD_DIM * 2
+    }
+    bytes
+}
+
+private fun transferWindow(var backend: Backend, cache: DeviceBuffer, offset: int, saved: DeviceBuffer, savedOffset: int,
+    pos: int, window: int, slots: int, heads: int, rowBytes: int, restore: bool): bool {
+    val live = if (pos < window) pos else window
+    if (live == 0) return true
+    val vectors = rowBytes / 16
+    backend.launch("checkpoint_window", kernelArgs().pointer(cache, offset).pointer(saved, savedOffset)
+        .u32(pos - live).u32(live).u32(window).u32(slots).u32(vectors).u32(heads).u32(if (restore) 1 else 0), [heads * live * vectors])
+}
+
+fun transferPromptCheckpoint(var backend: Backend, model: InklingModel, drafter: DsparkDrafter, saved: DeviceBuffer,
+    offset: int, pos: int, restore: bool, windows: bool): bool {
+    val history = model.history.bytes
+    val ok = if (restore) opCopy(backend, saved, offset, model.history, 0, history / 4)
+        else opCopy(backend, model.history, 0, saved, offset, history / 4)
+    if (!ok || !windows) return ok
+    val c = model.config
+    var at = offset + history
+    val rowBytes = c.headDim * model.kvElementBytes
+    val targetBytes = c.nSwa * c.nHeadKv * rowBytes
+    for (visit in 0 until model.visits) if (model.ringVisit(visit)) {
+        val cache = model.cacheOffsets[visit]
+        if (!transferWindow(backend, model.kCache, cache, saved, at, pos, c.nSwa, INKLING_KV_RING, c.nHeadKv, rowBytes, restore) ||
+            !transferWindow(backend, model.vCache, cache, saved, at + targetBytes, pos, c.nSwa, INKLING_KV_RING, c.nHeadKv, rowBytes, restore)) return false
+        at = at + 2 * targetBytes
+    }
+    if (model.rollingTaps) {
+        // DSpark includes the anchor in its 1,025-token window. The 1,024
+        // preceding committed tokens suffice for the first new anchor.
+        val rows = DSPARK_WINDOW - 1
+        val draftRow = DSPARK_HEAD_DIM * 2
+        val draftBytes = rows * DSPARK_KV_HEADS * draftRow
+        for (layer in [0, 2]) {
+            val cache = drafter.cacheOffset(layer)
+            if (!transferWindow(backend, drafter.kCache, cache, saved, at, pos, rows, INKLING_DRAFT_RING, DSPARK_KV_HEADS, draftRow, restore) ||
+                !transferWindow(backend, drafter.vCache, cache, saved, at + draftBytes, pos, rows, INKLING_DRAFT_RING, DSPARK_KV_HEADS, draftRow, restore)) return false
+            at = at + 2 * draftBytes
+        }
+        if (!transferWindow(backend, model.taps, 0, saved, at, pos, rows, INKLING_DRAFT_RING, 1, DSPARK_TAP_BYTES, restore)) return false
+    }
+    true
+}

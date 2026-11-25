@@ -173,6 +173,9 @@ private fun cudaCountIsLast3(args: KernelArgs, problem: array<int>): bool = args
 private fun cudaCountIsLast2(args: KernelArgs, problem: array<int>): bool = args.words[2] == problem[0]
 private fun cudaCountIsLast5(args: KernelArgs, problem: array<int>): bool = args.words[5] == problem[0]
 private fun cudaSituShape(args: KernelArgs, problem: array<int>): bool = args.words[2] * args.words[3] == problem[0]
+private fun cudaCheckpointWindowShape(args: KernelArgs, problem: array<int>): bool =
+    args.words[3] > 0 && args.words[3] <= args.words[4] && args.words[4] <= args.words[5] &&
+        args.words[6] > 0 && args.words[7] > 0 && problem[0] == args.words[3] * args.words[6] * args.words[7]
 private fun cudaKvStoreShape(args: KernelArgs, problem: array<int>): bool = args.words[5] * args.words[6] == problem[0]
 private fun cudaL2ClipShape(args: KernelArgs, problem: array<int>): bool = args.words[3] == problem[0] && args.words[4] > 0
 private fun cudaArgmaxShape(args: KernelArgs, problem: array<int>): bool = problem[0] == 1 && args.words[1] > 0
@@ -631,6 +634,8 @@ private val cudaKernels = [
     CudaKernelSpec("sigmoid_mul", kernelSigmoidMul, 256, 256, cudaArgsAdd, cudaCountIsLast3),
     CudaKernelSpec("situ", kernelSitu, 256, 256, cudaArgsSitu, cudaSituShape),
     CudaKernelSpec("control_mix", kernelControlMix, 256, 256, cudaArgsControlMix, cudaCountIsLast5),
+    CudaKernelSpec("checkpoint_window", kernelCheckpointWindow, 256, 256,
+        [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32], cudaCheckpointWindowShape),
     CudaKernelSpec("kv_store", kernelKvStore, 256, 256, cudaArgsKvStore, cudaKvStoreShape),
     CudaKernelSpec("l2clip", kernelL2Clip, 1, 128, cudaArgsL2Clip, cudaL2ClipShape, 1, 1),
     CudaKernelSpec("argmax", kernelArgmax, 1, 1024, cudaArgsArgmax, cudaArgmaxShape),

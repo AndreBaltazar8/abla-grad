@@ -90,7 +90,7 @@ private fun DsparkDrafter.w(name: string): WeightRef = weightOf(this.plan, name)
 private fun DsparkDrafter.cacheCtx(): int = this.maxCtx + DSPARK_BLOCK - 1
 private fun DsparkDrafter.cacheSuffix(layer: int): string =
     if (this.maxCtx < INKLING_HALF_KV_CONTEXT) "" else if (layer == 1) "_f16" else "_draft_ring_f16"
-private fun DsparkDrafter.cacheOffset(layer: int): int {
+fun DsparkDrafter.cacheOffset(layer: int): int {
     if (this.maxCtx < INKLING_HALF_KV_CONTEXT) return layer * this.cacheCtx() * dsparkKv * 4
     val firstSlot = if (layer == 0) 0 else if (layer == 1) INKLING_DRAFT_RING else INKLING_DRAFT_RING + this.cacheCtx()
     firstSlot * dsparkKv * 2

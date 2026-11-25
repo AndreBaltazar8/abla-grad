@@ -603,3 +603,9 @@ The numerical gate compared every vocabulary logit at every input position, usin
 | 102,400 | Abla global Q8, sliding F16 | 350 | 2,330 | .824671 | 18.409976 |
 
 Both Abla cache modes passed at 32,768 and 102,400 positions under the calibrated long-prompt rule. On fixed step prompt 06, F16 had 24 rows over the KL threshold, 110 argmax differences and worst KL .175718. Mixed Q8/F16 had 29, 94 and .287230. Both also passed prompt 05. At the 131,072-token allocation, adaptive nmax 2 matched 256 plain greedy IDs on each of prompts 01–04. Prompt 05 first differed at token 98 with a target margin of .139292, inside the speculation gate. The input hashes, fixed 05/06 rules and calibration limits are in `tests/tolerances-inkling-long.txt`. Commands and raw logs are in `~/archive/abla-grad-128k-1251/`. The reusable producers and streaming comparator are described in `tools/oracle/README.md`.
+
+### Serving a rewritten prompt after long generation
+
+At a 131,072-token capacity, the HTTP checkpoint regression started with 21,765 MiB free and selected a 512-token prefill workspace with 865 MiB to spare. Each of the two checkpoints occupies 207.66 MiB. This includes 160 MiB for the target sliding K/V, 8 MiB for the two sliding drafter visits, 36 MiB for rolling target taps and 3.66 MiB for convolution history.
+
+A 6,040-token prompt took 4.019 s to first token cold. After generating 2,304 tokens, its repeat reused 6,039 prompt tokens and took 0.060 s to first token. A 6,026-token edit within the preceding prompt reused the saved 4,096-token boundary and took 3.025 s, compared with 3.748 s for a cold request with the identical edit. Both restored requests returned the same eight-token choices as their cold references, including reasoning. These are single-request first-token times. The test is reproducible with `tools/test-serve.sh <model.gguf> --long-checkpoint` under the GPU lock.
