@@ -35,3 +35,74 @@ extern "C" __global__ void moe_combine_conv_residual(const float *expertOut, con
     out[c] = sum * outScale + residual[c];
 }
 """
+
+// ---- prefill: the loop controller's input and mix over a chunk of tokens (docs/prefill.md) ----
+// ctrlIn[t] = [rmsnorm(cur[t]), rmsnorm(message[t])] (weightless, y = x * rsqrt(mean(x^2) + eps)), cur at cur + t * curStride, message at message + t * messageStride, ctrlIn [t][2n].
+// One block of 128 threads per token; replaces two rmsnorm launches and three row copies.
+val kernelCtrlInRows = """
+extern "C" __global__ void ctrl_in_rows(const float *cur, unsigned curStride, const float *message, unsigned messageStride, float *ctrlIn, unsigned n, float eps) {
+    const unsigned t = blockIdx.x;
+    const float *a = cur + static_cast<unsigned long long>(t) * curStride;
+    const float *b = message + static_cast<unsigned long long>(t) * messageStride;
+    float *out = ctrlIn + static_cast<unsigned long long>(t) * 2 * n;
+    __shared__ float sums[2][128];
+    float sa = 0.0f, sb = 0.0f;
+    for (unsigned i = threadIdx.x; i < n; i += 128) {
+        float va = a[i], vb = b[i];
+        sa = fmaf(va, va, sa);
+        sb = fmaf(vb, vb, sb);
+    }
+    sums[0][threadIdx.x] = sa;
+    sums[1][threadIdx.x] = sb;
+    __syncthreads();
+    for (unsigned width = 64; width; width /= 2) {
+        if (threadIdx.x < width) {
+            sums[0][threadIdx.x] += sums[0][threadIdx.x + width];
+            sums[1][threadIdx.x] += sums[1][threadIdx.x + width];
+        }
+        __syncthreads();
+    }
+    const float fa = rsqrtf(sums[0][0] / float(n) + eps);
+    const float fb = rsqrtf(sums[1][0] / float(n) + eps);
+    for (unsigned i = threadIdx.x; i < n; i += 128) {
+        out[i] = a[i] * fa;
+        out[n + i] = b[i] * fb;
+    }
+}
+"""
+
+// out[t][i] = cur - tanh(forget) * cur + tanh(gain) * message, message strided; cur, gain, forget, out contiguous [t][n]
+val kernelControlMixRows = """
+extern "C" __global__ void control_mix_rows(const float *cur, unsigned curStride, const float *message, unsigned messageStride, const float *gain, const float *forget,
+                                            float *out, unsigned n) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const unsigned long long at = static_cast<unsigned long long>(blockIdx.y) * n + i;
+    const float c = cur[static_cast<unsigned long long>(blockIdx.y) * curStride + i];
+    out[at] = c - tanhf(forget[at]) * c + tanhf(gain[at]) * message[static_cast<unsigned long long>(blockIdx.y) * messageStride + i];
+}
+"""
+
+// y[j][t] = rmsnorm(x[t][j]) * w_j for the three attention inputs q, k, v of every token: x row (t, j) at x + t * xTokenStride + j * xQueryStride (floats; the depth
+// mix's [t][nq][n] output, one shared row when xQueryStride is 0, or the controllers' [j][chunk][n]), y row at y + j * yQueryStride + t * n. problem [tokens, 3].
+val kernelRmsnormThreeRows = """
+extern "C" __global__ void rmsnorm_three_rows(const float *x, unsigned xTokenStride, unsigned xQueryStride, const float *w0, const float *w1, const float *w2,
+                                              float *y, unsigned yQueryStride, unsigned n, float eps) {
+    const unsigned t = blockIdx.x;
+    const unsigned j = blockIdx.y;
+    const float *row = x + static_cast<unsigned long long>(t) * xTokenStride + static_cast<unsigned long long>(j) * xQueryStride;
+    const float *w = j == 0 ? w0 : j == 1 ? w1 : w2;
+    float *out = y + static_cast<unsigned long long>(j) * yQueryStride + static_cast<unsigned long long>(t) * n;
+    __shared__ float sums[128];
+    float sum = 0.0f;
+    for (unsigned i = threadIdx.x; i < n; i += 128) sum = fmaf(row[i], row[i], sum);
+    sums[threadIdx.x] = sum;
+    __syncthreads();
+    for (unsigned width = 64; width; width /= 2) {
+        if (threadIdx.x < width) sums[threadIdx.x] += sums[threadIdx.x + width];
+        __syncthreads();
+    }
+    const float factor = rsqrtf(sums[0] / float(n) + eps);
+    for (unsigned i = threadIdx.x; i < n; i += 128) out[i] = (row[i] * factor) * w[i];
+}
+"""

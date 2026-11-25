@@ -263,25 +263,20 @@ private fun InklingModel.mixRows(var backend: Backend, ws: PrefillWorkspace, ban
 
 // control(cur, message) for every token (loop passes > 0): cur - tanh(forget) cur + tanh(gain) message with the gates of physical layer `ip`.
 // `message` is token t's n values at messageBase + t * messageStride (floats), `cur` and `output` contiguous [t][n].
-private fun InklingModel.controlRows(var backend: Backend, ws: PrefillWorkspace, ip: int, which: string, cur: int, messageBase: int, messageStride: int,
+private fun InklingModel.controlRows(var backend: Backend, ws: PrefillWorkspace, ip: int, which: string, cur: int, curStride: int, messageBase: int, messageStride: int,
     output: int, tokens: int, lane: int = 0): bool {
     val n = this.config.nEmbd
     val down = this.wr("blk.$ip.loop_${which}_ctrl_down.weight")
     val gain = this.wr("blk.$ip.loop_${which}_ctrl_gain.weight")
     val forget = this.wr("blk.$ip.loop_${which}_ctrl_forget.weight")
-    val tmpA = ws.o("tmpA$lane")
-    val tmpB = ws.o("tmpB$lane")
     val ctrlIn = ws.o("ctrlIn$lane")
-    // contiguous copy of the message, then both normalized (weightless) into the [t][2n] controller input
-    var ok = this.copyRows(backend, ws.buffer, messageBase, messageStride, ws.buffer, tmpB, n, n, tokens)
-    ok = ok && opRmsNormPlain(backend, ws.buffer, cur, ws.buffer, tmpA, n, 0.000001, tokens)
-    ok = ok && this.copyRows(backend, ws.buffer, tmpA, n, ws.buffer, ctrlIn, 2 * n, n, tokens)
-    ok = ok && opRmsNormPlain(backend, ws.buffer, tmpB, ws.buffer, tmpA, n, 0.000001, tokens)
-    ok = ok && this.copyRows(backend, ws.buffer, tmpA, n, ws.buffer, ctrlIn + n * 4, 2 * n, n, tokens)
+    // both vectors normalized (weightless) straight into the [t][2n] controller input: one launch, no row copies (the message is read in place, strided)
+    var ok = backend.launch("ctrl_in_rows", kernelArgs().pointer(ws.buffer, cur).u32(curStride).pointer(ws.buffer, messageBase).u32(messageStride).pointer(ws.buffer, ctrlIn).u32(n).f32(0.000001), [tokens])
     ok = ok && this.dense(backend, ws, "blk.$ip.loop_${which}_ctrl_down.weight", ctrlIn, ws.o("ctrlGate$lane"), tokens)
     ok = ok && this.dense(backend, ws, "blk.$ip.loop_${which}_ctrl_gain.weight", ws.o("ctrlGate$lane"), ws.o("ctrlGain$lane"), tokens)
     ok = ok && this.dense(backend, ws, "blk.$ip.loop_${which}_ctrl_forget.weight", ws.o("ctrlGate$lane"), ws.o("ctrlForget$lane"), tokens)
-    ok && opControlMix(backend, ws.buffer, cur, ws.buffer, tmpB, ws.buffer, ws.o("ctrlGain$lane"), ws.buffer, ws.o("ctrlForget$lane"), ws.buffer, output, tokens * n)
+    ok && backend.launch("control_mix_rows", kernelArgs().pointer(ws.buffer, cur).u32(curStride).pointer(ws.buffer, messageBase).u32(messageStride).pointer(ws.buffer, ws.o("ctrlGain$lane"))
+        .pointer(ws.buffer, ws.o("ctrlForget$lane")).pointer(ws.buffer, output).u32(n), [n, tokens])
 }
 
 // One layer visit for the whole chunk; returns the new block count or -1.
@@ -319,35 +314,39 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
             source = mixed
         }
         ok = ok && this.normRows(backend, ws, "blk.$ip.attn_norm.weight", source, normed, tokens)
-    } else if (ip > 0) {
-        val nq = if (isSwa) 1 else 3
-        ok = ok && this.mixRows(backend, ws, ws.blocks, blocks, x, "blk.$ip.attn_res_query.weight", nq, mixed, nq * n, tokens)
-        for (j in 0 until 3) {
-            ok = ok && this.copyRows(backend, ws.buffer, mixed + (if (isSwa) 0 else j) * nb, nq * n, ws.buffer, inputs + j * ws.chunk * nb, n, n, tokens)
-        }
     } else {
-        for (j in 0 until 3) ok = ok && opCopy(backend, ws.buffer, x, ws.buffer, inputs + j * ws.chunk * nb, tokens * n)
-    }
-    if (!sharedInput && loopPass > 0) {
-        ok = ok && backend.fork(2)
-        var j = 0
-        for (which in ["q", "k", "v"]) {
-            ok = ok && backend.branch(j)
-            ok = ok && this.controlRows(backend, ws, ip, which, inputs + j * ws.chunk * nb, ws.o("msgs") + j * nb, 4 * n, ws.o("ctrlOut$j"), tokens, j)
-            ok = ok && opCopy(backend, ws.buffer, ws.o("ctrlOut$j"), ws.buffer, inputs + j * ws.chunk * nb, tokens * n)
-            j = j + 1
+        // the three rows (q, k, v) of every token live where the depth mix put them ([t][nq][n]) or in x; nothing is copied: the controllers (later loop passes)
+        // read them in place and write [j][chunk][n] into `inputs`, and one launch normalizes all three
+        var source = x
+        var tokenStride = n
+        var queryStride = 0
+        if (ip > 0) {
+            val nq = if (isSwa) 1 else 3
+            ok = ok && this.mixRows(backend, ws, ws.blocks, blocks, x, "blk.$ip.attn_res_query.weight", nq, mixed, nq * n, tokens)
+            source = mixed
+            tokenStride = nq * n
+            queryStride = if (isSwa) 0 else n
         }
-        ok = ok && backend.join()
-    }
-    if (sharedInput) {
-    } else if (isSwa) {
-        for (j in 0 until 3) {
-            ok = ok && this.normRows(backend, ws, "blk.$ip.attn_norm.weight", inputs + j * ws.chunk * nb, normed + j * ws.chunk * nb, tokens)
+        if (loopPass > 0) {
+            ok = ok && backend.fork(2)
+            var j = 0
+            for (which in ["q", "k", "v"]) {
+                ok = ok && backend.branch(j)
+                ok = ok && this.controlRows(backend, ws, ip, which, source + j * queryStride * 4, tokenStride, ws.o("msgs") + j * nb, 4 * n,
+                    inputs + j * ws.chunk * nb, tokens, j)
+                j = j + 1
+            }
+            ok = ok && backend.join()
+            source = inputs
+            tokenStride = n
+            queryStride = ws.chunk * n
         }
-    } else {
-        ok = ok && this.normRows(backend, ws, "blk.$ip.attn_q_inp_norm.weight", inputs, normed, tokens)
-        ok = ok && this.normRows(backend, ws, "blk.$ip.attn_k_inp_norm.weight", inputs + ws.chunk * nb, normed + ws.chunk * nb, tokens)
-        ok = ok && this.normRows(backend, ws, "blk.$ip.attn_v_inp_norm.weight", inputs + 2 * ws.chunk * nb, normed + 2 * ws.chunk * nb, tokens)
+        val w0 = this.wr(if (isSwa) "blk.$ip.attn_norm.weight" else "blk.$ip.attn_q_inp_norm.weight")
+        val w1 = this.wr(if (isSwa) "blk.$ip.attn_norm.weight" else "blk.$ip.attn_k_inp_norm.weight")
+        val w2 = this.wr(if (isSwa) "blk.$ip.attn_norm.weight" else "blk.$ip.attn_v_inp_norm.weight")
+        ok = ok && backend.launch("rmsnorm_three_rows", kernelArgs().pointer(ws.buffer, source).u32(tokenStride).u32(queryStride)
+            .pointer(this.arena, w0.offset).pointer(this.arena, w1.offset).pointer(this.arena, w2.offset).pointer(ws.buffer, normed).u32(ws.chunk * n).u32(n)
+            .f32(c.rmsEps), [tokens, 3])
     }
     val normedQ = normed
     val normedK = if (sharedInput) normed else normed + ws.chunk * nb
@@ -487,8 +486,7 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     // MoE
     ok = ok && this.mixRows(backend, ws, ws.blocks, blocks, x, "blk.$ip.ffn_res_query.weight", 1, x, n, tokens)
     if (loopPass > 0) {
-        ok = ok && this.controlRows(backend, ws, ip, "ffn", x, ws.o("msgs") + 3 * nb, 4 * n, ws.o("ctrlOut0"), tokens)
-        ok = ok && opCopy(backend, ws.buffer, ws.o("ctrlOut0"), ws.buffer, x, tokens * n)
+        ok = ok && this.controlRows(backend, ws, ip, "ffn", x, n, ws.o("msgs") + 3 * nb, 4 * n, x, tokens)
     }
     ok = ok && this.normRows(backend, ws, "blk.$ip.ffn_norm.weight", x, x, tokens)
     if (!ok) return -1

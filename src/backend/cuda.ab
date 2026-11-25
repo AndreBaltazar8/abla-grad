@@ -325,6 +325,17 @@ private val cudaArgsKvStoreStep = [
 private val cudaArgsScaleTau = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_F32, KERNEL_ARG_F32, KERNEL_ARG_U32]
 private val cudaArgsStepAdvance = [KERNEL_ARG_POINTER]
 private val cudaArgsStepRecord = [KERNEL_ARG_POINTER]
+private val cudaArgsCtrlInRows = [KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_F32]
+private val cudaArgsRmsnormThreeRows = [
+    KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
+    KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_F32
+]
+private fun cudaRmsnormThreeRowsShape(args: KernelArgs, problem: array<int>): bool = problem[1] == 3 && args.words[8] > 0 && problem[0] > 0
+private val cudaArgsControlMixRows = [
+    KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32
+]
+private fun cudaControlMixRowsShape(args: KernelArgs, problem: array<int>): bool = args.words[7] == problem[0] && problem[1] > 0
+private fun cudaCtrlInRowsShape(args: KernelArgs, problem: array<int>): bool = args.words[5] > 0 && problem[0] > 0
 private val cudaArgsConvStepResidual = [
     KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_F32
 ]
@@ -587,6 +598,9 @@ private val cudaKernels = [
     CudaKernelSpec("scale_tau", kernelScaleTau, 256, 256, cudaArgsScaleTau, cudaScaleTauShape),
     CudaKernelSpec("step_advance", kernelStepAdvance, 1, 1, cudaArgsStepAdvance, cudaStepAdvanceShape),
     CudaKernelSpec("step_record", kernelStepRecord, 1, 1, cudaArgsStepRecord, cudaStepAdvanceShape),
+    CudaKernelSpec("ctrl_in_rows", kernelCtrlInRows, 1, 128, cudaArgsCtrlInRows, cudaCtrlInRowsShape),
+    CudaKernelSpec("rmsnorm_three_rows", kernelRmsnormThreeRows, 1, 128, cudaArgsRmsnormThreeRows, cudaRmsnormThreeRowsShape, 2),
+    CudaKernelSpec("control_mix_rows", kernelControlMixRows, 256, 256, cudaArgsControlMixRows, cudaControlMixRowsShape, 2),
     CudaKernelSpec("conv_step_residual", kernelConvStepResidual, 256, 256, cudaArgsConvStepResidual, cudaConvStepResidualShape),
     CudaKernelSpec("moe_combine_conv_residual", kernelMoeCombineConvResidual, 256, 256, cudaArgsCombineConv, cudaCombineConvShape),
     CudaKernelSpec("requant_q8_to_q6k", kernelRequantQ8ToQ6K, 32, 32, cudaArgsRequant, cudaRequantShape),
