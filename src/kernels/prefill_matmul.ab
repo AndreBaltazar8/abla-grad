@@ -369,6 +369,27 @@ extern "C" __global__ void __launch_bounds__(256) matmul_bf16(const unsigned cha
     pm_gemm<PM_BF16, 64>(w, static_cast<unsigned long long>(cols) * 2, rows, cols, x, nullptr, 0, tokens, blockIdx.y * PM_TOKENS, blockIdx.x * PM_ROWS, y, 1.0f);
 }
 
+// Five Q8_0 products over the same tokens in one launch (q, k, v, rel, gate share the layer's norm outputs): block row tile t belongs to the first segment
+// whose cumulative tile count exceeds t. problem [sum of ceil(rows_i / 128) * 128, tokenTiles].
+struct PmSegment { const unsigned char *w; const float *x; float *y; unsigned rows; };
+extern "C" __global__ void __launch_bounds__(256) matmul_q8_0_x5(
+    const unsigned char *w0, const float *x0, float *y0, unsigned rows0, const unsigned char *w1, const float *x1, float *y1, unsigned rows1,
+    const unsigned char *w2, const float *x2, float *y2, unsigned rows2, const unsigned char *w3, const float *x3, float *y3, unsigned rows3,
+    const unsigned char *w4, const float *x4, float *y4, unsigned rows4, unsigned cols, unsigned tokens) {
+    const PmSegment segments[5] = {{w0, x0, y0, rows0}, {w1, x1, y1, rows1}, {w2, x2, y2, rows2}, {w3, x3, y3, rows3}, {w4, x4, y4, rows4}};
+    unsigned tile = blockIdx.x;
+    #pragma unroll
+    for (int i = 0; i < 5; ++i) {
+        const unsigned tiles = (segments[i].rows + PM_ROWS - 1) / PM_ROWS;
+        if (tile < tiles) {
+            pm_gemm<PM_Q8_0, 64>(segments[i].w, static_cast<unsigned long long>(cols / 32) * 34, segments[i].rows, cols, segments[i].x, nullptr, 0, tokens,
+                                 blockIdx.y * PM_TOKENS, tile * PM_ROWS, segments[i].y, 1.0f);
+            return;
+        }
+        tile -= tiles;
+    }
+}
+
 // Split-K for matrices with few rows (the controllers, the sink and convolution projections): the grid has tokenTiles * kSplit blocks along y; block
 // (tile, slice) sums the k range of its slice into y + slice * tokens * rows; `sum_slices` adds the slices up afterwards. (cols / 32) % kSplit == 0.
 extern "C" __global__ void __launch_bounds__(256) matmul_f32_split(const unsigned char *w, const float *x, float *y,

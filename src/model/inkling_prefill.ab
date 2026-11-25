@@ -16,7 +16,7 @@ import "inkling.ab"
 private var prefillError = ""
 
 // Tokens per tile of the expert-grouped matmuls (64 or 32; the plan and the kernel must agree).
-private var prefillMoeTile = 32
+private var prefillMoeTile = 64
 
 // false: the scalar attention kernel (f32 throughout), for A/B checks.
 private var prefillTensorAttention = true
@@ -164,6 +164,49 @@ private fun InklingModel.dense(var backend: Backend, ws: PrefillWorkspace, name:
         .u32(ref.rows).u32(ref.cols).u32(tokens), problem)
 }
 
+// q, k, v, rel and gate projections of a layer in one launch when all five are Q8_0 (else one launch each).
+private fun InklingModel.denseX5(var backend: Backend, ws: PrefillWorkspace, ip: int, normedQ: int, normedK: int, normedV: int, q: int, kRaw: int, vRaw: int,
+    r: int, gate: int, tokens: int): bool {
+    val wq = this.wr("blk.$ip.attn_q.weight")
+    val wk = this.wr("blk.$ip.attn_k.weight")
+    val wv = this.wr("blk.$ip.attn_v.weight")
+    val wrel = this.wr("blk.$ip.attn_rel.weight")
+    val wg = this.wr("blk.$ip.attn_gate.weight")
+    if (weightKind(wq.type) != "q8_0" || weightKind(wk.type) != "q8_0" || weightKind(wv.type) != "q8_0" || weightKind(wrel.type) != "q8_0" ||
+        weightKind(wg.type) != "q8_0" || wq.cols != wk.cols || wq.cols != wv.cols || wq.cols != wrel.cols || wq.cols != wg.cols) {
+        var ok = this.dense(backend, ws, "blk.$ip.attn_q.weight", normedQ, q, tokens)
+        ok = ok && this.dense(backend, ws, "blk.$ip.attn_k.weight", normedK, kRaw, tokens)
+        ok = ok && this.dense(backend, ws, "blk.$ip.attn_v.weight", normedV, vRaw, tokens)
+        ok = ok && this.dense(backend, ws, "blk.$ip.attn_rel.weight", normedQ, r, tokens)
+        return ok && this.dense(backend, ws, "blk.$ip.attn_gate.weight", normedQ, gate, tokens)
+    }
+    val tiles = (wq.rows + 127) / 128 + (wk.rows + 127) / 128 + (wv.rows + 127) / 128 + (wrel.rows + 127) / 128 + (wg.rows + 127) / 128
+    var args = kernelArgs()
+    args.pointer(this.arena, wq.offset)
+    args.pointer(ws.buffer, normedQ)
+    args.pointer(ws.buffer, q)
+    args.u32(wq.rows)
+    args.pointer(this.arena, wk.offset)
+    args.pointer(ws.buffer, normedK)
+    args.pointer(ws.buffer, kRaw)
+    args.u32(wk.rows)
+    args.pointer(this.arena, wv.offset)
+    args.pointer(ws.buffer, normedV)
+    args.pointer(ws.buffer, vRaw)
+    args.u32(wv.rows)
+    args.pointer(this.arena, wrel.offset)
+    args.pointer(ws.buffer, normedQ)
+    args.pointer(ws.buffer, r)
+    args.u32(wrel.rows)
+    args.pointer(this.arena, wg.offset)
+    args.pointer(ws.buffer, normedQ)
+    args.pointer(ws.buffer, gate)
+    args.u32(wg.rows)
+    args.u32(wq.cols)
+    args.u32(tokens)
+    return backend.launch("matmul_q8_0_x5", args, [tiles * 128, (tokens + 63) / 64])
+}
+
 // rmsnorm of `tokens` rows of n values with the weight tensor `name` (null weight: plain), in place allowed.
 private fun InklingModel.normRows(var backend: Backend, ws: PrefillWorkspace, name: string, input: int, output: int, tokens: int): bool {
     val ref = this.wr(name)
@@ -264,10 +307,7 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     val k = ws.o("k")
     val v = ws.o("v")
     val r = ws.o("r")
-    ok = this.dense(backend, ws, "blk.$ip.attn_q.weight", normedQ, q, tokens)
-    ok = ok && this.dense(backend, ws, "blk.$ip.attn_k.weight", normedK, kRaw, tokens)
-    ok = ok && this.dense(backend, ws, "blk.$ip.attn_v.weight", normedV, vRaw, tokens)
-    ok = ok && this.dense(backend, ws, "blk.$ip.attn_rel.weight", normedQ, r, tokens)
+    ok = this.denseX5(backend, ws, ip, normedQ, normedK, normedV, q, kRaw, vRaw, r, ws.o("gate"), tokens)
     if (!isSwa) {
         ok = ok && this.dense(backend, ws, "blk.$ip.attn_k_conv_proj.weight", normedK, ws.o("kDyn"), tokens)
         ok = ok && this.dense(backend, ws, "blk.$ip.attn_v_conv_proj.weight", normedV, ws.o("vDyn"), tokens)
@@ -326,7 +366,6 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
         .pointer(this.vCache, visit * layerCacheBytes).pointer(ws.buffer, table).pointer(ws.buffer, att).u32(c.nHead).u32(c.nHeadKv)
         .u32(if (isSwa) c.nSwa else 0).u32(firstPos).u32(extent).u32(this.maxCtx).f32(scale).u32(tokens), [c.nHead, (tokens + 31) / 32])
     }
-    ok = ok && this.dense(backend, ws, "blk.$ip.attn_gate.weight", normedQ, ws.o("gate"), tokens)
     ok = ok && opSigmoidMul(backend, ws.buffer, att, ws.buffer, ws.o("gate"), ws.buffer, att, tokens * qDim)
     val oproj = ws.o("oproj")
     ok = ok && this.dense(backend, ws, "blk.$ip.attn_output.weight", att, oproj, tokens)
