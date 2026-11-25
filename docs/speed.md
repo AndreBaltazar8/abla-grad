@@ -785,6 +785,9 @@ request times and excludes model loading. GPU clocks and other system load can a
 | `8af8468` | 74917 | 56660 | 202 | 12.943 | 65.74 | 16.016 | 65.097 |
 | `4bae40a` | 74917 | 56663 | 202 | 12.657 | 65.84 | 15.725 | 60.803 |
 | `b22b960` | 74917 | 56657 | 202 | 11.945 | 67.34 | 14.945 | 59.208 |
+| `cf6578c` | 74917 | 56656 | 202 | 10.838 | 101.22 | 12.834 | 55.565 |
+
+On `cf6578c`, request 5 hit the 512-token limit. On `b22b960` it stopped after 261 tokens. The session timings include this difference.
 
 ### Int8 prefill projection GEMMs
 
