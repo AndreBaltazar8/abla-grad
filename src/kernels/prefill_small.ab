@@ -319,6 +319,34 @@ extern "C" __global__ void moe_sort(const unsigned *ids, unsigned nPairs, unsign
 }
 """
 
+// The expert map of the R-row verification matvecs (docs/verify-matvec.md) from the routed ids [R][k]: one entry {expert, slot of vector 0, 1, 2} per distinct
+// expert (0xffffffff where a vector does not use it), entries beyond the distinct ones empty, `capacity` entries in all. One thread. problem [1].
+val kernelPrefillMoeMapRows = """
+extern "C" __global__ void moe_map_rows(const unsigned *ids, unsigned vectors, unsigned k, unsigned *map, unsigned capacity) {
+    if (threadIdx.x != 0 || blockIdx.x != 0 || vectors > 3) return;
+    for (unsigned e = 0; e < capacity; ++e) {
+        map[4 * e] = 0;
+        map[4 * e + 1] = 0xffffffffu;
+        map[4 * e + 2] = 0xffffffffu;
+        map[4 * e + 3] = 0xffffffffu;
+    }
+    unsigned used = 0;
+    for (unsigned v = 0; v < vectors; ++v) {
+        for (unsigned s = 0; s < k; ++s) {
+            unsigned expert = ids[v * k + s];
+            unsigned entry = 0;
+            while (entry < used && map[4 * entry] != expert) ++entry;
+            if (entry == used) {
+                if (used >= capacity) return;
+                map[4 * entry] = expert;
+                ++used;
+            }
+            map[4 * entry + 1 + v] = s;
+        }
+    }
+}
+"""
+
 // out[t][r] = sum_s weights[t * k + s] * down[slotOfPair[t * k + s]][r]. problem [rows, tokens].
 val kernelPrefillMoeCombine = """
 extern "C" __global__ void moe_combine_batch(const float *down, const unsigned *slotOfPair, const float *weights, float *out,

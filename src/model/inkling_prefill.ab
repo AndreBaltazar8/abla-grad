@@ -97,6 +97,7 @@ fun prefillWorkspace(var backend: Backend, c: InklingConfig, chunk: int, allLogi
     at = wsAdd(offsets, "sortedToken", pairs, at)
     at = wsAdd(offsets, "slotOfPair", pairs, at)
     at = wsAdd(offsets, "iota", pairs, at)
+    at = wsAdd(offsets, "expertMap", 4 * 3 * c.nExpertUsed, at)
     at = wsAdd(offsets, "plan", c.nExpert + 2 + 2 * maxTiles, at)
     at = wsAdd(offsets, "gu", pairs * 2 * c.nFfExp, at)
     at = wsAdd(offsets, "act", pairs * c.nFfExp, at)
@@ -156,6 +157,11 @@ private fun InklingModel.dense(var backend: Backend, ws: PrefillWorkspace, name:
     val kind = weightKind(ref.type)
     var kernel = ""
     var problem: array<int> = []
+    if (prefillVerifyRows > 0 && tokens <= 3 && (kind == "q8_0" || kind == "f32")) {
+        // the few rows of a verification: one weight read for all of them (e7's R-row matvecs, exact f32 arithmetic on the activations)
+        return backend.launch("matvec_${kind}_rows", kernelArgs().pointer(this.arena, ref.offset).pointer(ws.buffer, xOffset).pointer(ws.buffer, yOffset)
+            .u32(ref.rows).u32(ref.cols).u32(tokens), [ref.rows])
+    }
     if (exact && kind == "f32") {
         var split = 4
         while (split > 1 && ref.cols / 32 % split != 0) split = split / 2
@@ -193,7 +199,7 @@ private fun InklingModel.denseX5(var backend: Backend, ws: PrefillWorkspace, ip:
     val wv = this.wr("blk.$ip.attn_v.weight")
     val wrel = this.wr("blk.$ip.attn_rel.weight")
     val wg = this.wr("blk.$ip.attn_gate.weight")
-    if (weightKind(wq.type) != "q8_0" || weightKind(wk.type) != "q8_0" || weightKind(wv.type) != "q8_0" || weightKind(wrel.type) != "q8_0" ||
+    if (prefillVerifyRows > 0 || weightKind(wq.type) != "q8_0" || weightKind(wk.type) != "q8_0" || weightKind(wv.type) != "q8_0" || weightKind(wrel.type) != "q8_0" ||
         weightKind(wg.type) != "q8_0" || wq.cols != wk.cols || wq.cols != wv.cols || wq.cols != wrel.cols || wq.cols != wg.cols) {
         var ok = this.dense(backend, ws, "blk.$ip.attn_q.weight", normedQ, q, tokens)
         ok = ok && this.dense(backend, ws, "blk.$ip.attn_k.weight", normedK, kRaw, tokens)
@@ -436,12 +442,54 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     ok = this.dense(backend, ws, "blk.$ip.ffn_gate_inp.weight", x, ws.o("moeLogits"), tokens, true)
     ok = ok && backend.launch("moe_route_batch", kernelArgs().pointer(ws.buffer, ws.o("moeLogits")).pointer(this.arena, bias.offset).u32(c.nExpert)
         .u32(c.nExpertUsed).pointer(ws.buffer, ids).pointer(ws.buffer, weights).f32(0.00000000000000000001).f32(c.expertScale).u32(tokens), [tokens])
-    ok = ok && backend.launch("moe_sort", kernelArgs().pointer(ws.buffer, ids).u32(pairs).u32(c.nExpertUsed).u32(c.nExpert).u32(prefillMoeTile).pointer(ws.buffer, sortedToken)
-        .pointer(ws.buffer, slotOfPair).pointer(ws.buffer, plan), [1])
     val guRef = this.wr("blk.$ip.ffn_gate_up_exps.weight")
     val downRef = this.wr("blk.$ip.ffn_down_exps.weight")
     val guKind = weightKind(guRef.type)
     val downKind = weightKind(downRef.type)
+    val rowsPath = prefillVerifyRows > 0 && tokens <= 3 && guKind == "nvfp4" && downKind == "nvfp4"
+    if (rowsPath) {
+        // verification: the experts of the few rows through the indexed R-row matvecs (one read of each distinct expert); pair p = row * k + slot keeps its place
+        val capacity = tokens * c.nExpertUsed
+        val guScalesRows = this.wr("blk.$ip.ffn_gate_up_exps.scale")
+        val downScalesRows = this.wr("blk.$ip.ffn_down_exps.scale")
+        val nFfRows = c.nFfExp
+        ok = ok && backend.launch("moe_map_rows", kernelArgs().pointer(ws.buffer, ids).u32(tokens).u32(c.nExpertUsed).pointer(ws.buffer, ws.o("expertMap")).u32(capacity), [1])
+        var guArgs = kernelArgs()
+        guArgs.pointer(this.arena, guRef.offset)
+        guArgs.pointer(ws.buffer, x)
+        guArgs.pointer(ws.buffer, ws.o("gu"))
+        guArgs.u32(2 * nFfRows)
+        guArgs.u32(n)
+        guArgs.u32(tokens)
+        guArgs.pointer(ws.buffer, ws.o("expertMap"))
+        guArgs.u32(capacity)
+        guArgs.u64(ggmlRowBytes(guRef.type, guRef.cols) * 2 * nFfRows)
+        guArgs.u32(c.nExpertUsed)
+        guArgs.u32(n)
+        guArgs.u32(0)
+        if (this.hasWeight("blk.$ip.ffn_gate_up_exps.scale")) guArgs.pointer(this.arena, guScalesRows.offset) else guArgs.u64(0)
+        ok = ok && backend.launch("matvec_nvfp4_indexed_rows", guArgs, [2 * nFfRows, capacity])
+        ok = ok && opSitu(backend, ws.buffer, ws.o("gu"), ws.buffer, ws.o("act"), pairs, nFfRows, c.situBeta, c.situLinear)
+        var downArgs = kernelArgs()
+        downArgs.pointer(this.arena, downRef.offset)
+        downArgs.pointer(ws.buffer, ws.o("act"))
+        downArgs.pointer(ws.buffer, ws.o("down"))
+        downArgs.u32(n)
+        downArgs.u32(nFfRows)
+        downArgs.u32(tokens)
+        downArgs.pointer(ws.buffer, ws.o("expertMap"))
+        downArgs.u32(capacity)
+        downArgs.u64(ggmlRowBytes(downRef.type, downRef.cols) * n)
+        downArgs.u32(c.nExpertUsed)
+        downArgs.u32(c.nExpertUsed * nFfRows)
+        downArgs.u32(nFfRows)
+        if (this.hasWeight("blk.$ip.ffn_down_exps.scale")) downArgs.pointer(this.arena, downScalesRows.offset) else downArgs.u64(0)
+        ok = ok && backend.launch("matvec_nvfp4_indexed_rows", downArgs, [n, capacity])
+        ok = ok && backend.launch("moe_combine_batch", kernelArgs().pointer(ws.buffer, ws.o("down")).pointer(ws.buffer, ws.o("iota")).pointer(ws.buffer, weights)
+            .pointer(ws.buffer, ws.o("moe")).u32(n).u32(c.nExpertUsed).u32(tokens), [n, tokens])
+    } else {
+    ok = ok && backend.launch("moe_sort", kernelArgs().pointer(ws.buffer, ids).u32(pairs).u32(c.nExpertUsed).u32(c.nExpert).u32(prefillMoeTile).pointer(ws.buffer, sortedToken)
+        .pointer(ws.buffer, slotOfPair).pointer(ws.buffer, plan), [1])
     if ((guKind != "nvfp4" && guKind != "q8_0" && guKind != "q5_k") || (downKind != "nvfp4" && downKind != "q8_0" && downKind != "q5_k")) {
         prefillError = "no grouped prefill matmul for the expert types ${ggmlTypeName(guRef.type)} / ${ggmlTypeName(downRef.type)}"
         return -1
@@ -459,6 +507,7 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
         downScales.offset, plan, n, nFf, c.nExpert, downStride, maxTiles)
     ok = ok && backend.launch("moe_combine_batch", kernelArgs().pointer(ws.buffer, ws.o("down")).pointer(ws.buffer, slotOfPair).pointer(ws.buffer, weights)
         .pointer(ws.buffer, ws.o("moe")).u32(n).u32(c.nExpertUsed).u32(tokens), [n, tokens])
+    }
     val ffnPost = this.wr("blk.$ip.ffn_post_conv.weight")
     ok = ok && this.convRows(backend, ws, ws.o("moe"), fHistory, ffnPost.offset, 0, false, x, n, 1, plainScale, tokens)
     ok = ok && opAdd(backend, ws.buffer, ffnInp, ws.buffer, x, ws.buffer, x, tokens * n)
