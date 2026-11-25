@@ -4,6 +4,8 @@ import "kernel.ab"
 import "../backend/backend.ab"
 import "../kernels/matvec_nvfp4.ab"
 import "../kernels/elementwise.ab"
+import "../kernels/rmsnorm.ab"
+import "../kernels/matvec_f32.ab"
 
 private fun fuseParameter(inputs: array<FusedTensor>, name: string): int {
     for (at in 0 until inputs.size) if (inputs[at].name == name) return at
@@ -20,7 +22,33 @@ private compile fun fuseStepSyntax(step: FusedStep): SyntaxExpression {
     val inputs: array<SyntaxExpression> = []
     for (name in step.inputs) inputs.append(syntaxString(name))
     syntaxCall("FusedStep", [syntaxString(step.operation), syntaxString(step.output), syntaxArray(inputs),
-        syntaxString(step.beta), syntaxString(step.lb)])
+        syntaxString(step.beta), syntaxString(step.lb), syntaxString(step.eps)])
+}
+
+private fun fuseParameters(inputs: array<FusedTensor>): string {
+    var parameters = ""
+    for (at in 0 until inputs.size) {
+        val kind = inputs[at].kind
+        val scalar = if (kind == "nvfp4") "unsigned char" else if (kind == "u32") "unsigned" else "float"
+        parameters += "const $scalar *p$at, "
+    }
+    parameters
+}
+
+private compile fun fuseKernelSyntax(symbol: string, source: string, geometry: SyntaxExpression,
+    steps: array<FusedStep>, inputs: array<FusedTensor>, output: FusedTensor): SyntaxExpression {
+    val kinds: array<SyntaxExpression> = []
+    val tensors: array<SyntaxExpression> = []
+    val sequence: array<SyntaxExpression> = []
+    for (tensor in inputs) {
+        kinds.append(syntaxInteger(KERNEL_ARG_POINTER))
+        tensors.append(fuseTensorSyntax(tensor))
+    }
+    kinds.append(syntaxInteger(KERNEL_ARG_POINTER))
+    tensors.append(fuseTensorSyntax(output))
+    for (step in steps) sequence.append(fuseStepSyntax(step))
+    syntaxCall("FusedKernel", [syntaxString(symbol), syntaxString(source), syntaxArray(kinds), geometry,
+        syntaxArray(sequence), syntaxArray(tensors)])
 }
 
 compile fun fuseEmitGateUp(name: string, inputs: array<FusedTensor>, output: FusedTensor,
@@ -31,18 +59,7 @@ compile fun fuseEmitGateUp(name: string, inputs: array<FusedTensor>, output: Fus
     val scales = fuseParameter(inputs, matvec.inputs[3])
     val beta = situ.beta
     val lb = situ.lb
-    var parameters = ""
-    val kinds: array<SyntaxExpression> = []
-    val tensors: array<SyntaxExpression> = []
-    for (at in 0 until inputs.size) {
-        val tensor = inputs[at]
-        val scalar = if (tensor.kind == "nvfp4") "unsigned char" else if (tensor.kind == "u32") "unsigned" else "float"
-        parameters += "const $scalar *p$at, "
-        kinds.append(syntaxInteger(KERNEL_ARG_POINTER))
-        tensors.append(fuseTensorSyntax(tensor))
-    }
-    kinds.append(syntaxInteger(KERNEL_ARG_POINTER))
-    tensors.append(fuseTensorSyntax(output))
+    val parameters = fuseParameters(inputs)
     val symbol = "abla_fuse_$name"
     val header = "extern \"C\" __global__ void $symbol(${parameters}float *out) {\n" +
         "    constexpr unsigned cols = ${cols}u;\n" +
@@ -76,6 +93,38 @@ compile fun fuseEmitGateUp(name: string, inputs: array<FusedTensor>, output: Fus
             .replace("@scales@", "p$scales").replace("@beta@", beta).replace("@lb@", lb)
     val geometry = syntaxCall("FusedGeometry", [syntaxInteger(128), syntaxInteger(4),
         syntaxArray([syntaxInteger(ff), syntaxInteger(used)]), syntaxInteger(scales)])
-    syntaxCall("FusedKernel", [syntaxString(symbol), syntaxString(source), syntaxArray(kinds), geometry,
-        syntaxArray([fuseStepSyntax(matvec), fuseStepSyntax(situ)]), syntaxArray(tensors)])
+    fuseKernelSyntax(symbol, source, geometry, [matvec, situ], inputs, output)
+}
+
+compile fun fuseEmitController(name: string, inputs: array<FusedTensor>, output: FusedTensor,
+    steps: array<FusedStep>, rank: int): SyntaxExpression {
+    val symbol = "abla_fuse_$name"
+    val parameters = fuseParameters(inputs)
+    val current = fuseParameter(inputs, steps[0].inputs[0])
+    val message = fuseParameter(inputs, steps[1].inputs[0])
+    val weights = fuseParameter(inputs, steps[3].inputs[0])
+    val header = "extern \"C\" __global__ void $symbol(${parameters}float *out) {\n" +
+        "    constexpr unsigned rank = ${rank}u;\n"
+    val body = """
+    constexpr unsigned n = 2304u;
+    __shared__ float norm[2u * n];
+    __shared__ float partial[256u];
+    const unsigned half = threadIdx.x / 128u;
+    const unsigned lane = threadIdx.x % 128u;
+    rmsnorm_2304(half == 0 ? @cur@ : @msg@, nullptr, norm + half * n,
+        half == 0 ? @eps_cur@f : @eps_msg@f, partial + half * 128u, lane);
+    __syncthreads();
+    const unsigned row = blockIdx.x * 8u + threadIdx.x / 32u;
+    if (row >= rank) return;
+    const float sum = grad_f32_dot(@weights@ + static_cast<unsigned long long>(row) * (2u * n),
+        norm, 2u * n);
+    if ((threadIdx.x & 31u) == 0) out[row] = sum;
+}
+"""
+    val source = kernelRmsnormDeviceSource + "\n" + kernelMatvecF32DeviceSource + "\n" + header +
+        body.replace("@cur@", "p$current").replace("@msg@", "p$message").replace("@weights@", "p$weights")
+            .replace("@eps_cur@", steps[0].eps).replace("@eps_msg@", steps[1].eps)
+    val geometry = syntaxCall("FusedGeometry", [syntaxInteger(256), syntaxInteger(8),
+        syntaxArray([syntaxInteger(rank)]), syntaxInteger(-1)])
+    fuseKernelSyntax(symbol, source, geometry, steps, inputs, output)
 }

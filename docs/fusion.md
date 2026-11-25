@@ -1,6 +1,6 @@
 # `$fuse`: fused kernels from a chain of ops (design, 2026-11-24; to settle with e7 and e8 once df's profile says which chains first)
 
-## First supported chain
+## Supported chains
 
 `src/fuse/parser.ab` implements indexed NVFP4 gate/up followed by SiTU.
 Tensor arguments are ordered by their declarations. The generated kernel
@@ -14,6 +14,18 @@ The Inkling 2 Mini instance uses `[128, 2304, 2304]` packed weights, one
 Each warp computes one gate/up pair with the same device dot function as the
 unfused operation, scales each result, and writes one activation. The down
 projection requires a separate launch so it sees every completed activation.
+
+The controller combines two weightless 2,304-value RMS norms, `concat`, and
+the F32 down projection. Each half of the 256-thread block normalizes one
+input into shared memory. The eight warps then compute eight output rows
+using the same F32 dot as the standalone matvec. The parser checks operand
+order and the `[rows, 4608]` weight shape. A second kernel computes the
+rank-64 gain and forget dots and mixes the current and message vectors
+in the original FP32 order. Each controller lane has its own offsets.
+The two fusions check their respective weights’ device storage types;
+BF16 matrices use the native BF16 matvecs. With `logits` or
+`decode-bench`, `--no-fuse-controller` selects the standalone operations
+for both halves.
 
 Run `tools/test-fuse.sh` in the repository Nix shell for generated-source and
 diagnostic checks. `make test-gpu` also runs the fused/unfused comparison with

@@ -135,6 +135,7 @@ resource class InklingModel(
     var attentionSplits: int = 16,
     // Use the generated fused gate/up + SiTU kernel for the experts when the shapes match (--no-fuse turns it off for A/B runs).
     var fused: bool = true,
+    var fusedController: bool = true,
     // When not empty, `forward` at position 0 writes named intermediate vectors (the oracle's names) into this directory.
     var dumpDir: string = ""
 )
@@ -224,9 +225,22 @@ private fun InklingModel.control(var backend: Backend, ip: int, which: string, c
     val ctrlGate = this.so("ctrlGate") + lane * this.config.gateRank * 4
     val ctrlGain = this.so("ctrlGain") + lane * n * 4
     val ctrlForget = this.so("ctrlForget") + lane * n * 4
-    var ok = opRmsNormPlain(backend, this.scratch, curOffset, this.scratch, ctrlIn, n, 0.000001, 1)
-    ok = ok && opRmsNormPlain(backend, this.scratch, messageOffset, this.scratch, ctrlIn + n * 4, n, 0.000001, 1)
-    ok = ok && opMatvec(backend, weightKind(down.type), this.arena, down.offset, this.scratch, ctrlIn, this.scratch, ctrlGate, down.rows, down.cols)
+    val fuseDown = this.fused && this.fusedController && n == 2304 && this.config.gateRank == 64 &&
+        down.cols == 4608 && down.rows == 64 && down.type == GGML_TYPE_F32
+    var ok = if (fuseDown) {
+        opControllerNormDown(backend, this.scratch, curOffset, this.scratch, messageOffset,
+            this.arena, down.offset, this.scratch, ctrlGate)
+    } else {
+        opRmsNormPlain(backend, this.scratch, curOffset, this.scratch, ctrlIn, n, 0.000001, 1) &&
+        opRmsNormPlain(backend, this.scratch, messageOffset, this.scratch, ctrlIn + n * 4, n, 0.000001, 1) &&
+        opMatvec(backend, weightKind(down.type), this.arena, down.offset, this.scratch, ctrlIn, this.scratch, ctrlGate, down.rows, down.cols)
+    }
+    if (this.fused && this.fusedController && this.config.gateRank == 64 && gain.cols == 64 && forget.cols == 64 &&
+        gain.rows == n && forget.rows == n && gain.type == GGML_TYPE_F32 && forget.type == GGML_TYPE_F32) {
+        return ok && backend.launch("controller_gain_forget_mix", kernelArgs().pointer(this.arena, gain.offset).pointer(this.arena, forget.offset)
+            .pointer(this.scratch, ctrlGate).pointer(this.scratch, curOffset).u32(n).pointer(this.scratch, messageOffset).u32(n)
+            .pointer(this.scratch, output).u32(n).u32(1), [n])
+    }
     ok = ok && opMatvec(backend, weightKind(gain.type), this.arena, gain.offset, this.scratch, ctrlGate, this.scratch, ctrlGain, gain.rows, gain.cols)
     ok = ok && opMatvec(backend, weightKind(forget.type), this.arena, forget.offset, this.scratch, ctrlGate, this.scratch, ctrlForget, forget.rows, forget.cols)
     ok && opControlMix(backend, this.scratch, curOffset, this.scratch, messageOffset, this.scratch, ctrlGain,

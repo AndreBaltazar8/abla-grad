@@ -3,6 +3,7 @@
 // `kind` is the weight storage type's kernel suffix: "f32", "bf16", "q8_0", "q4_k", "q5_k", "q6_k", "nvfp4".
 import "backend/backend.ab"
 import "kernels/fused_gate_up_situ.ab"
+import "kernels/fused_controller.ab"
 
 fun opMatvec(
     var backend: Backend, kind: string,
@@ -376,3 +377,11 @@ fun opMoeCombineConvResidual(
         .pointer(out, outOffset).pointer(residual, residualOffset).u32(rows).u32(nUsed).u32(nConv).f32(outScale),
     [rows]
 )
+
+// Two weightless norms followed by the static-shape controller down projection.
+fun opControllerNormDown(
+    var backend: Backend, cur: DeviceBuffer, curOffset: int, message: DeviceBuffer, messageOffset: int,
+    weights: DeviceBuffer, weightOffset: int, out: DeviceBuffer, outOffset: int
+): bool = backend.launch(inklingControllerNormDown.name,
+    kernelArgs().pointer(cur, curOffset).pointer(message, messageOffset).pointer(weights, weightOffset)
+        .pointer(out, outOffset), inklingControllerNormDown.geometry.problem)

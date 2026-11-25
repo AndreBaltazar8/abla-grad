@@ -1,0 +1,15 @@
+import "../../src/fuse/parser.ab"
+import "../../src/fuse/kernel.ab"
+
+// Two weightless normalizations feed one contiguous F32 input to ctrl_down.
+val inklingControllerNormDown: FusedKernel = $fuse controller_norm_down {
+    dims n = 2304, rank = 64
+    in cur: f32[n], message: f32[n], weights: f32[rank, 2*n]
+    out gate: f32[rank]
+    a = rmsnorm(cur, eps = 0.000001)
+    b = rmsnorm(message, eps = 0.000001)
+    pair = concat(a, b)
+    gate = matvec(weights, pair)
+}
+
+fun main: int = if (inklingControllerNormDown.geometry.blockX == 256) 0 else 1

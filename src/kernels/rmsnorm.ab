@@ -1,6 +1,5 @@
-val kernelRmsnorm = """
-static __device__ __forceinline__ float rmsnorm_factor(float sum, unsigned n, float eps, float *sums) {
-    unsigned lane = threadIdx.x;
+val kernelRmsnormDeviceSource = """
+static __device__ __forceinline__ float rmsnorm_factor(float sum, unsigned n, float eps, float *sums, unsigned lane) {
     sums[lane] = sum;
     __syncthreads();
     if (lane < 32) {
@@ -19,8 +18,7 @@ static __device__ __forceinline__ float rmsnorm_factor(float sum, unsigned n, fl
 }
 
 static __device__ __forceinline__ void rmsnorm_2304(const float *x, const float *w,
-    float *y, float eps, float *sums) {
-    const unsigned lane = threadIdx.x;
+    float *y, float eps, float *sums, unsigned lane) {
     float activation[18];
     float sum = 0.0f;
     #pragma unroll
@@ -28,7 +26,7 @@ static __device__ __forceinline__ void rmsnorm_2304(const float *x, const float 
         activation[i] = x[lane + i * 128];
         sum = fmaf(activation[i], activation[i], sum);
     }
-    const float factor = rmsnorm_factor(sum, 2304, eps, sums);
+    const float factor = rmsnorm_factor(sum, 2304, eps, sums, lane);
     if (w) {
         #pragma unroll
         for (unsigned i = 0; i < 18; ++i) {
@@ -41,12 +39,15 @@ static __device__ __forceinline__ void rmsnorm_2304(const float *x, const float 
     }
 }
 
+"""
+
+val kernelRmsnorm = kernelRmsnormDeviceSource + "\n" + """
 static __device__ __forceinline__ void rmsnorm_row(const float *x, const float *w, float *y,
     unsigned n, float eps) {
     __shared__ float sums[128];
     unsigned lane = threadIdx.x;
     if (n == 2304) {
-        rmsnorm_2304(x, w, y, eps, sums);
+        rmsnorm_2304(x, w, y, eps, sums, lane);
         return;
     }
     float sum = 0.0f;
@@ -54,7 +55,7 @@ static __device__ __forceinline__ void rmsnorm_row(const float *x, const float *
         float v = x[i];
         sum = fmaf(v, v, sum);
     }
-    float factor = rmsnorm_factor(sum, n, eps, sums);
+    float factor = rmsnorm_factor(sum, n, eps, sums, lane);
     for (unsigned long long i = lane; i < n; i += blockDim.x) {
         float value = x[i] * factor;
         y[i] = w ? value * w[i] : value;

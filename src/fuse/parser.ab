@@ -155,7 +155,7 @@ private compile fun fuseScalar(cursor: ParserCursor, name: string): string {
             return "1.0"
         }
     }
-    if (digits == 0 || dots > 1 || text.size > 16 || (name == "beta" && !nonzero)) {
+    if (digits == 0 || dots > 1 || text.size > 16 || (name != "lb" && !nonzero)) {
         parserFail(cursor, "fuse: invalid '$name' constant")
         return "1.0"
     }
@@ -166,27 +166,36 @@ private compile fun fuseStep(cursor: ParserCursor): FusedStep? {
     val output = fuseName(cursor)
     fuseExpect(cursor, "=")
     val op = fuseName(cursor)
-    if (op != "matvec_indexed" && op != "situ") {
+    val count = when (op) {
+        "matvec_indexed" -> 4
+        "situ", "rmsnorm" -> 1
+        "matvec", "concat" -> 2
+        else -> 0
+    }
+    if (count == 0) {
         parserFail(cursor, "fuse: unknown operation '$op'")
         return null
     }
     fuseExpect(cursor, "(")
     val inputs: array<string> = []
-    val count = if (op == "matvec_indexed") 4 else 1
     for (at in 0 until count) {
         if (at > 0) fuseExpect(cursor, ",")
         inputs.append(fuseName(cursor))
     }
     var beta = ""
     var lb = ""
+    var eps = ""
     if (op == "situ") {
         fuseExpect(cursor, ",")
         beta = fuseScalar(cursor, "beta")
         fuseExpect(cursor, ",")
         lb = fuseScalar(cursor, "lb")
+    } else if (op == "rmsnorm") {
+        fuseExpect(cursor, ",")
+        eps = fuseScalar(cursor, "eps")
     }
     fuseExpect(cursor, ")")
-    FusedStep(op, output, inputs, beta, lb)
+    FusedStep(op, output, inputs, beta, lb, eps)
 }
 
 private compile fun fuseInput(cursor: ParserCursor, inputs: array<FusedTensor>,
@@ -201,6 +210,60 @@ private compile fun fuseInput(cursor: ParserCursor, inputs: array<FusedTensor>,
     null
 }
 
+// Only two independent weightless norms, an ordered concat and its F32 dot
+// can share this geometry. The intermediate vector remains in shared memory.
+private compile fun fuseController(cursor: ParserCursor, name: string,
+    inputs: array<FusedTensor>, outputs: array<FusedTensor>, tensors: Map<string, FusedTensor>,
+    current: FusedStep): SyntaxExpression {
+    val cur = fuseInput(cursor, inputs, current.inputs[0], "f32", 1) ?? return syntaxNull()
+    val message = fuseStep(cursor) ?? return syntaxNull()
+    if (message.operation != "rmsnorm") {
+        parserFail(cursor, "fuse: the second controller step must be a weightless norm")
+        return syntaxNull()
+    }
+    val msg = fuseInput(cursor, inputs, message.inputs[0], "f32", 1) ?? return syntaxNull()
+    if (cur.name == msg.name || cur.shape[0] != 2304 || msg.shape[0] != 2304) {
+        parserFail(cursor, "fuse: controller needs two distinct 2304-value input vectors")
+        return syntaxNull()
+    }
+    val joined = fuseStep(cursor) ?? return syntaxNull()
+    if (joined.operation != "concat" || joined.inputs[0] != current.output ||
+        joined.inputs[1] != message.output) {
+        parserFail(cursor, "fuse: concat must consume the two normalized vectors in order")
+        return syntaxNull()
+    }
+    val intermediates = [current.output, message.output, joined.output]
+    for (index in 0 until intermediates.size) {
+        val item = intermediates[index]
+        if (tensors.has(item) || (index > 0 && item == intermediates[0]) ||
+            (index > 1 && item == intermediates[1])) {
+            parserFail(cursor, "fuse: controller intermediates must have distinct fresh names")
+            return syntaxNull()
+        }
+    }
+    val down = fuseStep(cursor) ?? return syntaxNull()
+    if (down.operation != "matvec" || down.inputs[1] != joined.output) {
+        parserFail(cursor, "fuse: controller matvec must consume the concatenated vector")
+        return syntaxNull()
+    }
+    val weights = fuseInput(cursor, inputs, down.inputs[0], "f32", 2) ?? return syntaxNull()
+    if (inputs.size != 3 || weights.shape[1] != 4608) {
+        parserFail(cursor, "fuse: controller matvec needs a [rows, 4608] F32 weight tensor")
+        return syntaxNull()
+    }
+    if (outputs.size != 1 || outputs[0].name != down.output) {
+        parserFail(cursor, "fuse: every output must be assigned")
+        return syntaxNull()
+    }
+    val out = outputs[0]
+    if (out.kind != "f32" || out.shape.size != 1 || out.shape[0] != weights.shape[0]) {
+        parserFail(cursor, "fuse: controller matvec output shape mismatch")
+        return syntaxNull()
+    }
+    fuseExpect(cursor, "}")
+    fuseEmitController(name, inputs, out, [current, message, joined, down], weights.shape[0])
+}
+
 compile fun parseFuse(cursor: ParserCursor): SyntaxExpression {
     val name = fuseName(cursor)
     val dimensions: Map<string, int> = Map()
@@ -211,7 +274,9 @@ compile fun parseFuse(cursor: ParserCursor): SyntaxExpression {
     if (fuseKeyword(cursor, "dims")) fuseDimensions(cursor, dimensions)
     while (fuseKeyword(cursor, "in")) fuseTensors(cursor, dimensions, tensors, inputs)
     while (fuseKeyword(cursor, "out")) fuseTensors(cursor, dimensions, tensors, outputs)
-    val matvec = fuseStep(cursor) ?? return syntaxNull()
+    val first = fuseStep(cursor) ?? return syntaxNull()
+    if (first.operation == "rmsnorm") return fuseController(cursor, name, inputs, outputs, tensors, first)
+    val matvec = first
     if (matvec.operation != "matvec_indexed") {
         parserFail(cursor, "fuse: the first step must be indexed NVFP4 gate/up")
         return syntaxNull()

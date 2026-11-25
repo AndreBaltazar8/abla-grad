@@ -13,7 +13,8 @@ class FusedStep(
     val output: string,
     val inputs: array<string>,
     val beta: string = "",
-    val lb: string = ""
+    val lb: string = "",
+    val eps: string = ""
 )
 
 class FusedKernel(

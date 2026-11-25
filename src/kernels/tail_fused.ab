@@ -106,3 +106,28 @@ extern "C" __global__ void rmsnorm_three_rows(const float *x, unsigned xTokenStr
     for (unsigned i = threadIdx.x; i < n; i += 128) out[i] = (row[i] * factor) * w[i];
 }
 """
+
+val kernelControllerGainForgetMix = """
+extern "C" __global__ void controller_gain_forget_mix(const float *gain, const float *forget, const float *gate,
+    const float *cur, unsigned curStride, const float *msg, unsigned msgStride, float *out, unsigned n, unsigned tokens) {
+    const unsigned lane = threadIdx.x & 31;
+    const unsigned d = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (d >= n) return;
+    const unsigned long long at = static_cast<unsigned long long>(d) * 64 + lane;
+    const float g0 = gain[at], g1 = gain[at + 32];
+    const float f0 = forget[at], f1 = forget[at + 32];
+    for (unsigned t = 0; t < tokens; ++t) {
+        const float a = gate[t * 64 + lane], b = gate[t * 64 + 32 + lane];
+        float g = fmaf(g1, b, fmaf(g0, a, 0.0f));
+        float f = fmaf(f1, b, fmaf(f0, a, 0.0f));
+        for (unsigned delta = 16; delta; delta >>= 1) {
+            g += __shfl_down_sync(~0u, g, delta);
+            f += __shfl_down_sync(~0u, f, delta);
+        }
+        if (!lane) {
+            const float c = cur[t * curStride + d];
+            out[t * n + d] = c - tanhf(f) * c + tanhf(g) * msg[t * msgStride + d];
+        }
+    }
+}
+"""

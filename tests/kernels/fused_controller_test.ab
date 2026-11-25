@@ -1,0 +1,69 @@
+import "abla/io"
+import "abla/float"
+import "abla/process/time"
+import "abla/process/arguments"
+import "../../src/kernels/fused_controller.ab"
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "../../src/ops.ab"
+import "support.ab"
+
+private fun reference(var backend: Backend, cur: DeviceBuffer, message: DeviceBuffer,
+    w: DeviceBuffer, norms: DeviceBuffer, out: DeviceBuffer): bool =
+    opRmsNormPlain(backend, cur, 0, norms, 0, 2304, 0.000001, 1) &&
+    opRmsNormPlain(backend, message, 0, norms, 2304 * 4, 2304, 0.000001, 1) &&
+    opMatvec(backend, "f32", w, 0, norms, 0, out, 0, 64, 4608)
+
+private fun elapsed(var backend: Backend, graph: Recording): int {
+    val start = monotonicNanoseconds()
+    for (i in 0 until 128) if (!backend.replay(graph)) return -1
+    if (!backend.synchronize()) return -1
+    (monotonicNanoseconds() - start) / (128 * 32)
+}
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    val cur = uploadFloats(backend, testSignal(2304, 13)) ?? return 1
+    val msg = uploadFloats(backend, testSignal(2304, 17)) ?? return 1
+    val w = uploadFloats(backend, testSignal(64 * 4608, 19)) ?? return 1
+    val norms = backend.allocate(4608 * 4) ?? return 1
+    val unfused = backend.allocate(64 * 4) ?? return 1
+    val fused = backend.allocate(64 * 4) ?? return 1
+    val args = kernelArgs().pointer(cur).pointer(msg).pointer(w).pointer(fused)
+    if (!reference(backend, cur, msg, w, norms, unfused)) return 1
+    if (!backend.launch(inklingControllerNormDown.name, args, inklingControllerNormDown.geometry.problem)) {
+        println(cudaLastError())
+        return 1
+    }
+    val before = downloadFloats(backend, unfused, 64) ?? return 1
+    val after = downloadFloats(backend, fused, 64) ?? return 1
+    for (i in 0 until 64) {
+        if (f32ToBits(before[i]) != f32ToBits(after[i])) {
+            println("controller[$i] mismatch ${f32ToBits(before[i])} ${f32ToBits(after[i])}")
+            return 1
+        }
+    }
+    println("controller 64/64 bit-identical")
+    if (processArgumentCount() == 0 || processArgument(0) != "--bench") return 0
+    if (!backend.beginRecording()) return 1
+    for (i in 0 until 32) if (!reference(backend, cur, msg, w, norms, unfused)) return 1
+    val oldGraph = backend.endRecording() ?? return 1
+    if (!backend.beginRecording()) return 1
+    for (i in 0 until 32) if (!backend.launch(inklingControllerNormDown.name, args, inklingControllerNormDown.geometry.problem)) return 1
+    val newGraph = backend.endRecording() ?? return 1
+    if (!backend.replay(oldGraph) || !backend.replay(newGraph) || !backend.synchronize()) return 1
+    for (i in 0 until 7) {
+        var old = 0
+        var fresh = 0
+        if (i % 2 == 0) {
+            old = elapsed(backend, oldGraph)
+            fresh = elapsed(backend, newGraph)
+        } else {
+            fresh = elapsed(backend, newGraph)
+            old = elapsed(backend, oldGraph)
+        }
+        if (old < 0 || fresh < 0) return 1
+        println("controller pair $i $old $fresh")
+    }
+    0
+}

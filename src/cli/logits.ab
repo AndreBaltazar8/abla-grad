@@ -52,6 +52,7 @@ fun cmdLogits(args: array<string>): int {
     var prefill = false
     var chunk = 512
     var noFuse = false
+    var noFuseController = false
     val positional: array<string> = []
     var index = 0
     while (index < args.size) {
@@ -69,6 +70,9 @@ fun cmdLogits(args: array<string>): int {
             index = index + 1
         } else if (args[index] == "--q6k") {
             weightsRequantQ6K = true
+            index = index + 1
+        } else if (args[index] == "--no-fuse-controller") {
+            noFuseController = true
             index = index + 1
         } else if (args[index] == "--step") {
             useStep = true
@@ -137,6 +141,7 @@ fun cmdLogits(args: array<string>): int {
             return 2
         }
         model.fused = !noFuse
+        model.fusedController = !noFuseController
         if (!model.reset(backend)) {
             println("logits: could not clear the convolution state (${cudaLastError()})")
             return 1

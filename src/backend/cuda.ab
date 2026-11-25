@@ -10,6 +10,7 @@ import "../kernels/attention_split.ab"
 import "../kernels/matvec_k.ab"
 import "../kernels/matvec_nvfp4.ab"
 import "../kernels/fused_gate_up_situ.ab"
+import "../kernels/fused_controller.ab"
 import "../kernels/matvec_q8_0.ab"
 import "../kernels/verify_matvec.ab"
 import "../kernels/matvec_bf16.ab"
@@ -556,7 +557,16 @@ private fun cudaVerifyQ8IndexedShape(args: KernelArgs, problem: array<int>): boo
 private fun cudaVerifyQ5IndexedShape(args: KernelArgs, problem: array<int>): bool =
     cudaVerifyIndexedShape(args, problem, 256, 176)
 
+private fun cudaControllerNormDownShape(args: KernelArgs, problem: array<int>): bool =
+    problem[0] == inklingControllerNormDown.geometry.problem[0]
+
+private val cudaCtrlTailArgs = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgP, prefillArgU, prefillArgP, prefillArgU, prefillArgU]
+private fun cudaCtrlTailShape(args: KernelArgs, problem: array<int>): bool =
+    args.words[8] == problem[0] && args.words[8] > 0 && args.words[9] >= 1 && args.words[9] <= 5 &&
+        (args.words[9] == 1 || (args.words[4] >= args.words[8] && args.words[6] >= args.words[8]))
+
 private val cudaKernels = [
+    CudaKernelSpec("controller_gain_forget_mix", kernelControllerGainForgetMix, 4, 128, cudaCtrlTailArgs, cudaCtrlTailShape),
     CudaKernelSpec("matvec_f32_rows", kernelVerifyF32, 4, 128, cudaVerifyMatvecArguments, cudaVerifyDenseShape),
     CudaKernelSpec("matvec_bf16_output", kernelVerifyBf16Output, 1, 256, cudaVerifyMatvecArguments, cudaVerifyBf16OutputShape, 2),
     CudaKernelSpec("matvec_bf16_rows", kernelVerifyF32, 4, 128, cudaVerifyMatvecArguments, cudaVerifyDenseShape),
@@ -640,7 +650,10 @@ private val cudaKernels = [
 
     CudaKernelSpec(inklingGateUpSitu.name, inklingGateUpSitu.source, inklingGateUpSitu.geometry.itemsPerBlock,
         inklingGateUpSitu.geometry.blockX, inklingGateUpSitu.argKinds, cudaInklingGateUpSituShape,
-        2, inklingGateUpSitu.geometry.nullablePointer)
+        2, inklingGateUpSitu.geometry.nullablePointer),
+    CudaKernelSpec(inklingControllerNormDown.name, inklingControllerNormDown.source,
+        inklingControllerNormDown.geometry.itemsPerBlock, inklingControllerNormDown.geometry.blockX,
+        inklingControllerNormDown.argKinds, cudaControllerNormDownShape)
 ]
 
 // prefill kernels (ablac-4e; docs/prefill.md)

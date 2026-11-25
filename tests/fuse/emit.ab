@@ -2,6 +2,7 @@ import "abla/io"
 import "abla/process/arguments"
 import "../../src/fuse/parser.ab"
 import "../../src/fuse/kernel.ab"
+import "../../src/kernels/fused_controller.ab"
 
 val tiny: FusedKernel = $fuse tiny {
     dims n = 64, ff = 5, ex = 7, used = 3
@@ -29,6 +30,15 @@ val clipped: FusedKernel = $fuse clipped {
 
 fun main: int {
     val which = processArgument(0)
+    if (which == "controller") {
+        val kernel = inklingControllerNormDown
+        if (kernel.geometry.blockX != 256 || kernel.geometry.itemsPerBlock != 8 ||
+            kernel.geometry.problem[0] != 64 || kernel.geometry.nullablePointer != -1 ||
+            kernel.steps.size != 4 || kernel.argKinds.size != 4 ||
+            kernel.steps[1].eps != "0.000001" || kernel.steps[2].operation != "concat") return 1
+        println(kernel.source)
+        return 0
+    }
     val kernel = if (which == "tiny") tiny else if (which == "reordered") reordered else clipped
     if (kernel.geometry.blockX != 128 || kernel.geometry.itemsPerBlock != 4 ||
         kernel.geometry.nullablePointer != (if (which == "reordered") 1 else 3) ||

@@ -433,6 +433,17 @@ controller build reproduced every original FP32 logit on the 324
 short-gate rows in step mode.
 The combined controller also reproduced the original step logits byte for byte on both long prompts (5,924 rows).
 
+### Plain controller fusion on the original and packed models
+
+The default plain graph uses the generated norm/down and the fused gain/forget/mix for matching F32 device matrices. Each stage checks its own matrix types. Native packed BF16 matrices use the standalone FP32-accumulating kernels. On the same release executable, the original model went from 1,955 graph launches per token to 1,571.
+
+| Cached depth | Original, fusion disabled | Original, default | Packed BF16, default |
+|---|---:|---:|---:|
+| d15 | 133.15 | 137.87 | 132.94 |
+| d512 | 126.11 | 130.40 | 127.06 |
+
+Rates are tok/s for 128 generated tokens at context capacity 700, using the prefixes from the plain graph screen above. Each arm matched all 128 output IDs at each depth. The two release files reproduced every reference logit byte across all 6,248 stepped positions (01–06) and all 324 short chunk-256 positions. The short and long gates and the two- and four-proposal speculation gates passed. The F32 control is available with `decode-bench --no-fuse-controller`.
+
 ### Fixed-four proposal shortlist and controller experiment
 
 Two more fixed-four runs used the same 512-token museum and fog prompts.
