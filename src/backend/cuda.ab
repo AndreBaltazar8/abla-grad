@@ -609,7 +609,7 @@ private val cudaKernels = [
     CudaKernelSpec("gather_row_f32", kernelMatvecF32, 128, 128, cudaGatherArguments, cudaGatherShape),
     CudaKernelSpec("gather_row_q4_k", kernelMatvecK, 128, 128, cudaGatherArguments, cudaKGatherShape),
     CudaKernelSpec("gather_row_q6_k", kernelMatvecK, 128, 128, cudaGatherArguments, cudaKGatherShape),
-    CudaKernelSpec(ablaRmsnormKernel, kernelRmsnorm, 1, 128, cudaRmsnormArguments, cudaRmsnormShape, nullablePointer = 1, abla = true),
+    CudaKernelSpec(ablaRmsnormKernel, kernelRmsnorm, 1, 128, cudaRmsnormArguments, cudaRmsnormShape, nullablePointer = 1),
     CudaKernelSpec("rmsnorm_three", kernelRmsnorm, 1, 128, cudaRmsnormThreeArguments, cudaRmsnormThreeShape),
     CudaKernelSpec("rope", kernelRope, 128, 128, cudaRopeArguments, cudaRopeShape, nullablePointer = 1),
     CudaKernelSpec("attention_decode", kernelAttentionDecode, 1, 256, cudaAttentionArguments, cudaAttentionShape),
@@ -652,7 +652,7 @@ private val cudaKernels = [
     CudaKernelSpec("moe_route", kernelMoeRoute, 1, 32, cudaArgsMoeRoute, cudaMoeRouteShape, 1, 1),
     CudaKernelSpec("rel_table", kernelRelTable, 256, 256, cudaArgsRelTable, cudaRelTableShape),
     CudaKernelSpec("conv_step", kernelConvStep, 256, 256, cudaArgsConvStep, cudaConvStepShape, 1, 3),
-    CudaKernelSpec(ablaDepthMixKernel, kernelDepthMix, 1, 1024, cudaArgsDepthMix, cudaDepthMixShape, abla = true),
+    CudaKernelSpec(ablaDepthMixKernel, kernelDepthMix, 1, 1024, cudaArgsDepthMix, cudaDepthMixShape),
     // step-buffer kernels (60-2)
     CudaKernelSpec("kv_store_step", kernelKvStoreStep, 256, 256, cudaArgsKvStoreStep, cudaKvStoreStepShape),
     CudaKernelSpec("scale_tau", kernelScaleTau, 256, 256, cudaArgsScaleTau, cudaScaleTauShape),
