@@ -60,6 +60,9 @@ fun inklingScratch(c: InklingConfig): ScratchMap {
     at = scratchAdd(offsets, "gate", qDim, at)
     at = scratchAdd(offsets, "oproj", n, at)
     at = scratchAdd(offsets, "ffnInp", n, at)
+    at = scratchAdd(offsets, "attnOut", n, at)
+    at = scratchAdd(offsets, "ffnX", n, at)
+    at = scratchAdd(offsets, "ffnConv", n, at)
     at = scratchAdd(offsets, "moeLogits", c.nExpert, at)
     at = scratchAdd(offsets, "ids", c.nExpertUsed, at)
     at = scratchAdd(offsets, "weights", c.nExpertUsed, at)
@@ -244,7 +247,6 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     val slot = if (loopPass > 0) c.nLayer + (loopPass - 1) * (c.loopEnd - c.loopStart) + (ip - c.loopStart) else ip
     val extent = if (isSwa) c.nSwa else c.extent
     val x = this.so("x")
-    val inpSA = this.so("inpSA")
     val inputs = this.so("inputs")
     val normed = this.so("normed")
     val mixed = this.so("mixed")
@@ -253,7 +255,7 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     if (this.tapsOn && this.useStep && (visit == 5 || visit == 23 || visit == 41)) {
         ok = opTapStoreStep(backend, this.scratch, x, this.taps, this.step, n, if (visit == 5) 0 else if (visit == 23) 1 else 2, 4)
     }
-    ok = ok && this.copy(backend, x, inpSA, n)
+
 
     // attention inputs
     // The three attention inputs (q, k, v): the depth mix's rows (one shared row for sliding layers) or x itself; in later loop passes the
@@ -392,34 +394,37 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     val oproj = this.so("oproj")
     ok = ok && this.matvec(backend, "blk.$ip.attn_output.weight", att, oproj)
     val postConv = this.w("blk.$ip.attn_post_conv.weight")
+    // x (the layer's input) stays untouched until the very end, so it doubles as the residual: no copies
+    val attnOut = this.so("attnOut")
     ok = ok && opConvStep(backend, this.scratch, oproj, this.history, aHistory, this.arena, postConv.offset, this.scratch, 0, false,
-        this.scratch, x, n, c.nConv, 1, plainScale)
+        this.scratch, attnOut, n, c.nConv, 1, plainScale)
     if (!ok) return -1
 
-    // block residual
+    // block residual: ffnInp = x + attention output, or just the attention output when this layer starts a block (x then joins the blocks)
+    var ffnInp = attnOut
     if (ip % c.blockSize == 0) {
-        ok = opCopy(backend, this.scratch, inpSA, this.blocks, blocks * nb, n)
+        ok = opCopy(backend, this.scratch, x, this.blocks, blocks * nb, n)
         blocks = blocks + 1
     } else {
-        ok = opAdd(backend, this.scratch, inpSA, this.scratch, x, this.scratch, x, n)
+        ffnInp = this.so("ffnInp")
+        ok = opAdd(backend, this.scratch, x, this.scratch, attnOut, this.scratch, ffnInp, n)
     }
-    val ffnInp = this.so("ffnInp")
-    ok = ok && this.copy(backend, x, ffnInp, n)
     this.dump(backend, pos, "ffn_inp-$slot", ffnInp, n)
 
-    // MoE
-    ok = ok && this.mix(backend, blocks, x, "blk.$ip.ffn_res_query.weight", 1, x)
+    // MoE on ffnX
+    val f = this.so("ffnX")
+    ok = ok && this.mix(backend, blocks, ffnInp, "blk.$ip.ffn_res_query.weight", 1, f)
     if (loopPass > 0) {
         // control_mix is elementwise, so it can overwrite its own `cur`
-        ok = ok && this.control(backend, ip, "ffn", x, this.so("msgs") + 3 * nb, x, 0)
+        ok = ok && this.control(backend, ip, "ffn", f, this.so("msgs") + 3 * nb, f, 0)
     }
-    ok = ok && this.norm(backend, "blk.$ip.ffn_norm.weight", x, x)
+    ok = ok && this.norm(backend, "blk.$ip.ffn_norm.weight", f, f)
     if (!ok) return -1
     val ids = this.so("ids")
     val weights = this.so("weights")
     val routerLogits = this.so("moeLogits")
     val bias = this.w("blk.$ip.exp_probs_b.bias")
-    ok = this.matvec(backend, "blk.$ip.ffn_gate_inp.weight", x, routerLogits)
+    ok = this.matvec(backend, "blk.$ip.ffn_gate_inp.weight", f, routerLogits)
     ok = ok && opMoeRoute(backend, this.scratch, routerLogits, this.arena, bias.offset, true, c.nExpert, c.nExpertUsed, this.scratch, ids,
         this.scratch, weights, 0.00000000000000000001, c.expertScale)
     if (this.traceIds) {
@@ -444,10 +449,10 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
         c.situBeta == 4.0 && c.situLinear == 25.0 &&
         guRef.cols == n && guRef.rows == c.nExpert * 2 * nFf
     if (fusable) {
-        ok = ok && opGateUpSitu(backend, this.arena, guRef.offset, this.scratch, x, this.scratch, ids, this.arena, guScales.offset,
+        ok = ok && opGateUpSitu(backend, this.arena, guRef.offset, this.scratch, f, this.scratch, ids, this.arena, guScales.offset,
             this.has("blk.$ip.ffn_gate_up_exps.scale"), this.scratch, this.so("act"), nFf, c.nExpertUsed)
     } else {
-        ok = ok && opMatvecIndexed(backend, guKind, this.arena, guRef.offset, this.scratch, x, this.scratch, this.so("gu"), 2 * nFf, n,
+        ok = ok && opMatvecIndexed(backend, guKind, this.arena, guRef.offset, this.scratch, f, this.scratch, this.so("gu"), 2 * nFf, n,
             this.scratch, ids, c.nExpertUsed, guRowBytes * 2 * nFf, 0, this.arena, guScales.offset, this.has("blk.$ip.ffn_gate_up_exps.scale"))
         ok = ok && opSitu(backend, this.scratch, this.so("gu"), this.scratch, this.so("act"), c.nExpertUsed, nFf, c.situBeta, c.situLinear)
     }
@@ -457,9 +462,9 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     ok = ok && opMoeCombine(backend, this.scratch, this.so("down"), this.scratch, weights, this.scratch, this.so("moe"), n, c.nExpertUsed)
     val ffnPost = this.w("blk.$ip.ffn_post_conv.weight")
     ok = ok && opConvStep(backend, this.scratch, this.so("moe"), this.history, fHistory, this.arena, ffnPost.offset, this.scratch, 0, false,
-        this.scratch, x, n, c.nConv, 1, plainScale)
-    this.dump(backend, pos, "ffn_out-$slot", x, n)
-    ok = ok && opAdd(backend, this.scratch, ffnInp, this.scratch, x, this.scratch, x, n)
+        this.scratch, this.so("ffnConv"), n, c.nConv, 1, plainScale)
+    this.dump(backend, pos, "ffn_out-$slot", this.so("ffnConv"), n)
+    ok = ok && opAdd(backend, this.scratch, ffnInp, this.scratch, this.so("ffnConv"), this.scratch, x, n)
     this.dump(backend, pos, "l_out-$slot", x, n)
     if (!ok) {
         inklingError = "a launch failed in layer $ip (visit $visit)"
