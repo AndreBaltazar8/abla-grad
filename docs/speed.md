@@ -152,6 +152,23 @@ All 324 gate positions produced byte-identical logits across the two paths.
 |---|---:|---:|
 | Indexed NVFP4 gate/up → SiTU | 84.48 → 84.73 | 98.76 → 98.51 |
 
+## DSpark small-row projections
+
+On the RTX 4090, the eight-row draft block and three-row tap injection use
+small-row matvecs. The recorded head reads the shared output matrix once for
+both proposals. Q, K and V prepare in parallel, and the first Markov correction
+runs alongside the shared output projection.
+
+Recorded proposal time at depth 15 fell from 3.309 to 1.365 ms over 40
+CUPTI-traced replays. The following `spec-bench --prefill --n 128` runs compare
+main `0e9214d` with the draft changes. The complete generated ID logs matched
+byte-for-byte, including the final batch.
+
+| Prompt and depth | Baseline ms/cycle | Tuned ms/cycle | Baseline tok/s | Tuned tok/s |
+|---|---:|---:|---:|---:|
+| 03, depth 15 | 18.12 | 15.73 | 130.08 | 149.89 |
+| 05, depth 1624 | 19.30 | 16.96 | 83.55 | 95.10 |
+
 ## GPU etiquette
 Every model run, gate and benchmark goes through `tools/gpu-lock.sh [-t hold-seconds] -- command...` (flock on /tmp/abla-grad-gpu.lock, waits for 20 GB free, hard hold timeout, one run per hold). Timings taken next to another run are not trustworthy.
 - attention splits 16 (--splits N): d512 93.7 -> 95.7, d15 unchanged; 32 and 64 no better. The context cost is now ~0.3 ms/token between d15 and d512, near Unsloth's 0.1; what remains is kernel time elsewhere (RMSNorm, F32 matvec, depth_mix, copy_f32).

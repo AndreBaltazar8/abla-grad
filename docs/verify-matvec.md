@@ -1,12 +1,13 @@
 # Speculative verification matvecs
 
-The CUDA kernels accept one to three activation vectors per launch and reuse
-each packed weight across the vectors that need it. The number of vectors and
-launch dimensions stay fixed when the kernels are recorded in a graph.
+The dense CUDA kernels accept one, two, three or eight activation vectors per
+launch. Indexed kernels accept one to three. Each weight is reused across the
+vectors that need it. The vector count and launch dimensions stay fixed during
+graph capture.
 
 | Kernel | Parameters in launch order | Problem |
 | --- | --- | --- |
-| `matvec_f32_rows`, `matvec_q8_0_rows` | `w, x, y, u32 rows, u32 cols, u32 vectors` | `[rows]` |
+| `matvec_f32_rows`, `matvec_bf16_rows`, `matvec_q8_0_rows` | `w, x, y, u32 rows, u32 cols, u32 vectors` | `[rows]` |
 | `matvec_nvfp4_indexed_rows`, `matvec_q5_k_indexed_rows`, `matvec_q8_0_indexed_rows` | `w, x, y, u32 rows, u32 cols, u32 vectors, map, u32 capacity, u64 expertStrideBytes, u32 slotsPerVector, u32 xVectorStride, u32 xSlotStride, expertScales` | `[rows, capacity]` |
 
 Dense inputs and outputs are contiguous FP32 arrays of shape `[vectors][cols]`

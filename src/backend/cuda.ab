@@ -458,14 +458,14 @@ private val cudaVerifyIndexedArguments = [
     KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_POINTER
 ]
 
-private fun cudaVerifyF32Shape(args: KernelArgs, problem: array<int>): bool =
-    cudaF32Shape(args, problem) && args.words[5] >= 1 && args.words[5] <= 3
+private fun cudaVerifyDenseShape(args: KernelArgs, problem: array<int>): bool =
+    cudaF32Shape(args, problem) && ((args.words[5] >= 1 && args.words[5] <= 3) || args.words[5] == 8)
 
 private fun cudaVerifyQ8Shape(args: KernelArgs, problem: array<int>): bool =
-    cudaVerifyF32Shape(args, problem) && args.words[4] % 32 == 0
+    cudaVerifyDenseShape(args, problem) && args.words[4] % 32 == 0
 
 private fun cudaVerifyIndexedShape(args: KernelArgs, problem: array<int>, blockElements: int, blockBytes: int): bool {
-    if (!cudaVerifyF32Shape(args, problem) || args.words[4] % blockElements != 0 ||
+    if (!cudaF32Shape(args, problem) || args.words[5] < 1 || args.words[5] > 3 || args.words[4] % blockElements != 0 ||
         args.words[7] != problem[1]) return false
     val cols = args.words[4]
     val rowBytes = cols / blockElements * blockBytes
@@ -488,7 +488,8 @@ private fun cudaVerifyQ5IndexedShape(args: KernelArgs, problem: array<int>): boo
     cudaVerifyIndexedShape(args, problem, 256, 176)
 
 private val cudaKernels = [
-    CudaKernelSpec("matvec_f32_rows", kernelVerifyF32, 4, 128, cudaVerifyMatvecArguments, cudaVerifyF32Shape),
+    CudaKernelSpec("matvec_f32_rows", kernelVerifyF32, 4, 128, cudaVerifyMatvecArguments, cudaVerifyDenseShape),
+    CudaKernelSpec("matvec_bf16_rows", kernelVerifyF32, 4, 128, cudaVerifyMatvecArguments, cudaVerifyDenseShape),
     CudaKernelSpec("matvec_q8_0_rows", kernelVerifyQ8_0, 4, 128, cudaVerifyMatvecArguments, cudaVerifyQ8Shape),
     CudaKernelSpec("matvec_nvfp4_indexed_rows", kernelVerifyNvfp4, 4, 128,
         cudaVerifyIndexedArguments, cudaVerifyNvfp4Shape, 2, 12),

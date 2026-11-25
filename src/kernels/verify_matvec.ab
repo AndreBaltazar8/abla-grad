@@ -64,16 +64,19 @@ static __device__ __forceinline__ void verify_indexed(const unsigned char *w, co
 """
 
 val kernelVerifyF32 = verifyWarpReduction + "\n" + """
-template <unsigned R>
-static __device__ __forceinline__ void verify_f32(const unsigned char *w, const float *x,
+static __device__ __forceinline__ float verify_weight(float x) { return x; }
+static __device__ __forceinline__ float verify_weight(unsigned short x) { return __uint_as_float(unsigned(x) << 16); }
+
+template <unsigned R, typename Weight>
+static __device__ __forceinline__ void verify_dense(const unsigned char *w, const float *x,
     float *y, unsigned rows, unsigned cols) {
     const unsigned lane = threadIdx.x & 31;
     const unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     if (row >= rows) return;
-    const float *weights = reinterpret_cast<const float *>(w) + static_cast<unsigned long long>(row) * cols;
+    const Weight *weights = reinterpret_cast<const Weight *>(w) + static_cast<unsigned long long>(row) * cols;
     float sums[R] = {};
     for (unsigned long long col = lane; col < cols; col += 32) {
-        const float weight = weights[col];
+        const float weight = verify_weight(weights[col]);
         #pragma unroll
         for (unsigned v = 0; v < R; ++v) sums[v] = fmaf(weight, x[v * static_cast<unsigned long long>(cols) + col], sums[v]);
     }
@@ -86,9 +89,18 @@ static __device__ __forceinline__ void verify_f32(const unsigned char *w, const 
 
 extern "C" __global__ void matvec_f32_rows(const unsigned char *w, const float *x,
     float *y, unsigned rows, unsigned cols, unsigned vectors) {
-    if (vectors == 1) verify_f32<1>(w, x, y, rows, cols);
-    else if (vectors == 2) verify_f32<2>(w, x, y, rows, cols);
-    else if (vectors == 3) verify_f32<3>(w, x, y, rows, cols);
+    if (vectors == 1) verify_dense<1, float>(w, x, y, rows, cols);
+    else if (vectors == 2) verify_dense<2, float>(w, x, y, rows, cols);
+    else if (vectors == 3) verify_dense<3, float>(w, x, y, rows, cols);
+    else if (vectors == 8) verify_dense<8, float>(w, x, y, rows, cols);
+}
+
+extern "C" __global__ void matvec_bf16_rows(const unsigned char *w, const float *x,
+    float *y, unsigned rows, unsigned cols, unsigned vectors) {
+    if (vectors == 1) verify_dense<1, unsigned short>(w, x, y, rows, cols);
+    else if (vectors == 2) verify_dense<2, unsigned short>(w, x, y, rows, cols);
+    else if (vectors == 3) verify_dense<3, unsigned short>(w, x, y, rows, cols);
+    else if (vectors == 8) verify_dense<8, unsigned short>(w, x, y, rows, cols);
 }
 """
 
@@ -162,6 +174,7 @@ extern "C" __global__ void matvec_q8_0_rows(const unsigned char *w, const float 
     if (vectors == 1) verify_q8<1>(w, x, y, rows, cols);
     else if (vectors == 2) verify_q8<2>(w, x, y, rows, cols);
     else if (vectors == 3) verify_q8<3>(w, x, y, rows, cols);
+    else if (vectors == 8) verify_q8<8>(w, x, y, rows, cols);
 }
 """
 
