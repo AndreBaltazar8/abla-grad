@@ -1,6 +1,6 @@
 # Speculative verification matvecs
 
-The dense CUDA kernels accept one, two, three or eight activation vectors per
+The dense CUDA kernels accept one to five or eight activation vectors per
 launch. Indexed kernels accept one to three. Each weight is reused across the
 vectors that need it. The vector count and launch dimensions stay fixed during
 graph capture.
