@@ -177,11 +177,9 @@ fun testConvStep(var backend: Backend): bool {
     ok
 }
 
-fun testDepthMix(var backend: Backend): bool {
-    val n = 300
-    val nQuery = 3
+fun testDepthMix(var backend: Backend, n: int, nQuery: int, bankSizes: array<int>): bool {
     var ok = true
-    for (nBank in [0, 1, 4]) {
+    for (nBank in bankSizes) {
         val bank = testSignal(n * (nBank + 1), 50)
         val cur = testSignal(n, 51)
         val queries = testSignal(nQuery * n, 52)
@@ -228,13 +226,18 @@ fun testDepthMix(var backend: Backend): bool {
             }
         }
         ok = ok && near("depth_mix nBank=$nBank", downloadFloats(backend, dout, nQuery * n) ?? [], expected)
+        if (nQuery == 1) {
+            ok = ok && backend.launch("depth_mix", kernelArgs().pointer(dbank).u32(nBank).pointer(dcur)
+                .pointer(dq).u32(nQuery).pointer(dcur).u32(n).f32(0.000001), [nQuery])
+            ok = ok && near("depth_mix in place nBank=$nBank", downloadFloats(backend, dcur, n) ?? [], expected)
+        }
     }
     ok
 }
 
 fun main: int {
     var backend = cudaBackend() ?? return 1
-    val ok = testMoeCombine(backend) && testMoeRoute(backend) && testRelTable(backend) && testConvStep(backend) && testDepthMix(backend)
+    val ok = testMoeCombine(backend) && testMoeRoute(backend) && testRelTable(backend) && testConvStep(backend) && testDepthMix(backend, 301, 3, [0, 1, 4]) && testDepthMix(backend, 2304, 1, [12, 63])
     if (!ok) {
         println("inkling small kernel test FAILED (${cudaLastError()})")
         return 1

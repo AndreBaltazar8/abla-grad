@@ -27,67 +27,6 @@ extern "C" __global__ void copy_rows(const float *src, unsigned srcStride, float
 }
 """
 
-// depth_mix for T tokens (docs/kernels.md depth_mix): token t's states are bank[t * bankStride + s * n] (s < nBank) then cur[t * curStride].
-// Query q of token t goes to out[t * outStride + q * n]. problem [nQuery, tokens]; one block of 256 threads per (query, token); nBank + 1 <= 64.
-val kernelPrefillDepthMix = """
-extern "C" __global__ void depth_mix_batch(const float *bank, unsigned bankStride, unsigned nBank, const float *cur, unsigned curStride,
-                                           const float *queries, unsigned nQuery, float *out, unsigned outStride, unsigned n, float eps,
-                                           unsigned tokens) {
-    unsigned q = blockIdx.x;
-    unsigned t = blockIdx.y;
-    if (q >= nQuery || t >= tokens || nBank + 1 > 64) return;
-    __shared__ float scores[64];
-    __shared__ float inverse[64];
-    const float *tokenBank = bank + static_cast<unsigned long long>(t) * bankStride;
-    const float *tokenCur = cur + static_cast<unsigned long long>(t) * curStride;
-    const unsigned states = nBank + 1;
-    const unsigned lane = threadIdx.x & 31u;
-    const unsigned warp = threadIdx.x >> 5;
-    const float *query = queries + static_cast<unsigned long long>(q) * n;
-    // warp w handles states w, w + 8, ...: sum of squares and the dot with the query by lanes and shuffles
-    for (unsigned s = warp; s < states; s += blockDim.x / 32) {
-        const float *state = s < nBank ? tokenBank + static_cast<unsigned long long>(s) * n : tokenCur;
-        float sumSquares = 0.0f;
-        float dot = 0.0f;
-        for (unsigned j = lane; j < n; j += 32) {
-            float v = state[j];
-            sumSquares += v * v;
-            dot += v * query[j];
-        }
-        for (unsigned width = 16; width; width >>= 1) {
-            sumSquares += __shfl_xor_sync(0xffffffffu, sumSquares, width);
-            dot += __shfl_xor_sync(0xffffffffu, dot, width);
-        }
-        if (lane == 0) {
-            float inv = rsqrtf(sumSquares / float(n) + eps);
-            inverse[s] = inv;
-            scores[s] = dot * inv / sqrtf(float(n));
-        }
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float maximum = scores[0];
-        for (unsigned s = 1; s < states; ++s) maximum = fmaxf(maximum, scores[s]);
-        float total = 0.0f;
-        for (unsigned s = 0; s < states; ++s) {
-            scores[s] = expf(scores[s] - maximum);
-            total += scores[s];
-        }
-        for (unsigned s = 0; s < states; ++s) scores[s] = scores[s] / total * inverse[s];
-    }
-    __syncthreads();
-    float *result = out + static_cast<unsigned long long>(t) * outStride + static_cast<unsigned long long>(q) * n;
-    for (unsigned j = threadIdx.x; j < n; j += blockDim.x) {
-        float sum = 0.0f;
-        for (unsigned s = 0; s < states; ++s) {
-            const float *state = s < nBank ? tokenBank + static_cast<unsigned long long>(s) * n : tokenCur;
-            sum += scores[s] * state[j];
-        }
-        result[j] = sum;
-    }
-}
-"""
-
 // The short causal convolution over a sequence (docs/inkling-graph.md `convolve`). The sequence is the history (nConv - 1 inputs, oldest first)
 // followed by x[0 .. tokens); token t's window is entries t .. t + nConv - 1 of it. out[t][c] = (x + sum_k w[c*nConv + k] * window[k]
 // + sum_lag dyn[t][head(c)][lag] * window[nConv - 1 - lag]) * outScale. x and out must not overlap. conv_history then keeps the last nConv - 1 entries.

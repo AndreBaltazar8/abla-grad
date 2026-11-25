@@ -1,0 +1,128 @@
+// One CTA per (query, vector). Warps independently score states, then the
+// CTA applies the weights. The single-query path supports out == cur.
+val kernelDepthMix = """
+template <bool Packed>
+static __device__ __forceinline__ void depth_mix_query(const float *bank, unsigned nBank,
+    const float *cur, const float *query, float *out, unsigned n, float eps) {
+    __shared__ float scores[64];
+    __shared__ float inverse[64];
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned states = nBank + 1;
+
+    for (unsigned s = warp; s < states; s += blockDim.x / 32) {
+        const float *state = s < nBank ? bank + static_cast<unsigned long long>(s) * n : cur;
+        float sumSquares = 0.0f;
+        float dot = 0.0f;
+        if (Packed) {
+            float sums[4] = {}, dots[4] = {};
+            const float4 *values = reinterpret_cast<const float4 *>(state);
+            const float4 *queries = reinterpret_cast<const float4 *>(query);
+            for (unsigned j = lane; j < n / 4; j += 32) {
+                const float4 value = values[j];
+                const float4 q = queries[j];
+                const float v[4] = {value.x, value.y, value.z, value.w};
+                const float qv[4] = {q.x, q.y, q.z, q.w};
+                #pragma unroll
+                for (unsigned i = 0; i < 4; ++i) {
+                    sums[i] = fmaf(v[i], v[i], sums[i]);
+                    dots[i] = fmaf(v[i], qv[i], dots[i]);
+                }
+            }
+            sumSquares = (sums[0] + sums[1]) + (sums[2] + sums[3]);
+            dot = (dots[0] + dots[1]) + (dots[2] + dots[3]);
+        } else {
+            for (unsigned j = lane; j < n; j += 32) {
+                float v = state[j];
+                sumSquares = fmaf(v, v, sumSquares);
+                dot = fmaf(v, query[j], dot);
+            }
+        }
+        for (unsigned width = 16; width; width >>= 1) {
+            sumSquares += __shfl_down_sync(0xffffffffu, sumSquares, width);
+            dot += __shfl_down_sync(0xffffffffu, dot, width);
+        }
+        if (lane == 0) {
+            float inv = rsqrtf(sumSquares / float(n) + eps);
+            inverse[s] = inv;
+            scores[s] = dot * inv / sqrtf(float(n));
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const unsigned second = lane + 32;
+        const float a = lane < states ? scores[lane] : -__int_as_float(0x7f800000);
+        const float b = second < states ? scores[second] : -__int_as_float(0x7f800000);
+        float maximum = fmaxf(a, b);
+        for (unsigned width = 16; width; width >>= 1)
+            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, width));
+        const float pa = lane < states ? expf(a - maximum) : 0.0f;
+        const float pb = second < states ? expf(b - maximum) : 0.0f;
+        float total = pa + pb;
+        for (unsigned width = 16; width; width >>= 1)
+            total += __shfl_xor_sync(0xffffffffu, total, width);
+        if (lane < states) scores[lane] = pa / total * inverse[lane];
+        if (second < states) scores[second] = pb / total * inverse[second];
+    }
+    __syncthreads();
+
+    // Only the thread that owns an element reads it from cur in this phase.
+    if (Packed) {
+        const unsigned width = n / 4;
+        const float4 *bankValues = reinterpret_cast<const float4 *>(bank);
+        const float4 *current = reinterpret_cast<const float4 *>(cur);
+        float4 *output = reinterpret_cast<float4 *>(out);
+        for (unsigned j = threadIdx.x; j < width; j += blockDim.x) {
+            float sum[4] = {};
+            for (unsigned s = 0; s < nBank; ++s) {
+                const float4 value = bankValues[static_cast<unsigned long long>(s) * width + j];
+                const float weight = scores[s];
+                sum[0] = fmaf(weight, value.x, sum[0]);
+                sum[1] = fmaf(weight, value.y, sum[1]);
+                sum[2] = fmaf(weight, value.z, sum[2]);
+                sum[3] = fmaf(weight, value.w, sum[3]);
+            }
+            const float4 value = current[j];
+            const float weight = scores[nBank];
+            output[j] = make_float4(fmaf(weight, value.x, sum[0]), fmaf(weight, value.y, sum[1]),
+                fmaf(weight, value.z, sum[2]), fmaf(weight, value.w, sum[3]));
+        }
+    } else {
+        for (unsigned j = threadIdx.x; j < n; j += blockDim.x) {
+            float sum = 0.0f;
+            for (unsigned s = 0; s < nBank; ++s)
+                sum = fmaf(scores[s], bank[static_cast<unsigned long long>(s) * n + j], sum);
+            out[j] = fmaf(scores[nBank], cur[j], sum);
+        }
+    }
+}
+
+static __device__ __forceinline__ void depth_mix_row(const float *bank, unsigned nBank,
+    const float *cur, const float *query, float *out, unsigned n, float eps) {
+    const unsigned long long addresses = reinterpret_cast<unsigned long long>(bank) |
+        reinterpret_cast<unsigned long long>(cur) | reinterpret_cast<unsigned long long>(query) |
+        reinterpret_cast<unsigned long long>(out);
+    if ((n & 3) == 0 && (addresses & 15) == 0) depth_mix_query<true>(bank, nBank, cur, query, out, n, eps);
+    else depth_mix_query<false>(bank, nBank, cur, query, out, n, eps);
+}
+
+extern "C" __global__ void depth_mix(const float *bank, unsigned nBank, const float *cur, const float *queries,
+    unsigned nQuery, float *out, unsigned n, float eps) {
+    const unsigned q = blockIdx.x;
+    if (q >= nQuery || nBank >= 64) return;
+    const unsigned long long base = static_cast<unsigned long long>(q) * n;
+    depth_mix_row(bank, nBank, cur, queries + base, out + base, n, eps);
+}
+
+extern "C" __global__ void depth_mix_batch(const float *bank, unsigned bankStride, unsigned nBank,
+    const float *cur, unsigned curStride, const float *queries, unsigned nQuery, float *out,
+    unsigned outStride, unsigned n, float eps, unsigned tokens) {
+    const unsigned q = blockIdx.x;
+    const unsigned t = blockIdx.y;
+    if (q >= nQuery || t >= tokens || nBank >= 64) return;
+    const unsigned long long base = static_cast<unsigned long long>(q) * n;
+    depth_mix_row(bank + static_cast<unsigned long long>(t) * bankStride, nBank,
+        cur + static_cast<unsigned long long>(t) * curStride, queries + base,
+        out + static_cast<unsigned long long>(t) * outStride + base, n, eps);
+}
+"""

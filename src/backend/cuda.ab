@@ -2,6 +2,7 @@ import "backend.ab"
 import "../kernels/matvec_f32.ab"
 import "../kernels/elementwise.ab"
 import "../kernels/inkling_small.ab"
+import "../kernels/depth_mix.ab"
 import "../kernels/step.ab"
 import "../kernels/attention_split.ab"
 import "../kernels/matvec_k.ab"
@@ -544,7 +545,7 @@ private val cudaKernels = [
     CudaKernelSpec("moe_route", kernelMoeRoute, 1, 32, cudaArgsMoeRoute, cudaMoeRouteShape, 1, 1),
     CudaKernelSpec("rel_table", kernelRelTable, 256, 256, cudaArgsRelTable, cudaRelTableShape),
     CudaKernelSpec("conv_step", kernelConvStep, 256, 256, cudaArgsConvStep, cudaConvStepShape, 1, 3),
-    CudaKernelSpec("depth_mix", kernelDepthMix, 1, 256, cudaArgsDepthMix, cudaDepthMixShape),
+    CudaKernelSpec("depth_mix", kernelDepthMix, 1, 1024, cudaArgsDepthMix, cudaDepthMixShape),
     // step-buffer kernels (60-2)
     CudaKernelSpec("kv_store_step", kernelKvStoreStep, 256, 256, cudaArgsKvStoreStep, cudaKvStoreStepShape),
     CudaKernelSpec("scale_tau", kernelScaleTau, 256, 256, cudaArgsScaleTau, cudaScaleTauShape),
@@ -591,7 +592,7 @@ private val cudaPrefillKernels = [
     CudaKernelSpec("matmul_f32_exact", kernelPrefillMatmulF32Exact, 16, 256, cudaArgsPrefillMatmul, cudaPrefillMatmulExactShape, 2),
     CudaKernelSpec("gather_rows_q8_0", kernelPrefillGatherQ8_0, 256, 256, cudaArgsGatherRows, cudaPrefillGatherShape, 2),
     CudaKernelSpec("copy_rows", kernelPrefillCopyRows, 256, 256, cudaArgsCopyRows, cudaPrefillCopyRowsShape, 2),
-    CudaKernelSpec("depth_mix_batch", kernelPrefillDepthMix, 1, 256, cudaArgsDepthMixBatch, cudaPrefillDepthMixShape, 2),
+    CudaKernelSpec("depth_mix_batch", kernelDepthMix, 1, 256, cudaArgsDepthMixBatch, cudaPrefillDepthMixShape, 2),
     CudaKernelSpec("conv_seq", kernelPrefillConv, 256, 256, cudaArgsConvSeq, cudaPrefillConvSeqShape, 2, 3),
     CudaKernelSpec("conv_history", kernelPrefillConvHistory, 256, 256, cudaArgsConvHistory, cudaPrefillConvHistoryShape),
     CudaKernelSpec("l2clip_rows", kernelPrefillL2Clip, 1, 128, cudaArgsL2ClipRows, cudaPrefillL2ClipRowsShape, 1, 1),
