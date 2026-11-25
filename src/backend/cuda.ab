@@ -366,7 +366,7 @@ private val prefillArgU = KERNEL_ARG_U32
 private val prefillArgF = KERNEL_ARG_F32
 private val cudaArgsRelTableRows = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU]
 private fun cudaPrefillRelTableRowsShape(args: KernelArgs, problem: array<int>): bool =
-    args.words[5] + 1 == problem[0] && args.words[6] == problem[1] && args.words[4] > 0 && args.words[4] % 4 == 0 && args.words[4] <= 32 &&
+    problem[0] >= 1 && problem[0] <= args.words[5] + 1 && args.words[6] == problem[1] && args.words[4] > 0 && args.words[4] % 4 == 0 && args.words[4] <= 32 &&
         args.words[0] % 16 == 0 && args.words[1] % 16 == 0
 private val cudaArgsAttentionTc = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgP, prefillArgU, prefillArgU, prefillArgF, prefillArgU]
 private fun cudaPrefillAttentionTcShape(args: KernelArgs, problem: array<int>): bool =

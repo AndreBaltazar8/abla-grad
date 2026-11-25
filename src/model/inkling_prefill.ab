@@ -294,6 +294,8 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     val kvDim = c.nHeadKv * c.headDim
     val isSwa = !this.hasWeight("blk.$ip.attn_q_inp_norm.weight")
     val extent = if (isSwa) c.nSwa else c.extent
+    // only the distances up to the last position of the chunk are ever read (d <= pos), so the table is filled up to there (the host knows firstPos in prefill)
+    val relLimit = if (firstPos >= 0 && firstPos + tokens - 1 < extent) firstPos + tokens - 1 else extent
     val x = ws.o("x")
     val inpSA = ws.o("inpSA")
     val inputs = ws.o("inputs")
@@ -401,7 +403,7 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
         }
         ok = ok && this.dense(backend, ws, "blk.$ip.attn_sink_proj.weight", normedQ, sinks, tokens)
         ok = ok && backend.launch("rel_table_rows", kernelArgs().pointer(this.arena, relBias.offset).pointer(ws.buffer, r).pointer(ws.buffer, sinks)
-            .pointer(ws.buffer, table).u32(c.nRel).u32(extent).u32(tokens * c.nHead), [extent + 1, tokens * c.nHead])
+            .pointer(ws.buffer, table).u32(c.nRel).u32(extent).u32(tokens * c.nHead), [relLimit + 1, tokens * c.nHead])
         ok = ok && backend.branch(4)
         ok = ok && this.dense(backend, ws, "blk.$ip.attn_gate.weight", normedQ, ws.o("gate"), tokens)
         ok = ok && backend.branch(0)
@@ -439,7 +441,7 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     // relative-position bias table (sinks folded in)
     ok = this.dense(backend, ws, "blk.$ip.attn_sink_proj.weight", normedQ, sinks, tokens)
     ok = ok && backend.launch("rel_table_rows", kernelArgs().pointer(this.arena, relBias.offset).pointer(ws.buffer, r).pointer(ws.buffer, sinks)
-        .pointer(ws.buffer, table).u32(c.nRel).u32(extent).u32(tokens * c.nHead), [extent + 1, tokens * c.nHead])
+        .pointer(ws.buffer, table).u32(c.nRel).u32(extent).u32(tokens * c.nHead), [relLimit + 1, tokens * c.nHead])
     }
     if (!ok) return -1
     // KV store, attention
