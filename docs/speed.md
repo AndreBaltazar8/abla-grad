@@ -838,13 +838,14 @@ sets capacity to depth plus 169 rounded up to a multiple of 256.
 | Global attention policy | d0 | d8,192 | d32,768 | d65,536 | d131,072 |
 |---|---:|---:|---:|---:|---:|
 | F16 global, one query per block, 16 splits | 134.89 | 109.42 | 89.85 | 74.80 | 54.92 |
+| Q8 global, one query per block, 16 splits | 135.50 | 108.39 | 79.15 | 57.33 | 36.63 |
 | F16 grouped from 8k, Q8 above 98,304 | 127.05 | 111.37 | 101.01 | 86.84 | 84.87 |
 | **Q8 global, grouped/64 from 8k, CUDA C RMSNorm and depth mix** | **137.69** | **123.76** | **115.25** | **108.60** | **92.50** |
 
-The F16 precision-only build used the CUDA C norms and depth mix on
-`175171f`. The second row includes the Abla kernel ports. That diagnostic
+Both precision-only rows used the CUDA C norms and depth mix on
+`175171f`. The F16 grouped row includes the Abla kernel ports. That diagnostic
 also switched sliding K/V to F16 at 8k and used F32 globals below 8k.
-At 131,072 cached tokens, the second row reproduced all 128 token IDs of
+At 131,072 cached tokens, the F16 grouped row reproduced all 128 token IDs of
 the earlier 35.44 tok/s run.
 
 The bold row uses F16 globals below 8k, block Q8 from 8k and F16 sliding
@@ -854,6 +855,16 @@ At 32k it improves on the 92.71 tok/s capacity baseline by 24.3%. The
 on 35.44 tok/s by 2.61×. A registry-only repeat on the integrated
 build at 32k measured 115.99 tok/s with CUDA C RMSNorm and depth mix.
 Selecting the Abla ports gave 107.48 and 111.26 on the identical 128 IDs.
+On unmodified main at d0, three alternating measurements averaged 123.47
+tok/s with the ports and 135.04 with CUDA C. Within each pair all IDs
+matched. Main restored the CUDA C dispatch in `8af8468`.
+
+With the Abla ports selected, the otherwise identical Q8 policy measured
+123.44 / 114.96 / 107.48 / 104.54 / 90.68 tok/s at the five depths.
+At 32k, grouping the forty sliding visits as well measured 107.17.
+Making sliding K/V F16 measured 109.73 with per-query sliding attention
+and 109.27 with grouped sliding attention. This screen kept the existing
+sliding dispatch for the release.
 
 An isolated replay over eight disjoint global caches includes the gated
 merge for each visit. At 32k the 64-partition grouped kernel took
