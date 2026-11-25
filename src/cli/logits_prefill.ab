@@ -436,3 +436,83 @@ fun cmdVerifyArgmax(args: array<string>): int {
     println("verify-argmax: rows $rows, $windows windows from position $from: rows whose argmax differs from plain decode, by row: ${wrong[0]} ${wrong[1]} ${wrong[2]} ${wrong[3]} ${wrong[4]} (of $windows each)")
     0
 }
+
+// abla-grad verify-bench <model.gguf> <ids-file> [--rows R] [--reps N]: the recorded verifyStep (layout 2) alone, repeated at a fixed position after prefilling the prompt.
+// ms per call and tokens/s = R / ms: the throughput proxy of R independent sequences decoded together (weights read once per step; the rows share one sequence's KV).
+fun cmdVerifyBench(args: array<string>): int {
+    var rows = 3
+    var reps = 50
+    val positional: array<string> = []
+    var index = 0
+    while (index < args.size) {
+        if (args[index] == "--rows" && index + 1 < args.size) {
+            rows = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else if (args[index] == "--reps" && index + 1 < args.size) {
+            reps = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else {
+            positional.append(args[index])
+            index = index + 1
+        }
+    }
+    if (positional.size != 2 || rows < 1 || rows > 5 || reps < 1) {
+        println("usage: abla-grad verify-bench <model.gguf> <ids-file> [--rows 1..5] [--reps N]")
+        return 2
+    }
+    val idsText = Path(positional[1]).readTextResult()
+    val ids: array<int> = []
+    if (idsText.succeeded) for (line in idsText.text.split("\n")) if (line.trim() != "") ids.append(line.trim().parseInt() ?? 0)
+    if (ids.size < 8) {
+        println("verify-bench: need token ids")
+        return 2
+    }
+    val file = ggufOpen(positional[0])
+    if (file == null) {
+        println("verify-bench: ${ggufLastError()}")
+        return 2
+    }
+    val config = inklingConfigFrom(file) ?? return 2
+    var backend = cudaBackend() ?? return 2
+    val length = ids.size
+    var model = inklingLoad(backend, file, config, length + 16) ?? return loadFailed()
+    if (!model.reset(backend)) return 1
+    val seed = prefillWorkspace(backend, config, 512, false) ?? return 1
+    if (!model.prefill(backend, seed, ids, 0)) {
+        println("verify-bench: ${inklingPrefillLastError()}")
+        return 1
+    }
+    val ws = prefillWorkspace(backend, config, 8, true, 5) ?? return 1
+    val spec = backend.allocate(64) ?? return 1
+    val step = backend.allocate(64) ?? return 1
+    val host = nativeByteBuffer(64)
+    val address = nativePointerAddress(host.address)
+    for (i in 0 until 16) storeWord(address, i, 0)
+    for (i in 0 until rows) storeWord(address, i, ids[(length - rows + i) % ids.size])
+    storeWord(address, 5, rows - 1)
+    if (!backend.upload(spec, 0, address, 64)) return 1
+    for (i in 0 until 16) storeWord(address, i, 0)
+    storeWord(address, 1, length)
+    if (!backend.upload(step, 0, address, 64)) return 1
+    // one direct call loads every kernel, then the recording
+    if (!model.verifyStep(backend, ws, spec, step, rows, 2) || !backend.synchronize()) {
+        println("verify-bench: ${inklingPrefillLastError()} (${cudaLastError()})")
+        return 1
+    }
+    if (!backend.beginRecording()) return 1
+    var ok = model.verifyStep(backend, ws, spec, step, rows, 2)
+    val recording = backend.endRecording()
+    if (!ok || recording == null) {
+        println("verify-bench: recording failed: ${inklingPrefillLastError()} (${cudaLastError()})")
+        return 1
+    }
+    for (warm in 0 until 5) if (!backend.replay(recording)) return 1
+    if (!backend.synchronize()) return 1
+    val start = monotonicNanoseconds()
+    for (i in 0 until reps) if (!backend.replay(recording)) return 1
+    if (!backend.synchronize()) return 1
+    val seconds = f64FromInt(monotonicNanoseconds() - start) / 1000000000.0
+    val milliseconds = seconds * 1000.0 / f64FromInt(reps)
+    println("verify-bench: rows $rows at position $length: ${milliseconds} ms per call (recorded, $reps replays) = ${f64FromInt(rows) / (milliseconds / 1000.0)} tokens/s")
+    0
+}
