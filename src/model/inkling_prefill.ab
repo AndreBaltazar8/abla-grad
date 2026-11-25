@@ -290,7 +290,20 @@ private fun InklingModel.controlRows(var backend: Backend, ws: PrefillWorkspace,
     val ctrlIn = ws.o("ctrlIn$lane")
     // both vectors normalized (weightless) straight into the [t][2n] controller input: one launch, no row copies (the message is read in place, strided)
     var ok = backend.launch("ctrl_in_rows", kernelArgs().pointer(ws.buffer, cur).u32(curStride).pointer(ws.buffer, messageBase).u32(messageStride).pointer(ws.buffer, ctrlIn).u32(n).f32(0.000001), [tokens])
-    ok = ok && this.dense(backend, ws, "blk.$ip.loop_${which}_ctrl_down.weight", ctrlIn, ws.o("ctrlGate$lane"), tokens)
+    val smallVerify = prefillVerifyRows > 0 && tokens <= 5
+    if (smallVerify && down.rows == 64 && down.cols == 2 * n && (down.type == GGML_TYPE_F32 || down.type == GGML_TYPE_BF16)) {
+        val args = kernelArgs().pointer(this.arena, down.offset).pointer(ws.buffer, ctrlIn).pointer(ws.buffer, ws.o("ctrlGate$lane"))
+            .u32(down.rows).u32(down.cols).u32(tokens)
+        ok = ok && backend.launch("matvec_${weightKind(down.type)}_output", args, [down.rows, tokens])
+    } else {
+        ok = ok && this.dense(backend, ws, "blk.$ip.loop_${which}_ctrl_down.weight", ctrlIn, ws.o("ctrlGate$lane"), tokens)
+    }
+    if (smallVerify && gain.cols == 64 && forget.cols == 64 && gain.rows == n && forget.rows == n &&
+        gain.type == GGML_TYPE_F32 && forget.type == GGML_TYPE_F32) {
+        val args = kernelArgs().pointer(this.arena, gain.offset).pointer(this.arena, forget.offset).pointer(ws.buffer, ws.o("ctrlGate$lane"))
+            .pointer(ws.buffer, cur).u32(curStride).pointer(ws.buffer, messageBase).u32(messageStride).pointer(ws.buffer, output).u32(n).u32(tokens)
+        return ok && backend.launch("controller_gain_forget_mix", args, [n])
+    }
     ok = ok && this.dense(backend, ws, "blk.$ip.loop_${which}_ctrl_gain.weight", ws.o("ctrlGate$lane"), ws.o("ctrlGain$lane"), tokens)
     ok = ok && this.dense(backend, ws, "blk.$ip.loop_${which}_ctrl_forget.weight", ws.o("ctrlGate$lane"), ws.o("ctrlForget$lane"), tokens)
     ok && backend.launch("control_mix_rows", kernelArgs().pointer(ws.buffer, cur).u32(curStride).pointer(ws.buffer, messageBase).u32(messageStride).pointer(ws.buffer, ws.o("ctrlGain$lane"))
@@ -548,7 +561,7 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
         val guScaled = this.hasWeight("blk.$ip.ffn_gate_up_exps.scale")
         if (guScaled) guArgs.pointer(this.arena, guScalesRows.offset) else guArgs.u64(0)
         val guKernel = if (fiveRowShape && guScaled && guKind == "nvfp4" && x % 16 == 0) "matvec_nvfp4_inkling_five" else "matvec_${guKind}_indexed_rows"
-        ok = ok && backend.launch(guKernel, guArgs, [2 * nFfRows, capacity])
+        ok = ok && backend.launch(guKernel, guArgs, [2 * nFfRows, if (guKernel == "matvec_nvfp4_inkling_five") 20 else capacity])
         ok = ok && opSitu(backend, ws.buffer, ws.o("gu"), ws.buffer, ws.o("act"), pairs, nFfRows, c.situBeta, c.situLinear)
         var downArgs = kernelArgs()
         downArgs.pointer(this.arena, downRef.offset)
@@ -566,7 +579,7 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
         val downScaled = this.hasWeight("blk.$ip.ffn_down_exps.scale")
         if (downScaled) downArgs.pointer(this.arena, downScalesRows.offset) else downArgs.u64(0)
         val downKernel = if (fiveRowShape && downScaled && downKind == "nvfp4" && ws.o("act") % 16 == 0) "matvec_nvfp4_inkling_five" else "matvec_${downKind}_indexed_rows"
-        ok = ok && backend.launch(downKernel, downArgs, [n, capacity])
+        ok = ok && backend.launch(downKernel, downArgs, [n, if (downKernel == "matvec_nvfp4_inkling_five") 20 else capacity])
         ok = ok && backend.launch("moe_combine_batch", kernelArgs().pointer(ws.buffer, ws.o("down")).pointer(ws.buffer, ws.o("iota")).pointer(ws.buffer, weights)
             .pointer(ws.buffer, ws.o("moe")).u32(n).u32(c.nExpertUsed).u32(tokens), [n, tokens])
     } else {

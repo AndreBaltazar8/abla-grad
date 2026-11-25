@@ -95,14 +95,15 @@ private fun verifyDense(var backend: Backend, kind: string, rows: int, cols: int
             .u32(rows).u32(cols).u32(vectors)
         if (!backend.launch(newName, args, [rows]) || !backend.synchronize() ||
             !verifyEqual(backend, newName, vectors, y, ref, vectors * rows)) return false
-        if (kind == "bf16" && vectors <= 5) {
+        if ((kind == "bf16" || kind == "f32") && vectors <= 5) {
+            val projection = "matvec_" + kind + "_output"
             val projected = verifyOutput(backend, vectors * rows) ?? return false
             val projectionArgs = kernelArgs().pointer(w, wOffset).pointer(x, xOffset).pointer(projected)
                 .u32(rows).u32(cols).u32(vectors)
-            if (!backend.launch("matvec_bf16_output", projectionArgs, [rows, vectors]) || !backend.synchronize()) return false
+            if (!backend.launch(projection, projectionArgs, [rows, vectors]) || !backend.synchronize()) return false
             val got = downloadFloats(backend, projected, vectors * rows) ?? return false
             val expected = downloadFloats(backend, ref, vectors * rows) ?? return false
-            for (i in 0 until got.size) if (!testNear("matvec_bf16_output", i, got[i], f32ToF64(expected[i]))) return false
+            for (i in 0 until got.size) if (!testNear(projection, i, got[i], f32ToF64(expected[i]))) return false
         }
         if (bench && !timeVerify(backend, newName, args, [rows], "${newName} ${rows}x${cols}", vectors)) return false
     }
@@ -179,7 +180,7 @@ private fun verifyIndexed(var backend: Backend, rows: int, cols: int, slots: int
         val fixedFive = vectors == 5 && rows == 2304 && slots == 8 && kind == "nvfp4" && withScales &&
             vectorPadding == 0 && ((cols == 2304 && slotStride == 0) || (cols == 1152 && slotStride == cols))
         val rowKernel = if (fixedFive) "matvec_nvfp4_inkling_five" else name + "_rows"
-        val shape = [rows, capacity]
+        val shape = [rows, if (fixedFive) 20 else capacity]
         if (!backend.launch(rowKernel, args, shape) || !backend.synchronize() ||
             !verifyEqual(backend, rowKernel, vectors, y, ref, vectors * count)) return false
         if (bench && !timeVerify(backend, rowKernel, args, shape,

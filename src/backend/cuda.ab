@@ -523,6 +523,15 @@ private fun cudaVerifyDenseShape(args: KernelArgs, problem: array<int>): bool =
 private fun cudaVerifyBf16OutputShape(args: KernelArgs, problem: array<int>): bool =
     cudaVerifyDenseShape(args, problem) && args.words[0] % 2 == 0 && args.words[5] == problem[1] && problem[1] <= 5
 
+private fun cudaF32OutputShape(args: KernelArgs, problem: array<int>): bool =
+    cudaVerifyBf16OutputShape(args, problem) && args.words[0] % 4 == 0
+
+private fun cudaDsparkShortlistShape(args: KernelArgs, problem: array<int>): bool =
+    problem[0] == args.words[5] && problem[0] > 0 && args.words[2] % 2 == 0 && args.words[4] % 8 == 0
+
+private fun cudaDsparkPairShape(args: KernelArgs, problem: array<int>): bool =
+    problem[0] == 1 && args.words[0] % 8 == 0 && args.words[2] > 0
+
 private fun cudaVerifyQ8Shape(args: KernelArgs, problem: array<int>): bool =
     cudaVerifyDenseShape(args, problem) && args.words[4] % 32 == 0
 
@@ -547,7 +556,8 @@ private fun cudaVerifyNvfp4FiveShape(args: KernelArgs, problem: array<int>): boo
     val cols = args.words[4]
     val gateUp = cols == 2304 && args.words[10] == cols && args.words[11] == 0
     val down = cols == 1152 && args.words[10] == 8 * cols && args.words[11] == cols
-    cudaVerifyNvfp4Shape(args, problem) && problem[0] == 2304 && problem[1] == 40 &&
+    args.words[7] == 40 && problem[1] > 0 && problem[1] <= 40 &&
+        cudaVerifyNvfp4Shape(args, [problem[0], 40]) && problem[0] == 2304 &&
         args.words[5] == 5 && args.words[9] == 8 && args.words[1] % 16 == 0 && args.words[12] != 0 && (gateUp || down)
 }
 
@@ -568,7 +578,8 @@ private fun cudaCtrlTailShape(args: KernelArgs, problem: array<int>): bool =
 private val cudaKernels = [
     CudaKernelSpec("controller_gain_forget_mix", kernelControllerGainForgetMix, 4, 128, cudaCtrlTailArgs, cudaCtrlTailShape),
     CudaKernelSpec("matvec_f32_rows", kernelVerifyF32, 4, 128, cudaVerifyMatvecArguments, cudaVerifyDenseShape),
-    CudaKernelSpec("matvec_bf16_output", kernelVerifyBf16Output, 1, 256, cudaVerifyMatvecArguments, cudaVerifyBf16OutputShape, 2),
+    CudaKernelSpec("matvec_bf16_output", kernelVerifyOutput, 1, 256, cudaVerifyMatvecArguments, cudaVerifyBf16OutputShape, 2),
+    CudaKernelSpec("matvec_f32_output", kernelVerifyOutput, 1, 256, cudaVerifyMatvecArguments, cudaF32OutputShape, 2),
     CudaKernelSpec("matvec_bf16_rows", kernelVerifyF32, 4, 128, cudaVerifyMatvecArguments, cudaVerifyDenseShape),
     CudaKernelSpec("matvec_q8_0_rows", kernelVerifyQ8_0, 4, 128, cudaVerifyMatvecArguments, cudaVerifyQ8Shape),
     CudaKernelSpec("matvec_nvfp4_inkling_five", kernelVerifyNvfp4Five, 4, 128,
@@ -752,6 +763,9 @@ private val cudaDsparkKernels = [
     CudaKernelSpec("dspark_pad_step", kernelDsparkSpecStep, 1, 1, [prefillArgP, prefillArgU], cudaDsparkPadShape),
     CudaKernelSpec("dspark_mix", kernelDsparkMix, 256, 256,
         [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32], cudaDsparkMixShape),
+    CudaKernelSpec("dspark_shortlist_four", kernelDsparkShortlist, 128, 128,
+        [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgF], cudaDsparkShortlistShape),
+    CudaKernelSpec("dspark_best_pair", kernelDsparkShortlist, 1, 256, [prefillArgP, prefillArgP, prefillArgU], cudaDsparkPairShape),
     CudaKernelSpec("dspark_markov", kernelDsparkMarkov, 256, 256,
         [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32],
         cudaDsparkMarkovShape),

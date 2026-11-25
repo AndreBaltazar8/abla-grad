@@ -121,3 +121,65 @@ extern "C" __global__ void dspark_pad_step(unsigned *spec, unsigned countIndex) 
     for (unsigned i = spec[countIndex] + 1; i < countIndex; ++i) spec[i] = 0;
 }
 """
+
+// One warp shortlists four IDs by base+bias, then computes each selected W2 dot in FP32.
+val kernelDsparkShortlist = """
+static __device__ __forceinline__ bool wins(float a, unsigned ai, float b, unsigned bi) {
+    return a > b || (a == b && ai < bi);
+}
+extern "C" __global__ void dspark_shortlist_four(const float *base, const float *latent, const unsigned short *w, const float *bias,
+    uint2 *pairs, unsigned n, float cap) {
+    const unsigned lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float s = idx < n ? base[idx] + bias[idx] : -__int_as_float(0x7f800000);
+    float best = -__int_as_float(0x7f800000);
+    unsigned idBest = ~0u;
+    for (int rank = 0; rank < 4; ++rank) {
+        float top = s;
+        for (unsigned d = 16; d; d /= 2) top = fmaxf(top, __shfl_xor_sync(~0u, top, d));
+        const unsigned winner = __ffs(__ballot_sync(~0u, s == top)) - 1;
+        const unsigned id = __shfl_sync(~0u, idx, winner);
+        if (id >= n) break;
+        float dot = 0.f;
+        for (unsigned c = lane; c < 256; c += 32) dot = fmaf(__uint_as_float(unsigned(w[id * 256 + c]) << 16), latent[c], dot);
+        for (unsigned d = 16; d; d /= 2) dot += __shfl_down_sync(~0u, dot, d);
+        if (!lane) {
+            float value = cap * tanhf((base[id] + (dot + bias[id])) / cap);
+            if (wins(value, id, best, idBest)) { best = value; idBest = id; }
+        }
+        if (lane == winner) s = -__int_as_float(0x7f800000);
+    }
+    __shared__ uint2 winners[4];
+    if (!lane) winners[warp] = make_uint2(__float_as_uint(best), idBest);
+    __syncthreads();
+    if (!threadIdx.x) {
+        #pragma unroll
+        for (unsigned i = 1; i < 4; ++i) {
+            uint2 item = winners[i];
+            if (wins(__uint_as_float(item.x), item.y, best, idBest)) { best = __uint_as_float(item.x); idBest = item.y; }
+        }
+        pairs[blockIdx.x] = make_uint2(__float_as_uint(best), idBest);
+    }
+}
+extern "C" __global__ void dspark_best_pair(const uint2 *pairs, unsigned *out, unsigned count) {
+    __shared__ uint2 winners[256];
+    float best = -__int_as_float(0x7f800000);
+    unsigned id = ~0u;
+    for (unsigned i = threadIdx.x; i < count; i += 256) {
+        const uint2 p = pairs[i];
+        const float v = __uint_as_float(p.x);
+        if (wins(v, p.y, best, id)) { best = v; id = p.y; }
+    }
+    winners[threadIdx.x] = make_uint2(__float_as_uint(best), id);
+    __syncthreads();
+    for (unsigned d = 128; d; d /= 2) {
+        if (threadIdx.x < d) {
+            const uint2 p = winners[threadIdx.x + d];
+            const float v = __uint_as_float(p.x);
+            if (wins(v, p.y, best, id)) { best = v; id = p.y; winners[threadIdx.x] = p; }
+        }
+        __syncthreads();
+    }
+    if (!threadIdx.x) *out = id;
+}
+"""

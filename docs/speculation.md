@@ -11,6 +11,8 @@ verification rows go through different kernels than one-token decode; `abla-grad
 4. the conv histories of the committed rows are restored from per-row snapshots (the KV rows past the accepted prefix are overwritten later).
 Everything runs on the device: one recorded CUDA graph per cycle (and per n = 2, 3, 4), replayed back to back; the host reads the token log every few cycles.
 
+With a BF16 Markov W2 matrix, the recorded drafter ranks each group of 32 vocabulary IDs by base logit plus bias and evaluates the rank-256 correction for the best four. It compares their rounded, softcapped logits and breaks ties by the lowest token ID. A strong correction on an excluded ID can change the proposal. The target verifies every proposal. The host reference used by `spec-accept` and other supported W2 storage types evaluate the full vocabulary. The paired throughput and acceptance results appear in `docs/speed.md`.
+
 ## The controller
 Arms: the plain decode graph and the cycle graphs with 2..4 proposals (default: up to 2). It starts on plain, sweeps each arm (a warm-up batch and a measured one), then prices
 every arm in tokens/s from stable costs (seconds per plain token, seconds per cycle per arm) and the device's histogram of accepted counts (one histogram of the top

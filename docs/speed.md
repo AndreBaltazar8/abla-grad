@@ -473,3 +473,44 @@ the two- and four-proposal spec gates on 01–05, the short step and
 chunk-256 gates, and the long step gates on 05 and 06. These figures
 describe the archived experimental build. The released five-change
 throughput appears in the adaptive table above.
+
+### Default adaptive two-proposal comparison
+
+Each pair used the original GGUF and the same 512-token prompt run on the RTX 4090. The first pair ran the baseline first and the second ran it last. Both used `spec-bench --n 512 --nmax 2 --adaptive` with cores 24–27 and a separate GPU lock per invocation. The first 511 generated-token intervals were timed.
+
+The first comparison used main at `2a5e004` and the combined prototype.
+
+| Prompt | Pair | Baseline tok/s | Candidate tok/s | Accepted / offered, baseline → candidate | Plain steps, baseline → candidate | Matching output IDs |
+|---|---:|---:|---:|---|---|---:|
+| 03 | 1 | 199.01 | 207.79 | 308/376 → 308/376 | 16 → 16 | 512/512 |
+| 03 | 2 | 199.61 | 207.44 | 308/376 → 308/376 | 16 → 16 | 512/512 |
+| 05, Alice | 1 | 148.28 | 151.40 | 177/222 → 177/222 | 224 → 224 | 512/512 |
+| 05, Alice | 2 | 147.07 | 151.03 | 177/222 → 177/222 | 224 → 224 | 512/512 |
+| Museum | 1 | 157.96 | 164.92 | 251/488 → 251/488 | 16 → 16 | 512/512 |
+| Museum | 2 | 155.89 | 161.48 | 251/488 → 251/488 | 16 → 16 | 512/512 |
+| Fog | 1 | 141.66 | 147.85 | 220/550 → 219/552 | 16 → 16 | 512/512 |
+| Fog | 2 | 139.98 | 145.82 | 220/550 → 219/552 | 16 → 16 | 512/512 |
+
+The release comparison included native BF16 support and the shipping plain-controller fusion in both executables. The candidate additionally used the recorded DSpark shortlist, the small-row controller kernels and the compact five-row expert grid. At nmax 2 the verifier has three rows, so the five-row grid affects only the fixed-four comparison below.
+
+| Prompt | Pair | Baseline tok/s | Candidate tok/s | Accepted / offered, baseline → candidate | Plain steps, baseline → candidate | Matching output IDs |
+|---|---:|---:|---:|---|---|---:|
+| 03 | 1 | 200.00 | 208.37 | 308/376 → 308/376 | 16 → 16 | 512/512 |
+| 03 | 2 | 196.17 | 206.34 | 308/376 → 308/376 | 16 → 16 | 512/512 |
+| 05, Alice | 1 | 150.82 | 152.15 | 177/222 → 177/222 | 224 → 224 | 512/512 |
+| 05, Alice | 2 | 151.24 | 151.92 | 177/222 → 177/222 | 224 → 224 | 512/512 |
+| Museum | 1 | 156.27 | 163.27 | 251/488 → 251/488 | 16 → 16 | 512/512 |
+| Museum | 2 | 158.62 | 165.26 | 251/488 → 251/488 | 16 → 16 | 512/512 |
+| Fog | 1 | 140.27 | 146.24 | 220/550 → 219/552 | 16 → 16 | 512/512 |
+| Fog | 2 | 142.09 | 148.14 | 220/550 → 219/552 | 16 → 16 | 512/512 |
+
+Each speculative cycle commits an anchor plus its accepted proposals. The acceptance numerator subtracts one anchor per cycle from the device token count. The denominator is two offers per cycle on these prompts. The last device batch can commit an extra token beyond the 512 logged IDs.
+
+| Fixed four, 512 tokens | Baseline ms/cycle, two runs | Candidate ms/cycle, two runs | Baseline cycles | Candidate cycles |
+|---|---:|---:|---:|---:|
+| Museum | 16.07, 16.06 | 14.85, 14.80 | 212, 212 | 212, 212 |
+| Fog | 16.03, 16.02 | 14.71, 14.74 | 258, 258 | 260, 260 |
+
+The fixed-four figures divide elapsed generation time by the recorded cycle count and include drafting, verification and commit. Raw logs and the 512 output IDs per arm are under `~/archive/abla-grad-r5-ed/` (`ab-*`, `postctrl-*` and `endcycle-*`).
+
+The combination ships as the recorded default for the supported BF16 drafter. It won every release pair. The short step and chunk-256 gates and both long gates passed. Target step logits matched the original reference at all 6,248 positions. The two- and four-proposal speculation gates passed on 01–05. Both target files passed `verify-check` at accepted lengths zero through four and produced zero R3/R5 argmax differences on forty windows of 05. The production shortlist test covers a partial warp, an excluded correction and a rounded softcap tie across blocks.

@@ -1,0 +1,38 @@
+// Two CTAs, a partial final warp, a high-scoring excluded correction,
+// and two distinct logits which round to the same capped value.
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "support.ab"
+
+private fun check(var backend: Backend, saturated: bool): bool {
+    val n = 161
+    val base: array<f32> = []
+    val bias: array<f32> = []
+    val weights: array<int> = []
+    val latent: array<f32> = []
+    for (i in 0 until 256) latent.append(if (i == 0) 1.0 else 0.0)
+    for (id in 0 until n) {
+        base.append(if (saturated && id == 7) 20.0 else if (saturated && id == 150) 21.0 else 0.0)
+        bias.append(0.0)
+        // The first coefficient is BF16. The remaining rank-256 weights are zero.
+        val first = if (saturated) 0 else if (id == 10) 0x4180 else if (id == 160) 0x4080 else if (id == 128) 0x4000 else 0
+        for (i in 0 until 128) weights.append(if (i == 0) first else 0)
+    }
+    val db = uploadFloats(backend, base) ?? return false
+    val dl = uploadFloats(backend, latent) ?? return false
+    val dw = uploadWords(backend, weights) ?? return false
+    val dy = uploadFloats(backend, bias) ?? return false
+    val count = (n + 127) / 128
+    val pairs = backend.allocate(count * 8) ?? return false
+    val id = backend.allocate(4) ?? return false
+    val args = kernelArgs().pointer(db).pointer(dl).pointer(dw).pointer(dy).pointer(pairs).u32(n).f32(if (saturated) 0.5 else 30.0)
+    if (!backend.launch("dspark_shortlist_four", args, [n]) ||
+        !backend.launch("dspark_best_pair", kernelArgs().pointer(pairs).pointer(id).u32(count), [1])) return false
+    val result = downloadWords(backend, id, 1) ?? return false
+    result[0] == (if (saturated) 7 else 160)
+}
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    if (check(backend, false) && check(backend, true)) 0 else 1
+}

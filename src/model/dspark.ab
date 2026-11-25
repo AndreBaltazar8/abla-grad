@@ -332,18 +332,19 @@ private fun DsparkDrafter.layer(var backend: Backend, layer: int, anchor: int, s
         opAdd(backend, this.scratch, x, this.scratch, norm, this.scratch, x, width)
 }
 
-private fun DsparkDrafter.markovDelta(var backend: Backend, row: int): bool {
+private fun DsparkDrafter.markovDelta(var backend: Backend, row: int, shortlist: bool = false): bool {
     val joint = this.o("joint")
     val projected = this.o("projected")
     val latent = this.o("latent")
     val delta = this.o("delta")
     val rank = DSPARK_RANK
     val hidden = this.o("x") + row * dsparkWidth * 4
-    opCopy(backend, this.scratch, hidden, this.scratch, joint + 2 * rank * 4, dsparkWidth) &&
+    val ok = opCopy(backend, this.scratch, hidden, this.scratch, joint + 2 * rank * 4, dsparkWidth) &&
         this.dense(backend, "joint_proj.weight", joint, projected, 1) &&
         backend.launch("dspark_markov", kernelArgs().pointer(this.scratch, projected).pointer(this.arena, this.w("joint_proj.bias").offset)
-            .pointer(this.scratch, joint).pointer(this.scratch, latent).u32(rank), [rank]) &&
-        this.dense(backend, "markov_w2.weight", latent, delta, 1) &&
+            .pointer(this.scratch, joint).pointer(this.scratch, latent).u32(rank), [rank])
+    if (shortlist) return ok
+    ok && this.dense(backend, "markov_w2.weight", latent, delta, 1) &&
         opAdd(backend, this.scratch, delta, this.arena, this.w("markov_w2.bias").offset, this.scratch, delta, DSPARK_VOCAB)
 }
 
@@ -351,6 +352,17 @@ private fun DsparkDrafter.pick(var backend: Backend, base: int, ids: DeviceBuffe
     opAdd(backend, this.scratch, base, this.scratch, this.o("delta"), this.scratch, base, DSPARK_VOCAB) &&
         opSoftcap(backend, this.scratch, base, this.config.softcap, DSPARK_VOCAB) &&
         opArgmax(backend, this.scratch, base, DSPARK_VOCAB, ids, idOffset)
+
+// Only the recorded path shortlists. Other supported W2 storage types retain the full projection.
+private fun DsparkDrafter.pickRecorded(var backend: Backend, base: int, spec: DeviceBuffer, idOffset: int, shortlist: bool): bool {
+    if (!shortlist) return this.pick(backend, base, spec, idOffset)
+    val pairs = this.o("delta")
+    val args = kernelArgs().pointer(this.scratch, base).pointer(this.scratch, this.o("latent"))
+        .pointer(this.arena, this.w("markov_w2.weight").offset).pointer(this.arena, this.w("markov_w2.bias").offset)
+        .pointer(this.scratch, pairs).u32(DSPARK_VOCAB).f32(this.config.softcap)
+    return backend.launch("dspark_shortlist_four", args, [DSPARK_VOCAB]) &&
+        backend.launch("dspark_best_pair", kernelArgs().pointer(this.scratch, pairs).pointer(spec, idOffset).u32((DSPARK_VOCAB + 127) / 128), [1])
+}
 
 private trusted fun DsparkDrafter.choose(var backend: Backend, target: InklingModel, output: WeightRef,
     prev: int, row: int, host: NativeByteBuffer): int {
@@ -431,14 +443,15 @@ fun DsparkDrafter.proposeStep(var backend: Backend, target: InklingModel, step: 
         this.gatherStep(backend, this.arena, markov, spec, 0, previous)
     if (!backend.join() || !ok || !this.block(backend, 0, step) || !backend.fork(1)) return false
 
+    val shortlist = this.w("markov_w2.weight").type == GGML_TYPE_BF16
     // Project all base rows in one shared lm_head pass. Later corrections depend on the preceding sampled ID.
     val base = this.o("base")
     ok = this.projectRows(backend, target.arena, output, DSPARK_VOCAB, x + dsparkWidth * 4, base, proposals) &&
-        backend.branch(1) && this.markovDelta(backend, 1)
-    if (!backend.join() || !ok || !this.pick(backend, base, spec, 4)) return false
+        backend.branch(1) && this.markovDelta(backend, 1, shortlist)
+    if (!backend.join() || !ok || !this.pickRecorded(backend, base, spec, 4, shortlist)) return false
     for (row in 2 until proposals + 1) {
         if (!this.gatherStep(backend, this.arena, markov, spec, (row - 1) * 4, previous) ||
-            !this.markovDelta(backend, row) || !this.pick(backend, base + (row - 1) * DSPARK_VOCAB * 4, spec, row * 4)) return false
+            !this.markovDelta(backend, row, shortlist) || !this.pickRecorded(backend, base + (row - 1) * DSPARK_VOCAB * 4, spec, row * 4, shortlist)) return false
     }
     backend.launch("dspark_pad_step", kernelArgs().pointer(spec).u32(countIndex), [1])
 }
