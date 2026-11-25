@@ -142,8 +142,8 @@ and the server log. Source results are `raw/ttft-batch-d*.server.log`.
 
 Same private eight-request capture, original GGUF and DSpark. Session HTTP
 is the sum of the requests and excludes model load. Other columns describe
-the final request. Request 5 hit the 512-token limit on `cf6578c` and
-`9aaccb1`, while `b22b960` stopped after 261 tokens.
+the final request. Request 5 stopped after 261 tokens on `b22b960`
+and hit the 512-token limit from `cf6578c` through `6ef2608`.
 
 | Main landing | Prompt tokens | Reused tokens | Generated tokens | First raw token (s) | Decode (tok/s) | Final HTTP (s) | Session HTTP (s) |
 |:---|---:|---:|---:|---:|---:|---:|---:|
