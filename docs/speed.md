@@ -757,6 +757,7 @@ request times and excludes model loading. GPU clocks and other system load can a
 | `ab55314` | 74917 | 56660 | 202 | 13.820 | 62.11 | 17.073 | 65.086 |
 | `8af8468` | 74917 | 56660 | 202 | 12.943 | 65.74 | 16.016 | 65.097 |
 | `4bae40a` | 74917 | 56663 | 202 | 12.657 | 65.84 | 15.725 | 60.803 |
+| `b22b960` | 74917 | 56657 | 202 | 11.945 | 67.34 | 14.945 | 59.208 |
 
 ### Int8 prefill projection GEMMs
 
