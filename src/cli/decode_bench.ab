@@ -57,6 +57,9 @@ fun cmdDecodeBench(args: array<string>): int {
         } else if (args[index] == "--splits" && index + 1 < args.size) {
             splits = args[index + 1].parseInt() ?? 16
             index = index + 2
+        } else if (args[index] == "--skip" && index + 1 < args.size) {
+            for (name in args[index + 1].split(",")) cudaSkipKernels.append(name)
+            index = index + 2
         } else if (args[index] == "--launches") {
             launches = true
             index = index + 1

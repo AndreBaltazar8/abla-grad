@@ -61,6 +61,9 @@ private var cudaError = ""
 // Kernel name -> launches recorded so far (debug: decode-bench --launches prints it).
 val cudaLaunchCounts: Map<string, int> = Map()
 
+// Debug (decode-bench --skip a,b): launches of these kernels are left out of a recording, to price their share of the critical path (the output is garbage).
+val cudaSkipKernels: array<string> = []
+
 fun cudaLastError(): string = cudaError
 
 private fun cudaStatus(status: i32, call: string): bool {
@@ -972,6 +975,9 @@ class CudaBackend(
     }
 
     trusted fun launch(kernel: string, args: KernelArgs, problem: array<int>): bool {
+        if (this.recording && cudaSkipKernels.size > 0) {
+            for (skipped in cudaSkipKernels) if (skipped == kernel) return true
+        }
         val spec = cudaKernelSpec(kernel)
         if (spec == null || !cudaLaunchShape(spec, args, problem)) {
             cudaError = "unknown CUDA kernel or invalid launch shape or arguments"
