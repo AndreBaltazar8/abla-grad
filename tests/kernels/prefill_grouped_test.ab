@@ -90,7 +90,7 @@ trusted fun testGrouped(backend: Backend, kind: string, elements: int, blockByte
         val sx = backend.allocate(tokens * (cols / 32) * 4)
         if (qx == null || sx == null) return false
         backend.launch("quantize_rows_i8", kernelArgs().pointer(dx).pointer(qx).pointer(sx).u32(tokens).u32(cols), [cols / 4, tokens]) &&
-            backend.launch("matmul_nvfp4_grouped_i8", kernelArgs().pointer(dw).pointer(qx).pointer(if (identityMap) diota else dsorted)
+            backend.launch(if (kind != "nvfp4") "matmul_${kind}_grouped_i8" else "matmul_nvfp4_grouped_i8", kernelArgs().pointer(dw).pointer(qx).pointer(if (identityMap) diota else dsorted)
                 .pointer(dy).pointer(dscales).pointer(dplan).u32(rows).u32(cols).u32(nExpert).u64(stride).pointer(sx), [rows, maxTiles])
     } else if (identityMap) groupedLaunch(backend, "matmul_${kind}_grouped${suffix}", dw, dx, diota, dy, dscales, dplan, rows, cols, nExpert, stride, maxTiles)
         else groupedLaunch(backend, "matmul_${kind}_grouped${suffix}", dw, dx, dsorted, dy, dscales, dplan, rows, cols, nExpert, stride, maxTiles)
@@ -153,6 +153,7 @@ fun verify(backend: Backend): bool {
     if (!testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, false, true) || !testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, true, true)) return false
     if (!testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, false, false, 3, true) ||
         !testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, true, false, 2, true)) return false
+    if (!testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, 64, false, false, 4, true)) return false
     for (tile in [64, 32]) {
         if (!testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, tile, false) || !testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, tile, true)) return false
         if (!testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, tile, false) || !testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, tile, true)) return false

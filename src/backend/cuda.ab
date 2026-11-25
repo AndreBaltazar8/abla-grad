@@ -682,7 +682,43 @@ private val cudaKernels = [
 ]
 
 // prefill kernels (ablac-4e; docs/prefill.md)
+private fun cudaPrefillDenseQ8I8Shape(args: KernelArgs, problem: array<int>): bool =
+    args.words[4] == problem[0] && args.words[5] > 0 && args.words[5] % 64 == 0 &&
+        args.words[6] > 0 && problem[1] == (args.words[6] + 63) / 64 &&
+        args.words[0] % 2 == 0 && args.words[1] % 16 == 0 && args.words[2] % 4 == 0
+
+private fun cudaPrefillGroupedQ8I8Shape(args: KernelArgs, problem: array<int>): bool =
+    cudaPrefillGroupedQ8Shape(args, problem) && args.words[1] % 16 == 0 && args.words[10] % 4 == 0
+
+private fun cudaPrefillDenseQ8I8X5Shape(args: KernelArgs, problem: array<int>): bool {
+    val cols = args.words[25]
+    val tokens = args.words[26]
+    if (cols <= 0 || cols % 64 != 0 || tokens <= 0 || problem[1] != (tokens + 63) / 64) return false
+    var tiles = 0
+    for (i in 0 until 5) {
+        val base = i * 5
+        val rows = args.words[base + 4]
+        if (rows <= 0 || args.words[base] % 2 != 0 || args.words[base + 1] % 16 != 0 || args.words[base + 2] % 4 != 0) return false
+        tiles += (rows + 127) / 128
+    }
+    problem[0] == tiles * 128
+}
+
+private val cudaArgsDenseQ8I8X5 = [
+    prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU,
+    prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU,
+    prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU,
+    prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU,
+    prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU
+]
+
 private val cudaPrefillKernels = [
+    CudaKernelSpec("matmul_q8_0_i8_x5", kernelPrefillQ8I8X5, 128, 256,
+        cudaArgsDenseQ8I8X5, cudaPrefillDenseQ8I8X5Shape, 2),
+    CudaKernelSpec("matmul_q8_0_i8", kernelPrefillQ8I8, 128, 256,
+        [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU], cudaPrefillDenseQ8I8Shape, 2),
+    CudaKernelSpec("matmul_q8_0_grouped_i8", kernelPrefillQ8GroupedI8, 128, 256,
+        cudaArgsGroupedI8, cudaPrefillGroupedQ8I8Shape, 2, 4),
     CudaKernelSpec("quantize_rows_i8", kernelPrefillQuantizeI8, 128, 128,
         [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU], cudaPrefillQuantizeI8Shape, 2),
     CudaKernelSpec("matmul_nvfp4_grouped_i8", kernelPrefillNvfp4I8, 128, 256,

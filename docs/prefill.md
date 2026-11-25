@@ -66,3 +66,16 @@ difference (the f16 experts give 0; llama.cpp's own CPU and CUDA builds differ b
 The long-prompt gate also passes for INT8 at chunk 512. Against the pinned llama.cpp CUDA logits, prompt 05 has 27 rows outside the per-row tolerances, 34 argmax
 differences, and worst KL 0.23859 over 1,624 positions. Prompt 06 has 23 outside, 95 argmax differences, and worst KL 0.19976 over 4,300 positions.
 Run `GATE_LOGITS_FLAGS="--prefill --chunk 512" tools/gate-inkling-long.sh` to apply the existing long-prompt limits to the default prefill path.
+
+## Int8 projection GEMMs
+
+For prefill chunks of at least 64 tokens, aligned Q8_0 projections use
+signed-int8 tensor cores. Activations use one FP32 scale per 32 values.
+The combined Q/K/V/relative/gate launch quantizes each of its three inputs
+once, then reuses the Q pack for relative and gate. The existing dense
+path handles small batches and incompatible dimensions. The exact router
+and the speculative verification path keep their existing arithmetic.
+
+At the default 64-token expert tile, the int8 expert path accepts Q8_0
+as well as NVFP4. Q8_0 weights retain their original block scales. The
+existing `--no-int8-experts` option selects the FP16 grouped path.

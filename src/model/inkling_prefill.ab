@@ -116,6 +116,9 @@ fun prefillWorkspace(var backend: Backend, c: InklingConfig, chunk: int, allLogi
     at = wsAdd(offsets, "sxA", chunk * (c.nEmbd / 32), at)
     at = wsAdd(offsets, "qxB", (pairs * c.nFfExp + 3) / 4, at)
     at = wsAdd(offsets, "sxB", pairs * (c.nFfExp / 32), at)
+    val denseI8Cols = if (qDim > n) qDim else n
+    at = wsAdd(offsets, "denseQx", 3 * chunk * denseI8Cols / 4, at)
+    at = wsAdd(offsets, "denseSx", 3 * chunk * (denseI8Cols / 32), at)
     at = wsAdd(offsets, "expertMap", 8 * 5 * c.nExpertUsed, at)
     at = wsAdd(offsets, "plan", c.nExpert + 2 + 2 * maxTiles, at)
     at = wsAdd(offsets, "gu", pairs * 2 * c.nFfExp, at)
@@ -189,6 +192,14 @@ private fun InklingModel.dense(var backend: Backend, ws: PrefillWorkspace, name:
         return backend.launch("matvec_${kind}_rows", kernelArgs().pointer(this.arena, ref.offset).pointer(ws.buffer, xOffset).pointer(ws.buffer, yOffset)
             .u32(ref.rows).u32(ref.cols).u32(tokens), [ref.rows])
     }
+    if (!exact && prefillVerifyRows == 0 && kind == "q8_0" && tokens >= 64 && ref.cols % 64 == 0 && ref.cols <= max(this.config.nEmbd, this.config.nHead * this.config.headDim)) {
+        val qx = ws.o("denseQx")
+        val sx = ws.o("denseSx")
+        if (!backend.launch("quantize_rows_i8", kernelArgs().pointer(ws.buffer, xOffset).pointer(ws.buffer, qx).pointer(ws.buffer, sx)
+            .u32(tokens).u32(ref.cols), [ref.cols / 4, tokens])) return false
+        return backend.launch("matmul_q8_0_i8", kernelArgs().pointer(this.arena, ref.offset).pointer(ws.buffer, qx)
+            .pointer(ws.buffer, sx).pointer(ws.buffer, yOffset).u32(ref.rows).u32(ref.cols).u32(tokens), [ref.rows, (tokens + 63) / 64])
+    }
     if (exact && (kind == "f32" || packedMatrix)) {
         var split = 4
         while (split > 1 && ref.cols / 32 % split != 0) split = split / 2
@@ -235,6 +246,29 @@ private fun InklingModel.denseX5(var backend: Backend, ws: PrefillWorkspace, ip:
         return ok && this.dense(backend, ws, "blk.$ip.attn_gate.weight", normedQ, gate, tokens)
     }
     val tiles = (wq.rows + 127) / 128 + (wk.rows + 127) / 128 + (wv.rows + 127) / 128 + (wrel.rows + 127) / 128 + (wg.rows + 127) / 128
+    if (tokens >= 64 && wq.cols % 64 == 0 && wq.cols <= max(this.config.nEmbd, this.config.nHead * this.config.headDim)) {
+        val inputs = [normedQ, normedK, normedV]
+        val qxOffsets = [ws.o("denseQx"), ws.o("denseQx") + tokens * wq.cols, ws.o("denseQx") + 2 * tokens * wq.cols]
+        val sxOffsets = [ws.o("denseSx"), ws.o("denseSx") + tokens * wq.cols / 8, ws.o("denseSx") + 2 * tokens * wq.cols / 8]
+        for (part in 0 until 3) {
+            if (!backend.launch("quantize_rows_i8", kernelArgs().pointer(ws.buffer, inputs[part])
+                .pointer(ws.buffer, qxOffsets[part]).pointer(ws.buffer, sxOffsets[part]).u32(tokens).u32(wq.cols), [wq.cols / 4, tokens])) return false
+        }
+        val refs = [wq, wk, wv, wrel, wg]
+        val map = [0, 1, 2, 0, 0]
+        val outputs = [q, kRaw, vRaw, r, gate]
+        var iargs = kernelArgs()
+        for (part in 0 until 5) {
+            iargs.pointer(this.arena, refs[part].offset)
+            iargs.pointer(ws.buffer, qxOffsets[map[part]])
+            iargs.pointer(ws.buffer, sxOffsets[map[part]])
+            iargs.pointer(ws.buffer, outputs[part])
+            iargs.u32(refs[part].rows)
+        }
+        iargs.u32(wq.cols)
+        iargs.u32(tokens)
+        return backend.launch("matmul_q8_0_i8_x5", iargs, [tiles * 128, (tokens + 63) / 64])
+    }
     var args = kernelArgs()
     args.pointer(this.arena, wq.offset)
     args.pointer(ws.buffer, normedQ)
@@ -652,7 +686,7 @@ private fun InklingModel.convRows(var backend: Backend, ws: PrefillWorkspace, in
 
 private fun InklingModel.grouped(var backend: Backend, ws: PrefillWorkspace, kind: string, wOffset: int, x: int, xmap: int, y: int, useScales: bool, scalesOffset: int,
     plan: int, rows: int, cols: int, nExpert: int, stride: int, maxTiles: int, xRows: int = 0, quantName: string = "A"): bool {
-    if (kind == "nvfp4" && prefillInt8Experts && prefillMoeTile == 64 && xRows > 0 && cols % 32 == 0) {
+    if ((kind == "nvfp4" || (kind == "q8_0" && prefillVerifyRows == 0)) && prefillInt8Experts && prefillMoeTile == 64 && xRows > 0 && cols % 64 == 0) {
         // int8: quantize the f32 rows once (the kernel gathers rows through xmap), then the s8 grouped matmul
         val qx = ws.o("qx" + quantName)
         val sx = ws.o("sx" + quantName)
@@ -665,7 +699,9 @@ private fun InklingModel.grouped(var backend: Backend, ws: PrefillWorkspace, kin
         iargs.u32(nExpert)
         iargs.u64(stride)
         iargs.pointer(ws.buffer, sx)
-        return backend.launch("matmul_nvfp4_grouped_i8", iargs, [rows, maxTiles])
+        val kernel = if (kind == "q8_0") "matmul_q8_0_grouped_i8"
+            else "matmul_nvfp4_grouped_i8"
+        return backend.launch(kernel, iargs, [rows, maxTiles])
     }
     var args = kernelArgs().pointer(this.arena, wOffset).pointer(ws.buffer, x).pointer(ws.buffer, xmap).pointer(ws.buffer, y)
     if (useScales) args.pointer(this.arena, scalesOffset) else args.u64(0)
