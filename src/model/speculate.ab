@@ -1,6 +1,6 @@
 import "../kernels/kv_layout.ab"
 import "inkling_config.ab"
-// Greedy speculative decoding of an Inkling model with the DSpark drafter (docs/spec-cycle.md): one recorded graph per cycle (draft, 3-row verification,
+// Greedy speculative decoding of an Inkling model with the DSpark drafter (docs/engine.md): one recorded graph per cycle (draft, 3-row verification,
 // greedy acceptance, history commit) and, when `adaptive`, the plain decode graph whenever it is faster for the text at hand. Used by `generate` and
 // `spec-check`. Greedy only: a proposal is accepted when it is the target's argmax, so the output is the plain greedy output up to numerical near-ties.
 import "abla/process/time"

@@ -1,4 +1,4 @@
-// ops.ab builds each kernel launch in docs/kernels.md's parameter order. A recording Backend notes the kernel, the number and kinds of
+// ops.ab builds each kernel launch in the order declared by the kernels. A recording Backend notes the kernel, the number and kinds of
 // parameters and the problem; no device is involved.
 import "abla/io"
 import "../src/backend/backend.ab"

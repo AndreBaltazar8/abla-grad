@@ -1,4 +1,4 @@
-// Per-position comparison of two logit vectors (docs/plan.md, "How we compare with llama.cpp").
+// Per-position comparison of two logit vectors (tools/oracle/README.md).
 import "abla/math"
 import "abla/float"
 import "abla/float/text"

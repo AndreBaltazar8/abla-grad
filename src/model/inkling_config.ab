@@ -1,4 +1,4 @@
-// Hyper-parameters of an Inkling-2 GGUF (arch inkling2 / inkling2_loop), from its metadata (docs/inkling-graph.md lists the keys).
+// Hyper-parameters of an Inkling-2 GGUF (arch inkling2 / inkling2_loop), from its metadata.
 import "abla/float"
 import "../gguf/reader.ab"
 

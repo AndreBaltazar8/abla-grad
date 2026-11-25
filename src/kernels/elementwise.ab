@@ -1,5 +1,5 @@
 import "kv_layout.ab"
-// The small elementwise / row kernels (docs/kernels.md). One CUDA C source string per kernel; names and parameter lists are the contract.
+// The small elementwise / row kernels (docs/engine.md). One CUDA C source string per kernel; names and parameter lists are the contract.
 // Geometry (for the backend registry): the elementwise kernels use blocks of 256 threads, 256 problem items per block; l2clip one block of 128
 // threads per row; argmax a single block of 1024 threads.
 

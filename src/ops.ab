@@ -1,5 +1,5 @@
 import "kernels/kv_layout.ab"
-// Typed ops over the Backend interface (docs/interfaces.md section 6, kernel signatures in docs/kernels.md). The model calls only these;
+// Typed ops over the Backend interface (docs/engine.md). The model calls only these;
 // each builds the KernelArgs in the kernel's parameter order and launches it by name. Buffers are passed with a byte offset.
 // `kind` is the weight storage type's kernel suffix: "f32", "bf16", "q8_0", "q4_k", "q5_k", "q6_k", "nvfp4".
 import "backend/backend.ab"
@@ -140,7 +140,7 @@ fun opArgmax(var backend: Backend, x: DeviceBuffer, xOffset: int, n: int, out: D
 fun opCopy(var backend: Backend, src: DeviceBuffer, srcOffset: int, dst: DeviceBuffer, dstOffset: int, n: int): bool =
     backend.launch("copy_f32", kernelArgs().pointer(src, srcOffset).pointer(dst, dstOffset).u32(n), [n])
 
-// ---- Inkling additions (docs/inkling-graph.md, docs/kernels.md) ----
+// ---- Inkling additions (docs/engine.md) ----
 
 // Weightless rmsnorm (the weight pointer is null).
 fun opRmsNormPlain(
@@ -343,7 +343,7 @@ fun opTapStoreStep(
     if (ring) "tap_store_step_tap_ring" else "tap_store_step", kernelArgs().pointer(src, srcOffset).pointer(tap, 0).pointer(step, 0).u32(n).u32(slot).u32(slots), [n]
 )
 
-// ---- speculation cycle (docs/spec-cycle.md) ----
+// ---- speculation cycle (docs/engine.md) ----
 fun opSpecBegin(var backend: Backend, step: DeviceBuffer, spec: DeviceBuffer): bool =
     backend.launch("spec_begin", kernelArgs().pointer(step, 0).pointer(spec, 0), [1])
 

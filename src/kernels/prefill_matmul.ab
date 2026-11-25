@@ -1,4 +1,4 @@
-// Prefill matrix multiplication on tensor cores (docs/prefill.md). Y[token][row] = sum_k X[token][k] * W[row][k] for a batch of tokens:
+// Prefill matrix multiplication on tensor cores (docs/engine.md). Y[token][row] = sum_k X[token][k] * W[row][k] for a batch of tokens:
 // X is f32 [tokens][cols], W the GGUF rows in their stored type, Y f32 [tokens][rows]. A CTA computes 64 tokens x 128 weight rows with eight warps
 // (each warp 32 x 32: two m16 x four n8 mma.sync m16n8k16 tiles, f16 inputs, f32 accumulators). The k loop moves 32 columns per step: X is converted to
 // f16 on the way into shared memory, the weight tile is dequantized (scale folded in) to f16 on the way into shared memory; both global loads of the next

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The proof-model gate (docs/plan.md, S2): Llama-3.2-1B-Instruct logits from the GPU against llama.cpp's CUDA build on the four fixed prompts.
+# The proof-model gate (tools/oracle/README.md): Llama-3.2-1B-Instruct logits from the GPU against llama.cpp's CUDA build on the four fixed prompts.
 # Usage: tools/gate-llama.sh [abla-grad binary]   (run in nix-shell shell.nix; needs ~/models and the oracle's GRDL files)
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

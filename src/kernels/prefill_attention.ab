@@ -1,5 +1,5 @@
 import "kv_layout.ab"
-// Tensor-core attention for a chunk of tokens (docs/prefill.md). Two warps process 32 consecutive tokens for each head.
+// Tensor-core attention for a chunk of tokens (docs/engine.md). Two warps process 32 consecutive tokens for each head.
 // The global Q8 variant can stage K and V once per group of three query heads. Keys are processed 32 at a time: K and V tiles go f32 -> f16 into shared memory, S = Q K^T (mma m16n8k16, f16 in, f32 accumulate; Q and K are split into an f16 high and low part and the product is Qh Kh + Qh Kl + Ql Kh, because logits reach 40 and one f16 rounding of Q and K would already move them by 0.02), then
 // logit = S * scale + table[token][head][min(pos - key, extent)] (the relative-position bias with the sink folded in), causal and window masks, online softmax
 // that starts from the sink's zero logit (running max 0, running sum 1), P (f16) times V accumulates the output. Head dimension 128.

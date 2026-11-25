@@ -1,5 +1,5 @@
 import "../kernels/kv_layout.ab"
-// The Inkling-2 decoder (docs/inkling-graph.md is the spec; llama.cpp's inkling2.cpp at the oracle's commit the source). One token at a time:
+// The Inkling-2 decoder (docs/engine.md; see also the pinned oracle implementation). One token at a time:
 // `forward(token, pos)` runs every layer visit (looped core included) and leaves the logits in the scratch buffer. Weights stay in one device arena
 // in their stored types; activations are f32; the state per layer visit is a KV cache and four short-convolution histories.
 import "abla/float"

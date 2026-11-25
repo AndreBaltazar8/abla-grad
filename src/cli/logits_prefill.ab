@@ -311,7 +311,7 @@ fun cmdVerifyCheck(args: array<string>): int {
             }
         }
         println("taps from prefill, slot $slot: worst relative L2 error over 103 positions = $worst at position $worstAt")
-        // slot 0 (the input of visit 5) must agree to rounding; the deeper slots are reported only (see docs/prefill.md: they disagree with the step-mode taps although the logits agree)
+        // slot 0 (the input of visit 5) must agree to rounding; the deeper slots are reported only because they can differ from step-mode taps
         if (slot == 0 && worst > 0.01) ok = false
     }
     for (accepted in [2, 0]) {

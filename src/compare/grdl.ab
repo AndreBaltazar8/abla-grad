@@ -1,4 +1,4 @@
-// GRDL v1: the logits file the oracle (tools/oracle/dump-logits.sh) and `abla-grad logits` both write (docs/interfaces.md, section 3).
+// GRDL v1: the logits file the oracle (tools/oracle/dump-logits.sh) and `abla-grad logits` both write (tools/oracle/README.md).
 // Little-endian: "GRDL", u32 version = 1, u32 vocab, u32 tokens, u32 token[tokens], f32 logits[tokens][vocab].
 import "abla/bytes"
 import "abla/float"

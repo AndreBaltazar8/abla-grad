@@ -1,4 +1,4 @@
-// The real Inkling-2-Mini GGUF (in ~/models) gives the numbers docs/inkling-graph.md records.
+// The real Inkling-2-Mini GGUF (in ~/models) gives the expected configuration.
 import "abla/io"
 import "abla/process/arguments"
 import "../src/gguf/reader.ab"

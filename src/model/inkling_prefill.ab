@@ -1,6 +1,6 @@
 import "../kernels/kv_layout.ab"
-// Batched prefill for Inkling-2 (docs/prefill.md): `model.prefill(backend, ws, tokens, startPos, allLogits)` runs a chunk of prompt tokens through every
-// layer visit at once (the graph of docs/inkling-graph.md with each op over [token][...]) and leaves the model's state ready for `forward`: the KV
+// Batched prefill for Inkling-2 (docs/engine.md): `model.prefill(backend, ws, tokens, startPos, allLogits)` runs a chunk of prompt tokens through every
+// layer visit at once (the decoder graph with each op over [token][...]) and leaves the model's state ready for `forward`: the KV
 // caches of positions startPos .. startPos + tokens - 1 and the short-convolution histories. Matrix products run on tensor cores (src/kernels/prefill_matmul.ab),
 // the MoE experts as one matmul per expert over the tokens routed to it. The result is the logits of the last token (or of every token with `allLogits`).
 import "abla/float"
@@ -62,7 +62,7 @@ resource class PrefillWorkspace(
     // [chunk][nLayer + 2][nEmbd] depth-mixing states (the block bank) and the looped core's bank, one set per token
     val blocks: DeviceBuffer,
     val bank: DeviceBuffer,
-    // `verifyRows` snapshots of the whole convolution history (docs/prefill.md, verify); a one-byte buffer when verification is off
+    // `verifyRows` snapshots of the whole convolution history (docs/engine.md); a one-byte buffer when verification is off
     val snapshots: DeviceBuffer,
     val verifyRows: int,
     val historyBytes: int
@@ -914,11 +914,11 @@ trusted fun InklingModel.verifyArgmax(var backend: Backend, ws: PrefillWorkspace
     result
 }
 
-// ---- the graph-static forms for the speculative cycle (docs/spec-cycle.md): nothing is read from kernel parameters that changes from cycle to cycle ----
+// ---- the graph-static forms for the speculative cycle (docs/engine.md): nothing is read from kernel parameters that changes from cycle to cycle ----
 // `spec` words: [0..2] the rows' token ids (anchor, proposal 1, proposal 2), [3] padding, [4..6] the argmax of rows 0..2 (written here); `step` words: [1] = P, the position
 // of row 0 (rows are P, P+1, P+2), [3] = the accepted proposals of the cycle, read by `commitStep`. Always 3 rows (padding rows run and are ignored). Only launches: it
 // can be recorded.
-// `rows` (1 .. ws.verifyRows) rows with ids spec[0 .. rows - 1]. `layout` 1: the argmax of row r goes to spec[4 + r] (docs/spec-cycle.md); layout 2 (spec = u32[16], up to 5 rows):
+// `rows` (1 .. ws.verifyRows) rows with ids spec[0 .. rows - 1]. `layout` 1: the argmax of row r goes to spec[4 + r]; layout 2 (spec = u32[16], up to 5 rows):
 // to spec[8 + r]. Rows beyond 3 use the tile kernels where the R-row matvecs do not reach yet.
 fun InklingModel.verifyStep(var backend: Backend, ws: PrefillWorkspace, spec: DeviceBuffer, step: DeviceBuffer, rows: int = 3, layout: int = 1): bool {
     prefillError = ""

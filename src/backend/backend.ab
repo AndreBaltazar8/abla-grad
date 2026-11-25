@@ -1,4 +1,4 @@
-// The backend layer: the only thing the model, ops and CLI know about devices (docs/interfaces.md, section 4).
+// The backend layer: the only thing the model, ops and CLI know about devices (docs/engine.md).
 // Implementations: CudaBackend (src/backend/cuda.ab, ablac-e7), later Vulkan, CPU, Metal. Nothing above this file imports an extern.
 import "abla/float"
 import "abla/process"
@@ -74,7 +74,7 @@ interface Backend {
     fun upload(destination: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool
     // Copies back to host memory at `hostAddress`; waits for every queued launch and copy first.
     fun download(source: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool
-    // Queues kernel `kernel` (by name; docs/plan.md lists them) with `args` over `problem`, the op-specific sizes (a matvec:
+    // Queues kernel `kernel` (by name; the backend registry lists them) with `args` over `problem`, the op-specific sizes (a matvec:
     // [rows]; an indexed matvec: [rows, nUsed]); the backend turns them into its launch geometry. Launches run in order.
     fun launch(kernel: string, args: KernelArgs, problem: array<int>): bool
     // Waits for all queued work.

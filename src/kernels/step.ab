@@ -53,7 +53,7 @@ extern "C" __global__ void tap_store_step(const float *src, float *tap, const un
 }
 """
 
-// ---- speculation cycle kernels (docs/spec-cycle.md) ----
+// ---- speculation cycle kernels (docs/engine.md) ----
 // `spec` is u32[8]: [0..2] the verification rows' token ids (anchor, p1, p2), [3] the number of proposals n (0..2), [4..6] the target's argmax after each
 // row, [7] unused. The token log is the step buffer's word 4 + position: log[j] = the token at position j + 1 (as in the decode graph).
 

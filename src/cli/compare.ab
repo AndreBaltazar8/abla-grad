@@ -1,5 +1,5 @@
 // `abla-grad compare a.grdl b.grdl [--tolerances file]`: per position metrics, a summary, exit 0 when every position is within the
-// tolerances (docs/interfaces.md, section 7). `a` is the oracle by convention (KL(a || b)).
+// tolerances (tools/oracle/README.md). `a` is the oracle by convention (KL(a || b)).
 import "abla/io"
 import "abla/fs"
 import "abla/float/text"

@@ -1,4 +1,4 @@
-// Inkling's small non-quantized kernels (docs/kernels.md "Inkling additions", docs/inkling-graph.md): moe_combine, moe_route, rel_table, and conv_step. One CUDA C source string each. Geometry: moe_combine/rel_table/conv_step 256 threads, 256 items per block; moe_route one warp.
+// Inkling's small non-quantized kernels (docs/engine.md): moe_combine, moe_route, rel_table, and conv_step. One CUDA C source string each. Geometry: moe_combine/rel_table/conv_step 256 threads, 256 items per block; moe_route one warp.
 
 val kernelMoeCombine = """
 extern "C" __global__ void moe_combine(const float *expertOut, const float *weights, float *out, unsigned rows, unsigned nUsed) {
@@ -133,7 +133,7 @@ extern "C" __global__ void rel_table(const float *relBias, const float *r, const
 }
 """
 
-// The short causal depthwise convolution with a residual (docs/inkling-graph.md "convolve"). Per channel c: the window is history[0..nConv-1)
+// The short causal depthwise convolution with a residual. Per channel c: the window is history[0..nConv-1)
 // (oldest first) then x[c]; out = (x + sum_k w[c*nConv + k] * window[k] + sum_lag dyn[head*nConv + lag] * window[nConv-1-lag]) * outScale; then the history
 // shifts by one and takes x[c]. history is [nConv-1][channels]; dyn may be null; x == out allowed.
 val kernelConvStep = """

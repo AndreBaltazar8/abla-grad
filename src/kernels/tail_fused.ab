@@ -36,7 +36,7 @@ extern "C" __global__ void moe_combine_conv_residual(const float *expertOut, con
 }
 """
 
-// ---- prefill: the loop controller's input and mix over a chunk of tokens (docs/prefill.md) ----
+// ---- prefill: the loop controller's input and mix over a chunk of tokens (docs/engine.md) ----
 // ctrlIn[t] = [rmsnorm(cur[t]), rmsnorm(message[t])] (weightless, y = x * rsqrt(mean(x^2) + eps)), cur at cur + t * curStride, message at message + t * messageStride, ctrlIn [t][2n].
 // One block of 128 threads per token; replaces two rmsnorm launches and three row copies.
 val kernelCtrlInRows = """

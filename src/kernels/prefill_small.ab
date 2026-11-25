@@ -1,6 +1,6 @@
 import "kv_layout.ab"
 import "attention_decode.ab"
-// Batched forms of Inkling's small kernels for prefill (docs/prefill.md): a chunk of T tokens goes through every op at once. Activations are f32
+// Batched forms of Inkling's small kernels for prefill (docs/engine.md): a chunk of T tokens goes through every op at once. Activations are f32
 // [token][...]; the per-token states (the block bank) are [token][block][n]. One CUDA C source string per kernel (sources share nothing).
 
 // Embedding rows of Q8_0 for T token ids: out[t][col]. problem [cols, count].
@@ -28,7 +28,7 @@ extern "C" __global__ void copy_rows(const float *src, unsigned srcStride, float
 }
 """
 
-// The short causal convolution over a sequence (docs/inkling-graph.md `convolve`). The sequence is the history (nConv - 1 inputs, oldest first)
+// The short causal convolution over a sequence. The sequence is the history (nConv - 1 inputs, oldest first)
 // followed by x[0 .. tokens); token t's window is entries t .. t + nConv - 1 of it. out[t][c] = (x + sum_k w[c*nConv + k] * window[k]
 // + sum_lag dyn[t][head(c)][lag] * window[nConv - 1 - lag]) * outScale. x and out must not overlap. conv_history then keeps the last nConv - 1 entries.
 // problem [channels, tokens].
@@ -282,7 +282,7 @@ extern "C" __global__ void moe_sort(const unsigned *ids, unsigned nPairs, unsign
 }
 """
 
-// The expert map of the R-row verification matvecs (docs/verify-matvec.md) from the routed ids [R][k]: one entry {expert, slot of vector 0, 1, 2} per distinct
+// The expert map of the R-row verification matvecs (docs/engine.md) from the routed ids [R][k]: one entry {expert, slot of vector 0, 1, 2} per distinct
 // expert (0xffffffff where a vector does not use it), entries beyond the distinct ones empty, `capacity` entries in all. problem [1].
 val kernelPrefillMoeMapRows = """
 extern "C" __global__ void moe_map_rows(const unsigned *ids, unsigned vectors, unsigned k, unsigned *map, unsigned capacity) {
