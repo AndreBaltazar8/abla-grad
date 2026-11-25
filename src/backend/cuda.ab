@@ -426,6 +426,7 @@ private val cudaArgsGatherRows = [prefillArgP, prefillArgP, prefillArgP, prefill
 private val cudaArgsCopyRows = [prefillArgP, prefillArgU, prefillArgP, prefillArgU, prefillArgU, prefillArgU]
 private val cudaArgsDepthMixBatch = [prefillArgP, prefillArgU, prefillArgU, prefillArgP, prefillArgU, prefillArgP, prefillArgU, prefillArgP, prefillArgU, prefillArgU, prefillArgF, prefillArgU]
 private val cudaArgsConvSeq = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgF, prefillArgU]
+private val cudaArgsConvVerify = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgF, prefillArgU, prefillArgP, prefillArgU]
 private val cudaArgsConvHistory = [prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU]
 private val cudaArgsL2ClipRows = [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgF, prefillArgU]
 private val cudaArgsScaleTauRows = [prefillArgP, prefillArgU, prefillArgP, prefillArgU, prefillArgF, prefillArgU]
@@ -450,6 +451,8 @@ private fun cudaPrefillDepthMixShape(args: KernelArgs, problem: array<int>): boo
 private fun cudaPrefillConvSeqShape(args: KernelArgs, problem: array<int>): bool =
     args.words[5] == problem[0] && args.words[9] == problem[1] && args.words[6] >= 2 && args.words[6] <= 64 &&
         args.words[7] > 0 && args.words[5] % args.words[7] == 0
+private fun cudaVerifyConvFourShape(args: KernelArgs, problem: array<int>): bool =
+    cudaPrefillConvSeqShape(args, problem) && args.words[6] == 4 && args.words[11] >= 3 * problem[0]
 private fun cudaPrefillConvHistoryShape(args: KernelArgs, problem: array<int>): bool =
     args.words[2] == problem[0] && args.words[3] >= 2 && args.words[3] <= 64
 private fun cudaPrefillL2ClipRowsShape(args: KernelArgs, problem: array<int>): bool =
@@ -660,6 +663,7 @@ private val cudaPrefillKernels = [
     CudaKernelSpec("gather_rows_q8_0", kernelPrefillGatherQ8_0, 256, 256, cudaArgsGatherRows, cudaPrefillGatherShape, 2),
     CudaKernelSpec("copy_rows", kernelPrefillCopyRows, 256, 256, cudaArgsCopyRows, cudaPrefillCopyRowsShape, 2),
     CudaKernelSpec("depth_mix_batch", kernelDepthMix, 1, 256, cudaArgsDepthMixBatch, cudaPrefillDepthMixShape, 2),
+    CudaKernelSpec("conv_verify_four", kernelVerifyConv, 256, 256, cudaArgsConvVerify, cudaVerifyConvFourShape, 2, 3),
     CudaKernelSpec("conv_seq", kernelPrefillConv, 256, 256, cudaArgsConvSeq, cudaPrefillConvSeqShape, 2, 3),
     CudaKernelSpec("conv_history", kernelPrefillConvHistory, 256, 256, cudaArgsConvHistory, cudaPrefillConvHistoryShape),
     CudaKernelSpec("l2clip_rows", kernelPrefillL2Clip, 1, 128, cudaArgsL2ClipRows, cudaPrefillL2ClipRowsShape, 1, 1),

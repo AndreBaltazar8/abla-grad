@@ -31,28 +31,46 @@ extern "C" __global__ void copy_rows(const float *src, unsigned srcStride, float
 // followed by x[0 .. tokens); token t's window is entries t .. t + nConv - 1 of it. out[t][c] = (x + sum_k w[c*nConv + k] * window[k]
 // + sum_lag dyn[t][head(c)][lag] * window[nConv - 1 - lag]) * outScale. x and out must not overlap. conv_history then keeps the last nConv - 1 entries.
 // problem [channels, tokens].
-val kernelPrefillConv = """
-extern "C" __global__ void conv_seq(const float *x, const float *history, const float *w, const float *dyn, float *out,
-                                    unsigned channels, unsigned nConv, unsigned heads, float outScale, unsigned tokens) {
+private val prefillConvSource = """
+extern "C" __global__ void CONV_NAME(const float *x, const float *history, const float *w, const float *dyn, float *out,
+                                    unsigned channels, unsigned nConv, unsigned heads, float outScale, unsigned tokens
+#ifdef VERIFY_CONV
+                                    , float *snapBase, unsigned snapStride
+#endif
+                                    ) {
     unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned t = blockIdx.y;
     if (c >= channels || t >= tokens || nConv > 64) return;
-    float window[64];
-    for (unsigned k = 0; k < nConv; ++k) {
+#ifdef VERIFY_CONV
+    if (nConv != 4) return;
+    const unsigned tapsInWindow = 4;
+#else
+    const unsigned tapsInWindow = nConv;
+#endif
+    float window[CONV_MAX];
+    for (unsigned k = 0; k < tapsInWindow; ++k) {
         unsigned index = t + k;
-        window[k] = index + 1 < nConv ? history[static_cast<unsigned long long>(index) * channels + c]
-                                      : x[static_cast<unsigned long long>(index + 1 - nConv) * channels + c];
+        window[k] = index + 1 < tapsInWindow ? history[static_cast<unsigned long long>(index) * channels + c]
+                                      : x[static_cast<unsigned long long>(index + 1 - tapsInWindow) * channels + c];
     }
-    float sum = window[nConv - 1];
-    for (unsigned k = 0; k < nConv; ++k) sum += w[static_cast<unsigned long long>(c) * nConv + k] * window[k];
+    float sum = window[tapsInWindow - 1];
+    for (unsigned k = 0; k < tapsInWindow; ++k) sum += w[static_cast<unsigned long long>(c) * tapsInWindow + k] * window[k];
     if (dyn) {
         unsigned head = c / (channels / heads);
-        const float *taps = dyn + (static_cast<unsigned long long>(t) * heads + head) * nConv;
-        for (unsigned lag = 0; lag < nConv; ++lag) sum += taps[lag] * window[nConv - 1 - lag];
+        const float *taps = dyn + (static_cast<unsigned long long>(t) * heads + head) * tapsInWindow;
+        for (unsigned lag = 0; lag < tapsInWindow; ++lag) sum += taps[lag] * window[tapsInWindow - 1 - lag];
     }
+#ifdef VERIFY_CONV
+    float *snapshot = snapBase + static_cast<unsigned long long>(t) * snapStride;
+    for (unsigned k = 1; k < tapsInWindow; ++k)
+        snapshot[static_cast<unsigned long long>(k - 1) * channels + c] = window[k];
+#endif
     out[static_cast<unsigned long long>(t) * channels + c] = sum * outScale;
 }
 """
+
+val kernelPrefillConv = "#define CONV_NAME conv_seq\n#define CONV_MAX 64\n" + prefillConvSource
+val kernelVerifyConv = "#define VERIFY_CONV\n#define CONV_NAME conv_verify_four\n#define CONV_MAX 4\n" + prefillConvSource
 
 val kernelPrefillConvHistory = """
 extern "C" __global__ void conv_history(const float *x, float *history, unsigned channels, unsigned nConv, unsigned tokens) {

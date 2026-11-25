@@ -68,6 +68,20 @@ fun testConv(backend: Backend): bool {
             ok = backend.launch("conv_seq", kernelArgs().pointer(x).pointer(historyA).pointer(w).u64(0).pointer(outA).u32(channels).u32(nConv).u32(heads).f32(scale).u32(tokens),
                 [channels, tokens])
         }
+        val stride = (nConv - 1) * channels + 5
+        val snapshots = deviceFloats(backend, tokens * stride, 0, 0.0) ?? return false
+        val fused = deviceFloats(backend, tokens * channels, 0, 0.0) ?? return false
+        var args = kernelArgs().pointer(x).pointer(historyA).pointer(w)
+        if (dynamic) args.pointer(dyn) else args.u64(0)
+        args.pointer(fused)
+        args.u32(channels)
+        args.u32(nConv)
+        args.u32(heads)
+        args.f32(scale)
+        args.u32(tokens)
+        args.pointer(snapshots)
+        args.u32(stride)
+        ok = ok && backend.launch("conv_verify_four", args, [channels, tokens])
         ok = ok && backend.launch("conv_history", kernelArgs().pointer(x).pointer(historyA).u32(channels).u32(nConv).u32(tokens), [channels])
         for (t in 0 until tokens) {
             if (dynamic) {
@@ -77,9 +91,11 @@ fun testConv(backend: Backend): bool {
                 ok = ok && backend.launch("conv_step", kernelArgs().pointer(x, t * channels * 4).pointer(historyB).pointer(w).u64(0)
                     .pointer(outB, t * channels * 4).u32(channels).u32(nConv).u32(heads).f32(scale), [channels])
             }
+            if (!ok || !same("verify snapshot $t", downloadFloats(backend, snapshots, t * stride * 4, (nConv - 1) * channels) ?? return false,
+                downloadFloats(backend, historyB, 0, (nConv - 1) * channels) ?? return false, 0.0, 0.0)) return false
         }
-        if (!ok) return false
         val a = downloadFloats(backend, outA, 0, tokens * channels) ?? return false
+        if (!same("verify conv output", a, downloadFloats(backend, fused, 0, tokens * channels) ?? return false, 0.0, 0.0)) return false
         val b = downloadFloats(backend, outB, 0, tokens * channels) ?? return false
         val ha = downloadFloats(backend, historyA, 0, (nConv - 1) * channels) ?? return false
         val hb = downloadFloats(backend, historyB, 0, (nConv - 1) * channels) ?? return false

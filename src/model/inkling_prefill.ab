@@ -602,6 +602,11 @@ private fun InklingModel.convRows(var backend: Backend, ws: PrefillWorkspace, in
     args.u32(heads)
     args.f32(outScale)
     args.u32(tokens)
+    if (prefillVerifyRows > 0 && c.nConv == 4) {
+        args.pointer(ws.snapshots, historyOffset)
+        args.u32(ws.historyBytes / 4)
+        return backend.launch("conv_verify_four", args, [channels, tokens])
+    }
     if (!backend.launch("conv_seq", args, [channels, tokens])) return false
     if (prefillVerifyRows > 0) {
         return backend.launch("conv_history_rows", kernelArgs().pointer(ws.buffer, input).pointer(this.history, historyOffset).pointer(ws.snapshots, historyOffset)
