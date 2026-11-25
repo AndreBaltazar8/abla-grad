@@ -124,3 +124,31 @@ tools/gpu-lock.sh -t 3000 -- build/context-logits "$model" "$ids" q8 "$chunk" |
 ```
 
 Run the pipeline with `set -o pipefail`. The comparator streams batches of 16 rows and checks both input lengths. Its TSV columns are position count, rows over KL .04, argmax differences, worst KL, zero-based worst position and maximum absolute logit difference. Run the same comparison with Unsloth logits and the identical mainline reference to obtain the worst-KL limit in `tests/tolerances-inkling-long.txt`. At 102,400 positions one uncompressed reference is 81,943,756,800 bytes. Both candidate streams can go directly into the comparator.
+
+## Long-context retrieval
+
+`node tools/context-quality.mjs make ABLA_GRAD MODEL CORPUS OUT_DIR`
+inserts four records into a natural-text corpus with at least 131,000
+tokens. It writes exact 32,256-, 65,024- and 130,560-token prompts, with 512
+tokens reserved for a greedy answer. The same ID file goes to both engines.
+`node tools/context-quality.mjs score RESPONSE` prints badge retrieved
+(0/1), facts retrieved (0–3), all facts retrieved (0/1), and all four JSON keys present (0/1). The four
+values are scored against the final JSON object in the answer.
+
+Compile `context-greedy.c` against the pinned CUDA llama.cpp from the
+project root. Use the source tree at the same revision as the library.
+
+```sh
+source tools/oracle/common.sh
+libs="$llama_root/cuda/bin"
+cc -O2 -I"$llama_source/include" -I"$llama_source/ggml/include" \
+    tools/oracle/context-greedy.c -L"$libs" -Wl,-rpath,"$libs" \
+    -lllama -lggml -lggml-base -o build/context-greedy
+export LD_LIBRARY_PATH="/run/opengl-driver/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+tools/gpu-lock.sh -t 1200 -- build/context-greedy MODEL 32768.ids f16 32768 32256 512 64 > answer.ids
+build/context-greedy MODEL answer.ids text > answer.txt
+node tools/context-quality.mjs score answer.txt
+```
+
+The `text` mode loads the vocabulary only. It also decodes Abla's
+output IDs, using the same token pieces and end-of-generation rule.

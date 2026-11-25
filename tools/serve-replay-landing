@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Rebuild an exact main landing and produce the fixed 75k session's table and summary row.
+set -euo pipefail
+export LC_ALL=C
+umask 077
+if [[ $# != 4 && $# != 5 ]]; then
+    echo "usage: tools/serve-replay-landing SHA CAPTURE MODEL NEW_RESULTS_DIR [PORT]" >&2
+    exit 2
+fi
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+revision=$(git -C "$repo" rev-parse --verify "$1^{commit}")
+capture=$(realpath -e -- "$2")
+model=$(realpath -e -- "$3")
+[[ -s $capture && -f $model ]]
+mkdir -- "$4"
+out=$(realpath -e -- "$4")
+port=${5:-18081}
+source_tree=$out/source
+git -C "$repo" worktree add --detach "$source_tree" "$revision" >"$out/checkout.log" 2>&1
+trap 'git -C "$repo" worktree remove --force "$source_tree"' EXIT
+printf '%s\n' "$revision" >"$out/revision"
+sha256sum -- "$capture" >"$out/capture.sha256"
+(
+    cd -- "$source_tree"
+    ablac --version
+    ablac build src/main.ab --fast --no-cache -o "$out/abla-grad"
+) >"$out/build.log" 2>&1
+cd -- "$source_tree"
+ABLA_GRAD_BIN="$out/abla-grad" tools/serve-replay "$capture" "$model" --port "$port" --ctx 131072 --max-tokens 512 |
+    tee "$out/requests.md"
+awk -F '|' -v revision="${revision:0:7}" '
+    $2 ~ /^ [0-9]+ / {
+        ++requests
+        total += $8
+        last = $0
+    }
+    END {
+        if (requests != 8) exit 1
+        split(last, columns, "|")
+        if (columns[3] + 0 != 74917) exit 1
+        printf "| `%s` |%s|%s|%s|%s|%s|%s| %.3f |\n", revision,
+            columns[3], columns[4], columns[5], columns[6], columns[7], columns[8], total
+    }
+' "$out/requests.md" | tee "$out/landing-row.md"

@@ -100,6 +100,10 @@ responses and never executes tool calls. Recorded tool results and assistant tur
 and reused-token counts, first raw token and decode rate with client HTTP wall time. It excludes model startup. Set `ABLA_GRAD_BIN` to select a binary. The tool
 uses Bash, curl, jq and ss. Use an outer `tools/gpu-lock.sh -t SECONDS --` when the session needs longer than the default hold.
 
+For a main landing that changes decode, prefill or serving, run `tools/serve-replay-landing SHA CAPTURE MODEL NEW_RESULTS_DIR [PORT]` from the Nix shell.
+It builds the exact landing in a detached worktree, replays the fixed eight-request 75k capture and saves the full table and one comparison row. Record that row
+in `docs/speed.md`. The fixed capture remains local to the benchmark machine.
+
 ## Lossless packing for the Inkling target
 
 The packer checks every FP32 word in each router and loop-controller matrix. It requires every selected word to have zero low 16 bits. An inexact word produces an error identifying its tensor and element before the converter publishes the output. For the pinned UD-Q4_K_M model this saves 70,778,880 bytes across 168 matrices. Abla reads the packed router and controller weights natively. Decode and verification expand each BF16 value exactly inside their FP32 reductions. Prefill keeps its original router and controller reduction order. Loading the original GGUF uses its existing F32 path.

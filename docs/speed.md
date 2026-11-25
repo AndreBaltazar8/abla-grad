@@ -717,3 +717,15 @@ of the chat history. It measures HTTP wall time after model startup, with first 
 
 Reproduce locally with `tools/serve-replay <capture.jsonl> <model.gguf> --ctx 131072 --max-tokens 512`. This run used an ablac 0.2.73 `--fast` build and cached
 CUDA compilation artifacts. The private capture and the capture driver are in `~/archive/abla-grad-serve-replay/`.
+
+### Per-landing replay
+
+Each row uses the same eight chat POST bodies on a fresh model server.
+The prompt, reused and generated counts, first raw token, decode rate
+and HTTP time are for request 8. Session HTTP is the sum of the eight
+request times and excludes model loading. GPU clocks and other system load can affect these single-run comparisons.
+
+| Main landing | Prompt tokens | Reused tokens | Generated tokens | First raw token (s) | Decode (tok/s) | Final HTTP (s) | Session HTTP (s) |
+|:---|---:|---:|---:|---:|---:|---:|---:|
+| `ab55314` | 74917 | 56660 | 202 | 13.820 | 62.11 | 17.073 | 65.086 |
+| `8af8468` | 74917 | 56660 | 202 | 12.943 | 65.74 | 16.016 | 65.097 |
