@@ -111,5 +111,6 @@ extern "C" __global__ void spec_accept_n(unsigned *step, unsigned *spec, unsigne
     step[3] = a;
     step[1] = pos + a + 1;
     spec[6] += a;
+    spec[16 + a] += 1;  // histogram of the accepted count (the host derives the tokens per cycle of every smaller n-max from it)
 }
 """

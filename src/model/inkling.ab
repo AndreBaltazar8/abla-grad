@@ -748,3 +748,18 @@ private trusted fun InklingModel.readIds(var backend: Backend, ids: int): array<
     host.close()
     out
 }
+
+// The device's cumulative histogram of accepted proposals (spec words 16..20; a cycle that accepted a proposals adds one to word 16 + a).
+trusted fun InklingModel.readSpecHist(var backend: Backend, spec: DeviceBuffer): array<int>? {
+    val host = nativeByteBuffer(32)
+    val address = nativePointerAddress(host.address)
+    if (!backend.download(spec, 64, address, 20)) {
+        inklingError = "downloading the acceptance histogram failed"
+        host.close()
+        return null
+    }
+    val out: array<int> = []
+    for (i in 0 until 5) out.append(ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * i)))
+    host.close()
+    out
+}

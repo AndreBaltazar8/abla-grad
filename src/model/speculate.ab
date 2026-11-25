@@ -2,6 +2,8 @@
 // greedy acceptance, history commit) and, when `adaptive`, the plain decode graph whenever it is faster for the text at hand. Used by `generate` and
 // `spec-check`. Greedy only: a proposal is accepted when it is the target's argmax, so the output is the plain greedy output up to numerical near-ties.
 import "abla/process/time"
+import "abla/io"
+import "abla/float/text"
 import "abla/float"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
@@ -32,10 +34,10 @@ private val SPEC_BATCH_TOKENS_RUN = 32
 private val SPEC_EXACT_WINDOW = 1025
 
 private trusted fun specZero(var backend: Backend, spec: DeviceBuffer): bool {
-    val host = nativeByteBuffer(72)
+    val host = nativeByteBuffer(136)
     val address = nativePointerAddress(host.address)
-    for (i in 0 until 16) ablaUnsafeStoreU32(nativePointerFromAddress(address + 4 * i), 0)
-    val ok = backend.upload(spec, 0, address, 64)
+    for (i in 0 until 32) ablaUnsafeStoreU32(nativePointerFromAddress(address + 4 * i), 0)
+    val ok = backend.upload(spec, 0, address, 128)
     host.close()
     ok
 }
@@ -64,7 +66,7 @@ fun speculativeGenerate(
         speculateError = inklingPrefillLastError()
         return false
     }
-    val spec = backend.allocate(64)
+    val spec = backend.allocate(128)
     if (spec == null || !specZero(backend, spec)) {
         speculateError = "device memory for the speculation state is not available"
         return false
@@ -125,31 +127,41 @@ fun speculativeGenerate(
     var position = length
     var logged = length
     // Arms: 0 = the plain graph, 1 = cycle with 2 proposals, 2 = 3 proposals, 3 = 4 proposals. Without `adaptive` the top arm runs alone. The controller
-    // keeps a smoothed tokens/s per arm: a sweep visits every arm once (a batch to warm it up, a batch to measure), then the best arm runs and one of its
-    // neighbours is probed every few hundred tokens.
+    // scores every arm in tokens/s from two stable costs and one text-dependent quantity: seconds per plain token (tp) and per cycle of each arm (tc, they do
+    // not depend on the text), and the tokens per cycle, which the device's histogram of accepted proposals gives: a cycle with n proposals accepts
+    // min(a, n) of the proposals a cycle with more proposals would have accepted, so one histogram from the top arm prices every smaller arm.
     val arms = if (maxProposals >= 4) 4 else if (maxProposals >= 3) 3 else 2
-    val rate: array<f64> = [0.0, 0.0, 0.0, 0.0]
-    var arm = if (adaptive) 0 else arms - 1
-    var best = arm
+    val top = arms - 1
+    val tc: array<f64> = [0.0, 0.0, 0.0, 0.0]
+    var tp = 0.0
+    val hist: array<f64> = []
+    for (i in 0 until 20) hist.append(0.0)
+    val histTick: array<int> = [0, 0, 0, 0]
+    val deviceHist: array<int> = [0, 0, 0, 0, 0]
+    var tick = 0
+    var arm = if (adaptive) 0 else top
     var sweeping = adaptive
-    var probing = false
-    var warm = true
-    var sinceProbe = 0
-    var probeRound = 0
+    var refreshing = false
+    var batchesOnArm = 0
+    var sinceRefresh = 0
+    var refreshEvery = 64
+    var armBeforeRefresh = 0
     val started = monotonicNanoseconds()
     while (produced < maxTokens) {
         val before = position
+        val warm = batchesOnArm == 0
+        val small = sweeping || refreshing || warm
         val t0 = monotonicNanoseconds()
+        var batchCycles = 0
         if (arm == 0) {
-            if (!model.replayMany(backend, plain, specBound(if (sweeping || probing || warm) SPEC_BATCH_TOKENS else SPEC_BATCH_TOKENS_RUN, maxTokens - produced))) {
+            if (!model.replayMany(backend, plain, specBound(if (small) SPEC_BATCH_TOKENS else SPEC_BATCH_TOKENS_RUN, maxTokens - produced))) {
                 speculateError = inklingLastError()
                 return false
             }
         } else {
-            val batchCycles = specBound(if (sweeping || probing || warm) SPEC_BATCH_CYCLES else SPEC_BATCH_CYCLES_RUN, (maxTokens - produced + 2) / 3)
+            batchCycles = specBound(if (small) SPEC_BATCH_CYCLES else SPEC_BATCH_CYCLES_RUN, (maxTokens - produced + 2) / 3)
             for (b in 0 until batchCycles) {
-                val replayed = if (arm == 1) backend.replay(cycle2) else if (arm == 2) replayOptional(backend, cycle3)
-                    else replayOptional(backend, cycle4)
+                val replayed = if (arm == 1) backend.replay(cycle2) else if (arm == 2) replayOptional(backend, cycle3) else replayOptional(backend, cycle4)
                 if (!replayed) {
                     speculateError = "replaying a cycle failed"
                     return false
@@ -168,7 +180,6 @@ fun speculativeGenerate(
         }
         position = now
         val seconds = f64FromInt(monotonicNanoseconds() - t0) / 1000000000.0
-        val measured = f64FromInt(position - before) / seconds
         if (arm == 0) stats.plainTokens = stats.plainTokens + (position - before) else stats.cycleTokens = stats.cycleTokens + (position - before)
         // hand the new tokens to the caller: log[logged .. position)
         val fresh = model.readLog(backend, logged, position - logged)
@@ -190,36 +201,58 @@ fun speculativeGenerate(
             }
         }
         if (!adaptive) continue
+        // learn: costs (not from the warm-up batch) and the accepted-proposal histogram
+        tick = tick + 1
+        if (arm == 0) {
+            if (!warm && position > before) tp = if (tp == 0.0) seconds / f64FromInt(position - before) else 0.5 * tp + 0.5 * seconds / f64FromInt(position - before)
+        } else {
+            if (!warm && batchCycles > 0) tc[arm] = if (tc[arm] == 0.0) seconds / f64FromInt(batchCycles) else 0.5 * tc[arm] + 0.5 * seconds / f64FromInt(batchCycles)
+            val words = model.readSpecHist(backend, spec)
+            if (words == null) {
+                speculateError = inklingLastError()
+                return false
+            }
+            for (a in 0 until 5) {
+                hist[arm * 5 + a] = hist[arm * 5 + a] * 0.97 + f64FromInt(words[a] - deviceHist[a])
+                deviceHist[a] = words[a]
+            }
+            histTick[arm] = tick
+        }
+        batchesOnArm = batchesOnArm + 1
+        // choose the next arm
         var next = arm
-        if (!warm) {
-            rate[arm] = if (rate[arm] == 0.0) measured else 0.5 * rate[arm] + 0.5 * measured
-            if (sweeping) {
-                if (arm < arms - 1) {
+        sinceRefresh = sinceRefresh + (position - before)
+        if (sweeping) {
+            // plain and every cycle arm once (a warm-up batch and a measured one); the top arm runs longer to fill the histogram
+            val need = if (arm == top) 6 else 2
+            if (batchesOnArm >= need) {
+                if (arm < top) {
                     next = arm + 1
                 } else {
                     sweeping = false
-                    for (a in 0 until arms) if (rate[a] > rate[best]) best = a
-                    next = best
-                    sinceProbe = 0
+                    next = specBest(arms, tp, tc, hist, histTick)
+                    sinceRefresh = 0
                 }
-            } else if (probing) {
-                probing = false
-                if (rate[arm] > rate[best] * 1.03) best = arm
-                next = best
-                sinceProbe = 0
-            } else {
-                sinceProbe = sinceProbe + (position - before)
-                if (sinceProbe >= 384) {
-                    probeRound = probeRound + 1
-                    var candidate = if (probeRound % 2 == 1) best + 1 else best - 1
-                    if (candidate >= arms || candidate < 0) candidate = if (best + 1 < arms) best + 1 else best - 1
-                    if (candidate >= 0 && candidate < arms && candidate != best) {
-                        next = candidate
-                        probing = true
-                        rate[candidate] = 0.0
-                    }
-                    sinceProbe = 0
-                }
+            }
+        } else if (refreshing) {
+            if (batchesOnArm >= 3) {
+                refreshing = false
+                next = specBest(arms, tp, tc, hist, histTick)
+                // a refresh that changed nothing makes the next one rarer; one that changed the arm makes it sooner
+                refreshEvery = if (next == armBeforeRefresh) (if (refreshEvery * 2 > 768) 768 else refreshEvery * 2) else 192
+                sinceRefresh = 0
+            }
+        } else {
+            val best = specBest(arms, tp, tc, hist, histTick)
+            // hysteresis: leaving plain needs 5% more, leaving a cycle arm for plain 10% more, between cycle arms 8%
+            val margin = if (arm == 0) 1.05 else if (best == 0) 1.10 else 1.08
+            if (best != arm && batchesOnArm >= 3 && specScore(best, tp, tc, hist, histTick) > specScore(arm, tp, tc, hist, histTick) * margin) next = best
+            if (next == arm && sinceRefresh >= refreshEvery && arm != top) {
+                armBeforeRefresh = arm
+                // the histogram of the top arm is stale: run it for a few batches
+                next = top
+                refreshing = true
+                sinceRefresh = 0
             }
         }
         if (next != arm) {
@@ -231,14 +264,45 @@ fun speculativeGenerate(
                 }
             }
             stats.switches = stats.switches + 1
-            warm = true
             arm = next
-        } else {
-            warm = false
+            batchesOnArm = 0
         }
     }
     stats.loopNanos = monotonicNanoseconds() - started
     true
+}
+
+// Tokens per second of an arm from the measured costs: plain 1 / tp; a cycle arm with n proposals yields 1 + sum_{j <= n} P(accepted >= j) tokens per cycle, with the
+// probabilities from the freshest histogram of an arm with at least n proposals. 0 when something is not measured yet.
+private fun specScore(arm: int, tp: f64, tc: array<f64>, hist: array<f64>, histTick: array<int>): f64 {
+    if (arm == 0) return if (tp > 0.0) 1.0 / tp else 0.0
+    if (tc[arm] <= 0.0) return 0.0
+    var source = -1
+    for (b in arm until 4) if (histTick[b] > 0 && (source < 0 || histTick[b] > histTick[source])) source = b
+    if (source < 0) return 0.0
+    var total = 0.0
+    for (a in 0 until 5) total = total + hist[source * 5 + a]
+    if (total < 6.0) return 0.0
+    var tokens = 1.0
+    for (j in 1 until arm + 2) {
+        var atLeast = 0.0
+        for (a in j until 5) atLeast = atLeast + hist[source * 5 + a]
+        tokens = tokens + atLeast / total
+    }
+    tokens / tc[arm]
+}
+
+private fun specBest(arms: int, tp: f64, tc: array<f64>, hist: array<f64>, histTick: array<int>): int {
+    var best = 0
+    var bestScore = specScore(0, tp, tc, hist, histTick)
+    for (a in 1 until arms) {
+        val score = specScore(a, tp, tc, hist, histTick)
+        if (score > bestScore * 1.02) {
+            best = a
+            bestScore = score
+        }
+    }
+    best
 }
 
 // Records one speculation cycle with `n` proposals: drafter taps + proposals, an (n + 1)-row verification, greedy acceptance, history commit.

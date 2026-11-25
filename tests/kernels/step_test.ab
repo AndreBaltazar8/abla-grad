@@ -99,7 +99,7 @@ fun run(var backend: Backend): bool {
     for (n in 0 until 5) {
         for (matches in 0 until 5) {
             val spec = uploadWords(backend, [0, 11, 12, 13, 14, n, 0, 0, if (matches >= 1) 11 else 90, if (matches >= 2) 12 else 91, if (matches >= 3) 13 else 92,
-                if (matches >= 4) 14 else 93, 55, 0, 0, 0]) ?? return false
+                if (matches >= 4) 14 else 93, 55, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) ?? return false
             val stepWords = uploadWords(backend, [77, 5, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) ?? return false
             if (!backend.launch("spec_accept_n", kernelArgs().pointer(stepWords).pointer(spec).u32(16), [1])) return false
             val s = downloadWords(backend, stepWords, 20) ?? return false
