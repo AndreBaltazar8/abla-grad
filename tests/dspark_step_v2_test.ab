@@ -1,0 +1,109 @@
+// Real-weight parity for v2 proposal graphs sharing one drafter. The test supplies committed target taps
+// and the preceding accept count, so it can exercise a five-row handoff independently of the verifier.
+import "abla/fs"
+import "abla/integer"
+import "abla/io"
+import "abla/process"
+import "abla/text"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "../src/backend/backend.ab"
+import "../src/backend/cuda.ab"
+import "../src/gguf/reader.ab"
+import "../src/model/dspark.ab"
+import "../src/model/inkling.ab"
+import "../src/model/inkling_config.ab"
+import "kernels/support.ab"
+
+private fun fail(reason: string): int {
+    eprintln("DSpark v2: $reason")
+    1
+}
+
+private fun readIds(path: string): array<int>? {
+    val text = Path(path).readTextResult()
+    if (!text.succeeded) return null
+    val ids: array<int> = []
+    for (line in text.text.split("\n")) {
+        val token = line.trim()
+        if (token != "") ids.append(token.parseInt() ?? return null)
+    }
+    ids
+}
+
+private trusted fun setStep(var backend: Backend, step: DeviceBuffer, anchor: int, pos: int, accepted: int): bool {
+    val host = nativeByteBuffer(16)
+    val address = nativePointerAddress(host.address)
+    ablaUnsafeStoreU32(nativePointerFromAddress(address), anchor)
+    ablaUnsafeStoreU32(nativePointerFromAddress(address + 4), pos)
+    ablaUnsafeStoreU32(nativePointerFromAddress(address + 8), 0)
+    ablaUnsafeStoreU32(nativePointerFromAddress(address + 12), accepted)
+    backend.upload(step, 0, address, 16)
+}
+
+private fun capture(var backend: Backend, target: InklingModel, draft: DsparkDrafter,
+    step: DeviceBuffer, spec: DeviceBuffer, limit: int): Recording? {
+    if (!backend.beginRecording()) return null
+    val ok = draft.pushTapsStep(backend, target.taps, step, layoutV2 = true) &&
+        draft.proposeStep(backend, target, step, spec, layoutV2 = true, proposalLimit = limit)
+    val recording = backend.endRecording()
+    if (!ok) return null
+    return move(recording)
+}
+
+private fun check(var backend: Backend, target: InklingModel, direct: DsparkDrafter,
+    recording: Recording, step: DeviceBuffer, spec: DeviceBuffer, pos: int, anchor: int,
+    accepted: int, count: int): bool {
+    if (!setStep(backend, step, anchor, pos, accepted) || !backend.replay(recording)) return false
+    val out = downloadWords(backend, spec, 16) ?? return false
+    val control = downloadWords(backend, step, 4) ?? return false
+    val host = direct.propose(backend, target, pos, anchor)
+    if (host.size < count || dsparkLastError() != "" || out[0] != anchor || out[5] != count ||
+        control[0] != anchor || control[1] != pos || control[2] != count || control[3] != accepted) return false
+    for (i in 0 until 4) {
+        val expected = if (i < count) host[i] else 0
+        if (out[i + 1] != expected) return false
+    }
+    for (i in 6 until 16) if (out[i] != 100 + i) return false
+    true
+}
+
+fun main: int {
+    if (processArgumentCount() != 3) return fail("usage: dspark_step_v2_test TARGET DRAFT PROMPT.ids")
+    val ids = readIds(processArgument(2)) ?? return fail("reading prompt IDs failed")
+    if (ids.size == 0) return fail("empty prompt")
+    val targetFile = ggufOpen(processArgument(0)) ?? return fail(ggufLastError())
+    val draftFile = ggufOpen(processArgument(1)) ?? return fail(ggufLastError())
+    val config = inklingConfigFrom(targetFile) ?? return fail(inklingConfigLastError())
+    val ctx = ids.size + 13
+    var backend = cudaBackend() ?? return fail(cudaLastError())
+    var target = inklingLoad(backend, targetFile, config, ctx) ?? return fail(inklingLastError())
+    val graph = dsparkLoad(backend, draftFile, ctx, 4) ?? return fail(dsparkLastError())
+    val direct = dsparkLoad(backend, draftFile, ctx, 4) ?? return fail(dsparkLastError())
+    if (!target.reset(backend) || !target.enableTaps(backend)) return fail(inklingLastError())
+    target.useStep = true
+    val extra = [68014, 40, 23064, 11, 0, 15, 11, 0, 202, 25, 5, 108]
+    for (p in 0 until ids.size + extra.size) {
+        val token = if (p < ids.size) ids[p] else extra[p - ids.size]
+        if (token < 0 || token >= config.nVocab || !target.forward(backend, token, p)) return fail(inklingLastError())
+    }
+    val step = uploadWords(backend, [0, 0, 0, 0]) ?? return fail(cudaLastError())
+    val spec = uploadWords(backend, [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115]) ??
+        return fail(cudaLastError())
+    val p = ids.size
+    if (!direct.pushTaps(backend, target.taps, 0, p) || !graph.resume(backend, target.taps, p)) return fail(dsparkLastError())
+    val four = capture(backend, target, graph, step, spec, 4) ?? return fail("capture n=4: ${cudaLastError()}")
+    val two = capture(backend, target, graph, step, spec, 2) ?? return fail("capture n=2: ${cudaLastError()}")
+    val three = capture(backend, target, graph, step, spec, 3) ?? return fail("capture n=3: ${cudaLastError()}")
+    if (!check(backend, target, direct, four, step, spec, p, extra[0], 0, 4)) return fail("four initial proposals disagree")
+
+    // A two-proposal graph must still inject all five rows after the preceding four-proposal graph accepted all four.
+    if (!direct.pushTaps(backend, target.taps, p, 5) ||
+        !check(backend, target, direct, two, step, spec, p + 5, extra[5], 4, 2)) return fail("five-row handoff to n=2 disagrees")
+    if (!direct.pushTaps(backend, target.taps, p + 5, 4) ||
+        !check(backend, target, direct, three, step, spec, p + 9, extra[9], 3, 3)) return fail("four-row handoff to n=3 disagrees")
+    if (!direct.pushTaps(backend, target.taps, p + 9, 2) ||
+        !check(backend, target, direct, four, step, spec, p + 11, extra[11], 1, 1)) return fail("n=4 padding at capacity disagrees")
+    println("DSpark v2 n-max 4/2/3/4 matches the host drafter after 0/5/4/2 committed taps, including context padding")
+    0
+}

@@ -19,13 +19,13 @@ private var dsparkError = ""
 
 fun dsparkLastError(): string = dsparkError
 
-private fun dsparkScratch(): ScratchMap {
+private fun dsparkScratch(maxProposals: int): ScratchMap {
     val offsets: Map<string, int> = Map()
     var total = 0
     val widths = [dsparkWidth * DSPARK_BLOCK, dsparkWidth * dsparkBatchRows, dsparkQuery * DSPARK_BLOCK,
         dsparkKv * dsparkBatchRows, dsparkKv * dsparkBatchRows, DSPARK_FFN * DSPARK_BLOCK,
         DSPARK_FFN * DSPARK_BLOCK, 2 * (DSPARK_RANK + dsparkWidth), 3 * DSPARK_RANK, DSPARK_RANK,
-        2 * DSPARK_VOCAB, DSPARK_VOCAB, 1, 1]
+        maxProposals * DSPARK_VOCAB, DSPARK_VOCAB, 1, 1]
     val names = ["x", "norm", "q", "k", "v", "gate", "up", "joint", "projected", "latent", "base", "delta", "id", "cursor"]
     for (i in 0 until names.size) {
         offsets.set(names[i], total)
@@ -67,7 +67,7 @@ fun dsparkLoad(var backend: Backend, file: GgufFile, maxCtx: int, maxProposals: 
         dsparkError = weightsLastError()
         return null
     }
-    val layout = dsparkScratch()
+    val layout = dsparkScratch(maxProposals)
     val cacheBytes = DSPARK_LAYERS * (maxCtx + DSPARK_BLOCK - 1) * dsparkKv * 4
     dsparkError = "allocating DSpark scratch or KV failed"
     val scratch = backend.allocate(layout.total) ?? return null
@@ -221,12 +221,12 @@ trusted fun DsparkDrafter.resume(var backend: Backend, taps: DeviceBuffer, p: in
 }
 
 private fun DsparkDrafter.mixStep(var backend: Backend, taps: DeviceBuffer, step: DeviceBuffer,
-    mix: string, norm: string, limit: int, lastOnly: bool): bool {
+    mix: string, norm: string, limit: int, capacity: int, lastOnly: bool): bool {
     val dst = this.o("norm")
-    val rows = if (lastOnly) 1 else 3
+    val rows = if (lastOnly) 1 else capacity
     backend.launch("dspark_mix_step", kernelArgs().pointer(taps).pointer(this.arena, this.w(mix).offset)
         .pointer(this.scratch, dst).pointer(step).pointer(this.scratch, this.o("cursor")).u32(dsparkWidth)
-        .u32(limit).u32(if (lastOnly) 1 else 0), [dsparkWidth * rows]) &&
+        .u32(limit).u32(capacity).u32(if (lastOnly) 1 else 0), [dsparkWidth * rows]) &&
         this.norm(backend, norm, dst, dst, dsparkWidth, rows)
 }
 
@@ -236,34 +236,34 @@ private fun DsparkDrafter.rotateStep(var backend: Backend, offset: int, position
         .u32(heads).u32(DSPARK_HEAD_DIM).u32(rows).f32(this.config.ropeBase).u32(this.maxCtx),
         [heads * (DSPARK_HEAD_DIM / 2) * rows])
 
-private fun DsparkDrafter.storeKvStep(var backend: Backend, layer: int, step: DeviceBuffer, limit: int, blockRows: int): bool {
+private fun DsparkDrafter.storeKvStep(var backend: Backend, layer: int, step: DeviceBuffer, limit: int, rows: int, block: bool): bool {
     val cache = this.cacheOffset(layer)
-    val rows = if (blockRows > 0) blockRows else 3
     backend.launch("dspark_kv_step", kernelArgs().pointer(this.scratch, this.o("k")).pointer(this.scratch, this.o("v"))
         .pointer(this.kCache, cache).pointer(this.vCache, cache).pointer(step).pointer(this.scratch, this.o("cursor"))
-        .u32(DSPARK_HEAD_DIM).u32(dsparkKv).u32(this.cacheCtx()).u32(limit).u32(blockRows), [dsparkKv, rows])
+        .u32(DSPARK_HEAD_DIM).u32(dsparkKv).u32(this.cacheCtx()).u32(limit).u32(rows).u32(if (block) 1 else 0), [dsparkKv, rows])
 }
 
-/** Appends the accepted cycle's taps using the device cursor and step[1,3]. A seeded first replay appends zero rows. */
-fun DsparkDrafter.pushTapsStep(var backend: Backend, taps: DeviceBuffer, step: DeviceBuffer): bool {
+/** Appends committed taps using the device cursor and step[1], step[3]. Layout v2 accepts a preceding cycle of up to five rows. */
+fun DsparkDrafter.pushTapsStep(var backend: Backend, taps: DeviceBuffer, step: DeviceBuffer, layoutV2: bool = false): bool {
     if (step.bytes < 16 || taps.bytes < DSPARK_TAP_BYTES) return false
     val available = taps.bytes / DSPARK_TAP_BYTES
     val limit = if (available < this.maxCtx) available else this.maxCtx
+    val rows = if (layoutV2) 5 else 3
     val k = this.o("k")
     val norm = this.o("norm")
     for (layer in 0 until DSPARK_LAYERS) {
         val prefix = "blk.$layer"
-        if (!this.mixStep(backend, taps, step, "$prefix.ctx_mix.weight", "$prefix.ctx_norm.weight", limit, false) ||
-            !this.dense(backend, "$prefix.attn_k_ctx.weight", norm, k, 3) ||
-            !this.dense(backend, "$prefix.attn_v_ctx.weight", norm, this.o("v"), 3) ||
-            !this.norm(backend, "$prefix.attn_k_ctx_norm.weight", k, k, DSPARK_HEAD_DIM, 3 * DSPARK_KV_HEADS) ||
-            !this.rotateStep(backend, k, this.scratch, this.o("cursor"), DSPARK_KV_HEADS, 3) ||
-            !this.storeKvStep(backend, layer, step, limit, 0)) return false
+        if (!this.mixStep(backend, taps, step, "$prefix.ctx_mix.weight", "$prefix.ctx_norm.weight", limit, rows, false) ||
+            !this.projectRows(backend, this.arena, this.w("$prefix.attn_k_ctx.weight"), dsparkKv, norm, k, rows) ||
+            !this.projectRows(backend, this.arena, this.w("$prefix.attn_v_ctx.weight"), dsparkKv, norm, this.o("v"), rows) ||
+            !this.norm(backend, "$prefix.attn_k_ctx_norm.weight", k, k, DSPARK_HEAD_DIM, rows * DSPARK_KV_HEADS) ||
+            !this.rotateStep(backend, k, this.scratch, this.o("cursor"), DSPARK_KV_HEADS, rows) ||
+            !this.storeKvStep(backend, layer, step, limit, rows, false)) return false
     }
-    this.mixStep(backend, taps, step, "markov_ctx_mix.weight", "markov_ctx_norm.weight", limit, true) &&
+    this.mixStep(backend, taps, step, "markov_ctx_mix.weight", "markov_ctx_norm.weight", limit, rows, true) &&
         backend.launch("dspark_commit_taps_step", kernelArgs().pointer(this.scratch, norm)
             .pointer(this.scratch, this.o("joint") + dsparkHiddenContext).pointer(step)
-            .pointer(this.scratch, this.o("cursor")).u32(dsparkWidth).u32(limit), [1])
+            .pointer(this.scratch, this.o("cursor")).u32(dsparkWidth).u32(limit).u32(rows), [1])
 }
 
 private fun DsparkDrafter.attention(var backend: Backend, layer: int, anchor: int, step: DeviceBuffer?): bool {
@@ -275,7 +275,7 @@ private fun DsparkDrafter.attention(var backend: Backend, layer: int, anchor: in
     val cache = this.cacheOffset(layer)
     val scale: f32 = 0.08838834764831845
     if (step != null) {
-        return this.storeKvStep(backend, layer, step, this.maxCtx, rows) &&
+        return this.storeKvStep(backend, layer, step, this.maxCtx, rows, true) &&
             backend.launch("dspark_attention_step", kernelArgs().pointer(this.scratch, q).pointer(this.kCache, cache)
                 .pointer(this.vCache, cache).pointer(this.scratch, norm).pointer(step).u32(DSPARK_HEADS)
                 .u32(DSPARK_KV_HEADS).u32(DSPARK_HEAD_DIM).u32(rows).u32(this.cacheCtx()).u32(window).f32(scale),
@@ -399,19 +399,28 @@ private fun DsparkDrafter.gatherStep(var backend: Backend, arena: DeviceBuffer, 
     backend.launch("dspark_gather_step", args.u32(if (weight.type == GGML_TYPE_BF16) 1 else 0), [weight.cols])
 }
 
-/** Records up to two proposals. Reads [anchor,P] from step and writes [anchor,p1,p2,count] into spec. */
-fun DsparkDrafter.proposeStep(var backend: Backend, target: InklingModel, step: DeviceBuffer, spec: DeviceBuffer): bool {
-    if (this.maxProposals > 2) {
+/** Records fixed-shape proposals. Layout v2 writes IDs in words 0..4 and count in word 5.
+    A proposalLimit of zero uses the drafter's configured limit. */
+fun DsparkDrafter.proposeStep(var backend: Backend, target: InklingModel, step: DeviceBuffer, spec: DeviceBuffer,
+    layoutV2: bool = false, proposalLimit: int = 0): bool {
+    val proposals = if (proposalLimit == 0) this.maxProposals else proposalLimit
+    if (!layoutV2 && proposals > 2) {
         dsparkError = "recorded DSpark supports at most two proposals"
+        return false
+    }
+    if (proposals < (if (layoutV2) 2 else 1) || proposals > this.maxProposals || proposals > 4) {
+        dsparkError = "invalid DSpark recording proposal limit"
         return false
     }
     val embedding = weightOf(target.plan, "token_embd.weight")
     val output = weightOf(target.plan, "output.weight")
-    if (step.bytes < 16 || spec.bytes < 32 || !dsparkTargetShape(target, embedding, output)) return false
+    val specBytes = if (layoutV2) 64 else 32
+    val countIndex = if (layoutV2) 5 else 3
+    if (step.bytes < 16 || spec.bytes < specBytes || !dsparkTargetShape(target, embedding, output)) return false
     val limit = if (this.maxCtx < target.maxCtx) this.maxCtx else target.maxCtx
     val x = this.o("x")
     if (!backend.launch("dspark_begin_step", kernelArgs().pointer(step).pointer(spec).pointer(this.scratch, this.o("cursor"))
-            .u32(limit).u32(this.config.maxPositions - DSPARK_BLOCK).u32(DSPARK_VOCAB).u32(this.maxProposals), [1]) ||
+            .u32(limit).u32(this.config.maxPositions - DSPARK_BLOCK).u32(DSPARK_VOCAB).u32(proposals).u32(countIndex), [1]) ||
         !backend.fork(1)) return false
     // Only the backbone needs the normalized anchor and mask rows. Start the Markov state and embedding independently.
     val markov = this.w("markov_w1.weight")
@@ -422,14 +431,16 @@ fun DsparkDrafter.proposeStep(var backend: Backend, target: InklingModel, step: 
         this.gatherStep(backend, this.arena, markov, spec, 0, previous)
     if (!backend.join() || !ok || !this.block(backend, 0, step) || !backend.fork(1)) return false
 
-    // Project both base rows in one pass over the shared lm_head. Only the correction for row two depends on the first sampled ID.
+    // Project all base rows in one shared lm_head pass. Later corrections depend on the preceding sampled ID.
     val base = this.o("base")
-    ok = this.projectRows(backend, target.arena, output, DSPARK_VOCAB, x + dsparkWidth * 4, base, this.maxProposals) &&
+    ok = this.projectRows(backend, target.arena, output, DSPARK_VOCAB, x + dsparkWidth * 4, base, proposals) &&
         backend.branch(1) && this.markovDelta(backend, 1)
     if (!backend.join() || !ok || !this.pick(backend, base, spec, 4)) return false
-    if (this.maxProposals == 2 && (!this.gatherStep(backend, this.arena, markov, spec, 4, previous) ||
-        !this.markovDelta(backend, 2) || !this.pick(backend, base + DSPARK_VOCAB * 4, spec, 8))) return false
-    backend.launch("dspark_pad_step", kernelArgs().pointer(spec), [1])
+    for (row in 2 until proposals + 1) {
+        if (!this.gatherStep(backend, this.arena, markov, spec, (row - 1) * 4, previous) ||
+            !this.markovDelta(backend, row) || !this.pick(backend, base + (row - 1) * DSPARK_VOCAB * 4, spec, row * 4)) return false
+    }
+    backend.launch("dspark_pad_step", kernelArgs().pointer(spec).u32(countIndex), [1])
 }
 
 /** Returns up to the configured number of greedy proposals. ctxLen is the anchor position. */

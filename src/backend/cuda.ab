@@ -622,35 +622,45 @@ private fun cudaDsparkMixShape(args: KernelArgs, problem: array<int>): bool =
 private fun cudaDsparkMarkovShape(args: KernelArgs, problem: array<int>): bool = args.words[4] == problem[0]
 private fun cudaDsparkZeroShape(args: KernelArgs, problem: array<int>): bool = args.words[1] == problem[0]
 
+private fun cudaDsparkTapRows(rows: int): bool = rows == 3 || rows == 5
 private fun cudaDsparkMixStepShape(args: KernelArgs, problem: array<int>): bool =
-    args.words[7] <= 1 && args.words[5] * (if (args.words[7] == 1) 1 else 3) == problem[0]
+    cudaDsparkTapRows(args.words[7]) && args.words[8] <= 1 &&
+        args.words[5] * (if (args.words[8] == 1) 1 else args.words[7]) == problem[0]
+private fun cudaDsparkCommitTapShape(args: KernelArgs, problem: array<int>): bool =
+    cudaStepAdvanceShape(args, problem) && cudaDsparkTapRows(args.words[6])
 private fun cudaDsparkRopeStepShape(args: KernelArgs, problem: array<int>): bool =
     args.words[3] > 0 && args.words[3] % 2 == 0 && args.words[2] * (args.words[3] / 2) * args.words[4] == problem[0]
 private fun cudaDsparkKvStepShape(args: KernelArgs, problem: array<int>): bool =
-    args.words[6] > 0 && args.words[7] == problem[0] &&
-        (if (args.words[10] > 0) args.words[10] else 3) == problem[1]
+    args.words[6] > 0 && args.words[7] == problem[0] && args.words[10] == problem[1] &&
+        (if (args.words[11] == 1) problem[1] == 8 else args.words[11] == 0 && cudaDsparkTapRows(problem[1]))
 private fun cudaDsparkAttentionStepShape(args: KernelArgs, problem: array<int>): bool =
     cudaAttentionHeadShape(args.words[5], args.words[6], args.words[7], problem[0]) &&
         args.words[8] == problem[1] && args.words[9] >= problem[1]
+private fun cudaDsparkSpecCountIndex(index: int): bool = index == 3 || index == 5
+private fun cudaDsparkBeginShape(args: KernelArgs, problem: array<int>): bool =
+    cudaStepAdvanceShape(args, problem) && cudaDsparkSpecCountIndex(args.words[7]) &&
+        args.words[6] > 0 && args.words[6] < args.words[7]
+private fun cudaDsparkPadShape(args: KernelArgs, problem: array<int>): bool =
+    cudaStepAdvanceShape(args, problem) && cudaDsparkSpecCountIndex(args.words[1])
 
 private val cudaDsparkKernels = [
     CudaKernelSpec("dspark_mix_step", kernelDsparkMixStep, 256, 256,
-        [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU], cudaDsparkMixStepShape),
+        [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgU], cudaDsparkMixStepShape),
     CudaKernelSpec("dspark_commit_taps_step", kernelDsparkCommitTapsStep, 1, 256,
-        [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU], cudaStepAdvanceShape),
+        [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU], cudaDsparkCommitTapShape),
     CudaKernelSpec("dspark_rope_step", kernelDsparkRopeStep, 128, 128,
         [prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgF, prefillArgU], cudaDsparkRopeStepShape),
     CudaKernelSpec("dspark_kv_step", kernelDsparkKvStep, 256, 256,
         [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP,
-            prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgU], cudaDsparkKvStepShape, 2),
+            prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgU], cudaDsparkKvStepShape, 2),
     CudaKernelSpec("dspark_attention_step", kernelDsparkAttentionStep, 1, 256,
         [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU,
             prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgF], cudaDsparkAttentionStepShape, 2),
     CudaKernelSpec("dspark_gather_step", kernelDsparkGatherStep, 128, 128,
         [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU], cudaGatherShape),
     CudaKernelSpec("dspark_begin_step", kernelDsparkSpecStep, 1, 1,
-        [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgU], cudaStepAdvanceShape),
-    CudaKernelSpec("dspark_pad_step", kernelDsparkSpecStep, 1, 1, [prefillArgP], cudaStepAdvanceShape),
+        [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgU], cudaDsparkBeginShape),
+    CudaKernelSpec("dspark_pad_step", kernelDsparkSpecStep, 1, 1, [prefillArgP, prefillArgU], cudaDsparkPadShape),
     CudaKernelSpec("dspark_mix", kernelDsparkMix, 256, 256,
         [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32], cudaDsparkMixShape),
     CudaKernelSpec("dspark_markov", kernelDsparkMarkov, 256, 256,

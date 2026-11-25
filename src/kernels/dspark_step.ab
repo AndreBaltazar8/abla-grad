@@ -3,10 +3,11 @@ import "attention_decode.ab"
 // [step] is [anchor, P, proposal count, accepted count]. cursor is the number
 // of tap rows already injected. A replay following the seed injects no rows.
 private val dsparkTapRange = """
-static __device__ __forceinline__ unsigned tap_rows(const unsigned *step, const unsigned *cursor, unsigned limit) {
+static __device__ __forceinline__ unsigned tap_rows(const unsigned *step, const unsigned *cursor,
+    unsigned limit, unsigned capacity) {
     const unsigned p = step[1];
     const unsigned first = *cursor;
-    if (p <= first || p > limit || step[3] > 2 || p - first != step[3] + 1)
+    if (p <= first || p > limit || step[3] >= capacity || p - first != step[3] + 1)
         return 0;
     return p - first;
 }
@@ -14,11 +15,11 @@ static __device__ __forceinline__ unsigned tap_rows(const unsigned *step, const 
 
 val kernelDsparkMixStep = dsparkTapRange + """
 extern "C" __global__ void dspark_mix_step(const float *taps, const float *alpha, float *out,
-    const unsigned *step, const unsigned *cursor, unsigned width, unsigned limit, unsigned lastOnly) {
+    const unsigned *step, const unsigned *cursor, unsigned width, unsigned limit, unsigned capacity, unsigned lastOnly) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned rows = lastOnly ? 1 : 3;
+    const unsigned rows = lastOnly ? 1 : capacity;
     if (i >= width * rows) return;
-    const unsigned count = tap_rows(step, cursor, limit);
+    const unsigned count = tap_rows(step, cursor, limit, capacity);
     const unsigned row = i / width;
     float value = 0.0f;
     if (row < count) {
@@ -33,9 +34,9 @@ extern "C" __global__ void dspark_mix_step(const float *taps, const float *alpha
 
 val kernelDsparkCommitTapsStep = dsparkTapRange + """
 extern "C" __global__ void dspark_commit_taps_step(const float *mixed, float *context,
-    const unsigned *step, unsigned *cursor, unsigned width, unsigned limit) {
+    const unsigned *step, unsigned *cursor, unsigned width, unsigned limit, unsigned capacity) {
     // One CTA prevents the cursor update from racing a lane's range check.
-    if (!tap_rows(step, cursor, limit)) return;
+    if (!tap_rows(step, cursor, limit, capacity)) return;
     for (unsigned i = threadIdx.x; i < width; i += blockDim.x) context[i] = mixed[i];
     __syncthreads();
     if (threadIdx.x == 0) *cursor = step[1];
@@ -64,13 +65,13 @@ extern "C" __global__ void dspark_rope_step(float *x, const unsigned *first, uns
 val kernelDsparkKvStep = dsparkTapRange + """
 extern "C" __global__ void dspark_kv_step(const float *k, const float *v, float *kc, float *vc,
     const unsigned *step, const unsigned *cursor, unsigned headDim, unsigned kvDim,
-    unsigned cacheCtx, unsigned limit, unsigned blockRows) {
+    unsigned cacheCtx, unsigned limit, unsigned capacity, unsigned block) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned row = blockIdx.y;
-    if (blockRows && step[2] == 0) return;
+    if (block && step[2] == 0) return;
     const unsigned p = step[1];
-    const unsigned first = blockRows ? p : *cursor;
-    const unsigned rows = blockRows ? blockRows : tap_rows(step, cursor, limit);
+    const unsigned first = block ? p : *cursor;
+    const unsigned rows = block ? capacity : tap_rows(step, cursor, limit, capacity);
     if (i >= kvDim || row >= rows || first >= cacheCtx || row >= cacheCtx - first) return;
     const unsigned long long dst = (static_cast<unsigned long long>(i / headDim) * cacheCtx + first + row) * headDim + i % headDim;
     kc[dst] = k[row * kvDim + i];
@@ -105,20 +106,18 @@ extern "C" __global__ void dspark_gather_step(const unsigned char *table, const 
 
 val kernelDsparkSpecStep = """
 extern "C" __global__ void dspark_begin_step(unsigned *step, unsigned *spec, const unsigned *cursor,
-    unsigned maxCtx, unsigned noiseLimit, unsigned nVocab, unsigned maxProposals) {
+    unsigned maxCtx, unsigned noiseLimit, unsigned nVocab, unsigned maxProposals, unsigned countIndex) {
     const unsigned p = step[1];
     const unsigned anchor = step[0];
     const bool inVocab = anchor < nVocab;
     unsigned count = 0;
     if (inVocab && p > 0 && p == *cursor && p < maxCtx && p <= noiseLimit)
         count = min(maxProposals, maxCtx - p - 1);
-    step[2] = spec[3] = count;
+    step[2] = spec[countIndex] = count;
     spec[0] = inVocab ? anchor : 0;
-    spec[1] = spec[2] = 0;
 }
 
-extern "C" __global__ void dspark_pad_step(unsigned *spec) {
-    if (spec[3] < 1) spec[1] = 0;
-    if (spec[3] < 2) spec[2] = 0;
+extern "C" __global__ void dspark_pad_step(unsigned *spec, unsigned countIndex) {
+    for (unsigned i = spec[countIndex] + 1; i < countIndex; ++i) spec[i] = 0;
 }
 """
