@@ -729,3 +729,28 @@ request times and excludes model loading. GPU clocks and other system load can a
 |:---|---:|---:|---:|---:|---:|---:|---:|
 | `ab55314` | 74917 | 56660 | 202 | 13.820 | 62.11 | 17.073 | 65.086 |
 | `8af8468` | 74917 | 56660 | 202 | 12.943 | 65.74 | 16.016 | 65.097 |
+
+### Int8 prefill projection GEMMs
+
+The original 128k trace attributed 20.67 GPU seconds to GEMMs, including
+12.48 s to grouped NVFP4 int8 and 4.24 s to the two Q8_0 dense paths.
+The Q8_0 int8 path reuses three quantized activation packs across the five
+Q/K/V/relative/gate projections and keeps the single combined launch.
+Grouped Q8_0 also uses int8 MMA with 64-token expert tiles.
+
+Matched RTX 4090 prefill throughput on the original Inkling UD-Q4_K_M,
+fixed prompt IDs from the 128k trace, chunk 512, and the v0.2.73 compiler.
+Before and after use the same benchmark source snapshot based on e2a0fdf
+apart from the GEMM changes. Values are medians of three runs at 8k and
+32k and two runs at 128k.
+
+| Prompt tokens | Before tok/s | After tok/s | Change |
+| ---: | ---: | ---: | ---: |
+| 8,192 | 4,499.68 | 4,776.15 | +6.1% |
+| 32,768 | 4,034.44 | 4,152.54 | +2.9% |
+| 131,072 | 2,322.73 | 2,365.08 | +1.8% |
+
+The Inkling prefill gate passed 324 positions and the Llama gate passed
+266, with one argmax difference each and zero outside tolerance. A
+32-token NVFP4 int8 tile reduced 8k throughput to 4,174.27 tok/s, so the
+default remains 64.
