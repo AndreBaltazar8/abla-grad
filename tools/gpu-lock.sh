@@ -15,6 +15,8 @@ while [[ ${1:-} == -* ]]; do
     esac
 done
 [[ $# -gt 0 ]] || { echo "usage: tools/gpu-lock.sh [-t hold-seconds] [-w wait-seconds] -- command..." >&2; exit 2; }
+# Already inside a hold (a script run under this wrapper calls it again): just run, never wait for our own lock.
+if [[ -n ${ABLA_GRAD_GPU_LOCK_HELD:-} ]]; then exec timeout -k 10 "$hold" "$@"; fi
 lock=${ABLA_GRAD_GPU_LOCK:-/tmp/abla-grad-gpu.lock}
 need=${ABLA_GRAD_GPU_FREE_MIB:-20000}
 exec 9>"$lock"
@@ -26,4 +28,4 @@ while true; do
     ((SECONDS < deadline)) || { echo "gpu-lock: only ${used} MiB free after ${wait}s (a process outside the lock holds the card)" >&2; exit 75; }
     sleep 5
 done
-timeout -k 10 "$hold" "$@"
+ABLA_GRAD_GPU_LOCK_HELD=1 timeout -k 10 "$hold" "$@"
