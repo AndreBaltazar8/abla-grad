@@ -612,7 +612,7 @@ private fun InklingModel.convRows(var backend: Backend, ws: PrefillWorkspace, in
 
 private fun InklingModel.grouped(var backend: Backend, ws: PrefillWorkspace, kind: string, wOffset: int, x: int, xmap: int, y: int, useScales: bool, scalesOffset: int,
     plan: int, rows: int, cols: int, nExpert: int, stride: int, maxTiles: int, xRows: int = 0, quantName: string = "A"): bool {
-    if (kind == "nvfp4" && prefillInt8Experts && xRows > 0 && cols % 32 == 0) {
+    if (kind == "nvfp4" && prefillInt8Experts && prefillMoeTile == 64 && xRows > 0 && cols % 32 == 0) {
         // int8: quantize the f32 rows once (the kernel gathers rows through xmap), then the s8 grouped matmul
         val qx = ws.o("qx" + quantName)
         val sx = ws.o("sx" + quantName)
