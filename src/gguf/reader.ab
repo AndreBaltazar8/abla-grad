@@ -152,21 +152,29 @@ private fun ggufReadTensor(var cursor: GgufCursor, alignment: int): GgufTensorIn
 private fun ggufPadding(offset: int, alignment: int): int =
     (alignment - offset % alignment) % alignment
 
+// Release exactly the range returned by ggufOpen's successful mmap. The caller
+// either owns the live mapping or is cleaning up a parse failure before publishing it.
+private trusted fun ggufUnmap(address: int, size: int): void {
+    val ignored = linuxSyscall2(11, address, size)
+}
+
+// Only the reader can construct a mapping from a raw address and length.
+private class GgufMapping(val address: int, val size: int, var closed: bool = false)
+
 // Owns a read-only mapping. The underlying file must remain unchanged until
 // close. Keep the file alive through every upload from tensorAddress.
 resource class GgufFile(
-    val ggufAddress: int, val ggufSize: int, val ggufVersion: int, val ggufDataStart: int,
+    val ggufMapping: GgufMapping, val ggufVersion: int, val ggufDataStart: int,
     val ggufFields: array<GgufMetadata>, val ggufKeys: Map<string, int>,
-    val ggufTensors: array<GgufTensorInfo>, val ggufNames: Map<string, int>,
-    var ggufClosed: bool = false
+    val ggufTensors: array<GgufTensorInfo>, val ggufNames: Map<string, int>
 ) {
     fun drop(): void { this.close() }
 
     // Releases the mapping. Calling close again is harmless.
     fun close(): void {
-        if (this.ggufClosed) return
-        linuxSyscall2(11, this.ggufAddress, this.ggufSize)
-        this.ggufClosed = true
+        if (this.ggufMapping.closed) return
+        ggufUnmap(this.ggufMapping.address, this.ggufMapping.size)
+        this.ggufMapping.closed = true
     }
 
     // GGUF wire version.
@@ -200,10 +208,10 @@ resource class GgufFile(
 
     // Returns a bounded address from this file until close, otherwise zero.
     fun tensorAddress(tensor: GgufTensorInfo): int {
-        if (this.ggufClosed) return 0
+        if (this.ggufMapping.closed) return 0
         val entry = this.tensor(tensor.name)
         if (entry == null || entry != tensor) return 0
-        this.ggufAddress + this.ggufDataStart + entry.offset
+        this.ggufMapping.address + this.ggufDataStart + entry.offset
     }
 
     // Returns the string metadata or null on missing key, wrong type or close.
@@ -284,14 +292,14 @@ resource class GgufFile(
 }
 
 private fun GgufFile.ggufField(key: string): GgufMetadata? {
-    if (this.ggufClosed) return null
+    if (this.ggufMapping.closed) return null
     val index = this.ggufKeys.get(key)
     if (index == null) return null
     this.ggufFields[index]
 }
 
 private fun GgufFile.ggufAt(entry: GgufMetadata): GgufCursor =
-    GgufCursor(this.ggufAddress, this.ggufDataStart, entry.offset)
+    GgufCursor(this.ggufMapping.address, this.ggufDataStart, entry.offset)
 
 private fun ggufFail(message: string): GgufFile? {
     ggufError = message
@@ -358,7 +366,7 @@ private fun ggufParse(address: int, size: int): GgufFile? {
         if (pad > ggufMaxInt - end) return ggufFail("GGUF data padding overflows")
         next = end + pad
     }
-    GgufFile(address, size, version, dataStart, fields, keys, tensors, names)
+    GgufFile(GgufMapping(address, size), version, dataStart, fields, keys, tensors, names)
 }
 
 // Opens a regular x86-64 Linux GGUF using a read-only private mapping.
@@ -390,6 +398,6 @@ trusted fun ggufOpen(path: string): GgufFile? {
     linuxSyscall1(3, fd)
     if (address < 0) return ggufFail("could not mmap GGUF '$path' (errno ${-address})")
     val model = ggufParse(address, size)
-    if (model == null) linuxSyscall2(11, address, size)
+    if (model == null) ggufUnmap(address, size)
     model
 }

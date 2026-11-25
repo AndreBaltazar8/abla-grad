@@ -2,6 +2,8 @@
 // Implementations: CudaBackend (src/backend/cuda.ab, ablac-e7), later Vulkan, CPU, Metal. Nothing above this file imports an extern.
 import "abla/float"
 import "abla/process"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
 
 // How one kernel parameter is packed. Pointers and 64-bit values take 8 bytes (aligned to 8), 32-bit values 4 (aligned to 4),
 // as CUDA's parameter buffer and Vulkan push constants both want it.
@@ -90,6 +92,16 @@ interface Backend {
     // Called by DeviceBuffer.drop only.
     fun release(handle: int, bytes: int): void
 }
+
+// These copies borrow the start of a live, owned host buffer only for the call.
+// The backend checks the device range and completes the host-memory access before returning.
+trusted fun uploadFrom(backend: Backend, destination: DeviceBuffer, offset: int, host: NativeByteBuffer, bytes: int): bool =
+    !host.closed && bytes >= 0 && bytes <= host.capacity &&
+        backend.upload(destination, offset, nativePointerAddress(host.address), bytes)
+
+trusted fun downloadInto(backend: Backend, source: DeviceBuffer, offset: int, host: NativeByteBuffer, bytes: int): bool =
+    !host.closed && bytes >= 0 && bytes <= host.capacity &&
+        backend.download(source, offset, nativePointerAddress(host.address), bytes)
 
 // A recorded sequence of launches that can be replayed with one call (a CUDA graph; for other backends a list of launches). Recording captures what `launch`
 // is asked to do between `beginRecording` and `endRecording`: nothing runs while recording. Everything a replay needs that changes from run to run

@@ -6,6 +6,7 @@ import "abla/integer"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 import "abla/process/time"
+import "abla/process"
 import "abla/float"
 import "abla/math"
 import "abla/float/text"
@@ -187,9 +188,15 @@ fun cmdPrefillBench(args: array<string>): int {
     0
 }
 
-private trusted fun storeWord(address: int, index: int, value: int): void = ablaUnsafeStoreU32(nativePointerFromAddress(address + 4 * index), value)
+private trusted fun storeWord(host: NativeByteBuffer, index: int, value: int): void {
+    if (host.closed || index < 0 || index >= host.capacity / 4) panic("verify word outside host buffer")
+    ablaUnsafeStoreU32(host.pointerAt(4 * index), value)
+}
 
-private trusted fun loadWord(address: int, index: int): int = ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * index))
+private trusted fun loadWord(host: NativeByteBuffer, index: int): int {
+    if (host.closed || index < 0 || index >= host.capacity / 4) panic("verify word outside host buffer")
+    ablaUnsafeLoadU32(host.pointerAt(4 * index))
+}
 
 private fun maxAbsDifference(a: array<f32>, b: array<f32>): f64 {
     var largest = 0.0
@@ -345,22 +352,21 @@ fun cmdVerifyCheck(args: array<string>): int {
         val spec = backend.allocate(64) ?? return 1
         val step = backend.allocate(64) ?? return 1
         val host = nativeByteBuffer(64)
-        val address = nativePointerAddress(host.address)
-        for (i in 0 until 3) storeWord(address, i, ids[100 + i])
-        storeWord(address, 3, 0)
-        for (i in 4 until 8) storeWord(address, i, 0)
-        if (!backend.upload(spec, 0, address, 32)) return 1
-        for (i in 0 until 8) storeWord(address, i, 0)
-        storeWord(address, 1, 100)
-        storeWord(address, 3, 1)
-        if (!backend.upload(step, 0, address, 32)) return 1
+        for (i in 0 until 3) storeWord(host, i, ids[100 + i])
+        storeWord(host, 3, 0)
+        for (i in 4 until 8) storeWord(host, i, 0)
+        if (!uploadFrom(backend, spec, 0, host, 32)) return 1
+        for (i in 0 until 8) storeWord(host, i, 0)
+        storeWord(host, 1, 100)
+        storeWord(host, 3, 1)
+        if (!uploadFrom(backend, step, 0, host, 32)) return 1
         if (!model.reset(backend) || !model.prefill(backend, wsS, first, 0) || !model.verifyStep(backend, wsS, spec, step)) {
             println("verify-check: verifyStep: ${inklingPrefillLastError()} (${cudaLastError()})")
             return 1
         }
-        if (!backend.download(spec, 0, address, 32)) return 1
+        if (!downloadInto(backend, spec, 0, host, 32)) return 1
         for (row in 0 until 3) {
-            val got = loadWord(address, 4 + row)
+            val got = loadWord(host, 4 + row)
             println("verifyStep row $row argmax $got (reference ${argmaxOf(reference[row])})")
             if (got != argmaxOf(reference[row])) ok = false
         }
@@ -381,22 +387,21 @@ fun cmdVerifyCheck(args: array<string>): int {
         val spec5 = backend.allocate(64) ?? return 1
         val step5 = backend.allocate(64) ?? return 1
         val host5 = nativeByteBuffer(64)
-        val a5 = nativePointerAddress(host5.address)
-        for (i in 0 until 16) storeWord(a5, i, 0)
-        for (i in 0 until 5) storeWord(a5, i, ids[100 + i])
-        storeWord(a5, 5, 4)
-        if (!backend.upload(spec5, 0, a5, 64)) return 1
-        for (i in 0 until 16) storeWord(a5, i, 0)
-        storeWord(a5, 1, 100)
-        storeWord(a5, 3, 3)
-        if (!backend.upload(step5, 0, a5, 64)) return 1
+        for (i in 0 until 16) storeWord(host5, i, 0)
+        for (i in 0 until 5) storeWord(host5, i, ids[100 + i])
+        storeWord(host5, 5, 4)
+        if (!uploadFrom(backend, spec5, 0, host5, 64)) return 1
+        for (i in 0 until 16) storeWord(host5, i, 0)
+        storeWord(host5, 1, 100)
+        storeWord(host5, 3, 3)
+        if (!uploadFrom(backend, step5, 0, host5, 64)) return 1
         if (!model.reset(backend) || !model.prefill(backend, ws5, first, 0) || !model.verifyStep(backend, ws5, spec5, step5, 5, 2)) {
             println("verify-check: verifyStep 5 rows: ${inklingPrefillLastError()} (${cudaLastError()})")
             return 1
         }
-        if (!backend.download(spec5, 0, a5, 64)) return 1
+        if (!downloadInto(backend, spec5, 0, host5, 64)) return 1
         for (row in 0 until 5) {
-            val got = loadWord(a5, 8 + row)
+            val got = loadWord(host5, 8 + row)
             println("verifyStep 5 rows, row $row argmax $got (reference ${argmaxOf(ref5[row])})")
             if (got != argmaxOf(ref5[row])) ok = false
         }
@@ -407,10 +412,10 @@ fun cmdVerifyCheck(args: array<string>): int {
         val ref6: array<array<f32>> = []
         for (row in 100 until 106) ref6.append(model.readPrefillLogits(backend, wsR, row) ?? return 1)
         for (accepted in 0 until 5) {
-            for (i in 0 until 16) storeWord(a5, i, 0)
-            storeWord(a5, 1, 100)
-            storeWord(a5, 3, accepted)
-            if (!backend.upload(step5, 0, a5, 64)) return 1
+            for (i in 0 until 16) storeWord(host5, i, 0)
+            storeWord(host5, 1, 100)
+            storeWord(host5, 3, accepted)
+            if (!uploadFrom(backend, step5, 0, host5, 64)) return 1
             // spec still holds the five rows
             if (!model.reset(backend) || !model.prefill(backend, ws5, first, 0) || !model.verifyStep(backend, ws5, spec5, step5, 5, 2)) return 1
             if (!model.commitStep(backend, ws5, step5) || !model.forward(backend, ids[100 + accepted + 1], 100 + accepted + 1)) return 1
@@ -477,24 +482,23 @@ fun cmdVerifyArgmax(args: array<string>): int {
     val spec = backend.allocate(64) ?? return 1
     val step = backend.allocate(64) ?? return 1
     val host = nativeByteBuffer(64)
-    val address = nativePointerAddress(host.address)
     val wrong: array<int> = [0, 0, 0, 0, 0]
     var position = from
     for (window in 0 until windows) {
-        for (i in 0 until 16) storeWord(address, i, 0)
-        for (i in 0 until rows) storeWord(address, i, ids[position + i])
-        storeWord(address, 5, rows - 1)
-        if (!backend.upload(spec, 0, address, 64)) return 1
-        for (i in 0 until 16) storeWord(address, i, 0)
-        storeWord(address, 1, position)
-        if (!backend.upload(step, 0, address, 64)) return 1
+        for (i in 0 until 16) storeWord(host, i, 0)
+        for (i in 0 until rows) storeWord(host, i, ids[position + i])
+        storeWord(host, 5, rows - 1)
+        if (!uploadFrom(backend, spec, 0, host, 64)) return 1
+        for (i in 0 until 16) storeWord(host, i, 0)
+        storeWord(host, 1, position)
+        if (!uploadFrom(backend, step, 0, host, 64)) return 1
         if (!model.verifyStep(backend, ws, spec, step, rows, 2)) {
             println("verify-argmax: ${inklingPrefillLastError()} (${cudaLastError()})")
             return 1
         }
-        if (!backend.download(spec, 0, address, 64)) return 1
+        if (!downloadInto(backend, spec, 0, host, 64)) return 1
         val verified: array<int> = []
-        for (row in 0 until rows) verified.append(loadWord(address, 8 + row))
+        for (row in 0 until rows) verified.append(loadWord(host, 8 + row))
         for (row in 0 until rows) {
             if (!model.forward(backend, ids[position + row], position + row)) return 1
             val logits = model.readLogits(backend) ?? return 1
@@ -555,14 +559,13 @@ fun cmdVerifyBench(args: array<string>): int {
     val spec = backend.allocate(64) ?? return 1
     val step = backend.allocate(64) ?? return 1
     val host = nativeByteBuffer(64)
-    val address = nativePointerAddress(host.address)
-    for (i in 0 until 16) storeWord(address, i, 0)
-    for (i in 0 until rows) storeWord(address, i, ids[(length - rows + i) % ids.size])
-    storeWord(address, 5, rows - 1)
-    if (!backend.upload(spec, 0, address, 64)) return 1
-    for (i in 0 until 16) storeWord(address, i, 0)
-    storeWord(address, 1, length)
-    if (!backend.upload(step, 0, address, 64)) return 1
+    for (i in 0 until 16) storeWord(host, i, 0)
+    for (i in 0 until rows) storeWord(host, i, ids[(length - rows + i) % ids.size])
+    storeWord(host, 5, rows - 1)
+    if (!uploadFrom(backend, spec, 0, host, 64)) return 1
+    for (i in 0 until 16) storeWord(host, i, 0)
+    storeWord(host, 1, length)
+    if (!uploadFrom(backend, step, 0, host, 64)) return 1
     // one direct call loads every kernel, then the recording
     if (!model.verifyStep(backend, ws, spec, step, rows, 2) || !backend.synchronize()) {
         println("verify-bench: ${inklingPrefillLastError()} (${cudaLastError()})")

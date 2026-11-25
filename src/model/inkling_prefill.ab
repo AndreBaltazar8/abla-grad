@@ -151,7 +151,7 @@ fun prefillWorkspace(var backend: Backend, c: InklingConfig, chunk: int, allLogi
     // iota[i] = i: the identity row map of the down projection
     val host = nativeByteBuffer(pairs * 4 + 8)
     prefillStoreIota(host, pairs)
-    val iotaOk = backend.upload(workspace.buffer, offsets.get("iota") ?? 0, nativePointerAddress(host.address), pairs * 4)
+    val iotaOk = uploadFrom(backend, workspace.buffer, offsets.get("iota") ?? 0, host, pairs * 4)
     host.close()
     if (!iotaOk) {
         prefillError = "uploading the prefill workspace failed"
