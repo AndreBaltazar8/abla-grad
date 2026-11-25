@@ -745,8 +745,12 @@ private fun InklingModel.prefillChunk(var backend: Backend, ws: PrefillWorkspace
     }
     val rowsOut = if (ws.allLogits) tokens else 1
     val xRows = if (ws.allLogits) x else x + (tokens - 1) * nb
-    ok = ok && backend.launch("matmul_q8_0", kernelArgs().pointer(this.arena, output.offset).pointer(ws.buffer, xRows).pointer(ws.buffer, ws.o("logits"))
+    if (prefillVerifyRows > 0 && rowsOut <= prefillRowsMax) {
+        ok = ok && this.dense(backend, ws, "output.weight", xRows, ws.o("logits"), rowsOut)
+    } else {
+        ok = ok && backend.launch("matmul_q8_0", kernelArgs().pointer(this.arena, output.offset).pointer(ws.buffer, xRows).pointer(ws.buffer, ws.o("logits"))
         .u32(output.rows).u32(output.cols).u32(rowsOut), [output.rows, (rowsOut + 63) / 64])
+    }
     if (c.softcap != 0.0) ok = ok && opSoftcap(backend, ws.buffer, ws.o("logits"), c.softcap, rowsOut * c.nVocabPadded)
     if (!ok) prefillError = "the output projection failed"
     ok
