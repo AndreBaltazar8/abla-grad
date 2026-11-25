@@ -37,3 +37,6 @@ to the model. See [Serving](docs/serving.md) for setup, endpoints and replay.
 
 Run `make test` for host tests and `tools/gpu-lock.sh -- make test-gpu`
 for the CUDA kernel suite.
+
+Licensed under the [Mozilla Public License 2.0](LICENSE), like ablac. Model weights are not part of this
+repository; they keep their own licenses.
