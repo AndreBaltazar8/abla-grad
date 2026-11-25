@@ -48,7 +48,7 @@ resource class DsparkDrafter(
     var stepPrepared: bool = false
 )
 
-/** Uploads the unpadded drafter. maxCtx counts target positions and maxProposals is one or two. */
+/** Uploads the unpadded drafter. maxCtx counts target positions. Host proposals support limits one through four. */
 fun dsparkLoad(var backend: Backend, file: GgufFile, maxCtx: int, maxProposals: int = 2): DsparkDrafter? {
     dsparkError = ""
     val config = dsparkConfig(file)
@@ -57,7 +57,7 @@ fun dsparkLoad(var backend: Backend, file: GgufFile, maxCtx: int, maxProposals: 
         dsparkError = dsparkConfigLastError()
         return null
     }
-    if (maxCtx < 1 || maxCtx > config.maxPositions || maxProposals < 1 || maxProposals > 2) {
+    if (maxCtx < 1 || maxCtx > config.maxPositions || maxProposals < 1 || maxProposals > 4) {
         dsparkError = "invalid drafter context or proposal limit"
         return null
     }
@@ -399,8 +399,12 @@ private fun DsparkDrafter.gatherStep(var backend: Backend, arena: DeviceBuffer, 
     backend.launch("dspark_gather_step", args.u32(if (weight.type == GGML_TYPE_BF16) 1 else 0), [weight.cols])
 }
 
-/** Records fixed-shape draft work. Reads [anchor,P] from step, writes [anchor,p1,p2,count] into spec. */
+/** Records up to two proposals. Reads [anchor,P] from step and writes [anchor,p1,p2,count] into spec. */
 fun DsparkDrafter.proposeStep(var backend: Backend, target: InklingModel, step: DeviceBuffer, spec: DeviceBuffer): bool {
+    if (this.maxProposals > 2) {
+        dsparkError = "recorded DSpark supports at most two proposals"
+        return false
+    }
     val embedding = weightOf(target.plan, "token_embd.weight")
     val output = weightOf(target.plan, "output.weight")
     if (step.bytes < 16 || spec.bytes < 32 || !dsparkTargetShape(target, embedding, output)) return false

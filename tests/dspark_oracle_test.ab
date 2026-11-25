@@ -5,6 +5,7 @@ import "abla/io"
 import "abla/process"
 import "abla/text"
 import "abla/unsafe/memory/raw"
+import "../src/backend/backend.ab"
 import "../src/backend/cuda.ab"
 import "../src/gguf/reader.ab"
 import "../src/model/dspark.ab"
@@ -30,6 +31,20 @@ private fun fail(reason: string): int {
     1
 }
 
+private fun hostProposals(var backend: Backend, target: InklingModel, file: GgufFile,
+    pos: int, anchor: int, limit: int, ctx: int): array<int>? {
+    val draft = dsparkLoad(backend, file, ctx, limit) ?? return null
+    val spec = backend.allocate(32) ?? return null
+    if (!draft.pushTaps(backend, target.taps, 0, pos) || !draft.prepareStep(backend)) return null
+    if (!backend.beginRecording()) return null
+    val captured = draft.proposeStep(backend, target, target.step, spec)
+    backend.endRecording()
+    if (captured || dsparkLastError() != "recorded DSpark supports at most two proposals") return null
+    val result: array<int> = []
+    for (id in draft.propose(backend, target, pos, anchor)) result.append(id)
+    result
+}
+
 trusted fun main: int {
     val argc = processArgumentCount()
     if (argc != 4 && argc != 6 && argc != 7)
@@ -42,12 +57,11 @@ trusted fun main: int {
     val targetFile = ggufOpen(processArgument(0)) ?? return fail(ggufLastError())
     val draftFile = ggufOpen(processArgument(1)) ?? return fail(ggufLastError())
     val config = inklingConfigFrom(targetFile) ?? return fail(inklingConfigLastError())
-    val backend = cudaBackend() ?? return fail(cudaLastError())
+    var backend = cudaBackend() ?? return fail(cudaLastError())
     val maxCtx = ids.size + 16
     val target = inklingLoad(backend, targetFile, config, maxCtx) ?? return fail(inklingLastError())
     val draft = dsparkLoad(backend, draftFile, maxCtx) ?? return fail(dsparkLastError())
     targetFile.close()
-    draftFile.close()
     if (!target.enableTaps(backend)) return fail(inklingLastError())
     if (argc == 7) {
         val taps = readFloatFile(processArgument(6)) ?? return fail("reading oracle taps failed")
@@ -79,5 +93,16 @@ trusted fun main: int {
     val incremental = draft.propose(backend, target, ids.size, anchor)
     if (incremental.size != 2 || incremental[0] != proposals[0] || incremental[1] != proposals[1])
         return fail("batch and incremental tap injection disagree")
+
+    val three = hostProposals(backend, target, draftFile, ids.size, anchor, 3, maxCtx) ?? return fail(dsparkLastError())
+    val four = hostProposals(backend, target, draftFile, ids.size, anchor, 4, maxCtx) ?? return fail(dsparkLastError())
+    val limited = hostProposals(backend, target, draftFile, ids.size, anchor, 4, ids.size + 4) ?? return fail(dsparkLastError())
+    if (three.size != 3 || four.size != 4 || limited.size != 3) return fail("wrong host proposal counts")
+    for (i in 0 until proposals.size) if (four[i] != proposals[i]) return fail("longer chain changed the first two proposals")
+    for (i in 0 until three.size) {
+        if (four[i] != three[i] || four[i] != limited[i]) return fail("proposal prefixes differ at position $i")
+    }
+    if (dsparkLoad(backend, draftFile, maxCtx, 5) != null) return fail("loaded a five-proposal drafter")
+    println("host n-max 2/3/4 match through their common prefixes and at the context limit")
     0
 }
