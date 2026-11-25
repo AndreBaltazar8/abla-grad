@@ -16,10 +16,13 @@ private var speculateError = ""
 
 fun speculateLastError(): string = if (speculateError != "") speculateError else dsparkLastError()
 
-class SpecStats(var cycleTokens: int = 0, var plainTokens: int = 0, var cycles: int = 0, var switches: int = 0)
+class SpecStats(var cycleTokens: int = 0, var plainTokens: int = 0, var cycles: int = 0, var switches: int = 0, var loopNanos: int = 0)
 
 // Extra positions the context needs beyond prompt + generated tokens (a batch of cycles can overshoot the last token by up to 3 rows each).
 val SPEC_CONTEXT_SLACK = 40
+
+// Proposals per cycle the product uses at most (2..4); the adaptive controller may use fewer.
+val SPEC_DEFAULT_PROPOSALS = 2
 
 private val SPEC_BATCH_CYCLES = 4
 private val SPEC_BATCH_TOKENS = 16
@@ -39,7 +42,7 @@ private trusted fun specZero(var backend: Backend, spec: DeviceBuffer): bool {
  *  The model must be freshly reset and loaded with a context of at least prompt.size + maxTokens + SPEC_CONTEXT_SLACK. */
 fun speculativeGenerate(
     var backend: Backend, var model: InklingModel, draftFile: GgufFile, prompt: array<int>, maxTokens: int, stops: array<int>,
-    adaptive: bool, var stats: SpecStats, var emit: FnMut(int) -> void
+    adaptive: bool, maxProposals: int, var stats: SpecStats, var emit: FnMut(int) -> void
 ): bool {
     speculateError = ""
     val config = model.config
@@ -53,8 +56,8 @@ fun speculativeGenerate(
         speculateError = inklingLastError()
         return false
     }
-    var drafter = dsparkLoad(backend, draftFile, model.maxCtx) ?? return false
-    val ws = prefillWorkspace(backend, config, 3, true, 3)
+    var drafter = dsparkLoad(backend, draftFile, model.maxCtx, maxProposals) ?? return false
+    val ws = prefillWorkspace(backend, config, 5, true, 5)
     if (ws == null) {
         speculateError = inklingPrefillLastError()
         return false
@@ -94,25 +97,17 @@ fun speculativeGenerate(
         speculateError = dsparkLastError()
         return false
     }
-    // the plain graph first: kernels are loaded by the seeding, recording runs nothing
+    // the plain graph and one cycle graph per n-max (n proposals, n + 1 verification rows): kernels are loaded by the seeding; recording runs nothing
     val plain = model.capture(backend)
     if (plain == null) {
         speculateError = inklingLastError()
         return false
     }
-    if (!backend.beginRecording()) {
-        speculateError = "the backend cannot record"
-        return false
-    }
-    var ok = opSpecBegin(backend, model.step, spec)
-    ok = ok && drafter.pushTapsStep(backend, model.taps, model.step)
-    ok = ok && drafter.proposeStep(backend, model, model.step, spec)
-    ok = ok && model.verifyStep(backend, ws, spec, model.step)
-    ok = ok && opSpecAccept(backend, model.step, spec, model.maxCtx)
-    ok = ok && model.commitStep(backend, ws, model.step)
-    val cycle = backend.endRecording()
-    if (!ok || cycle == null) {
-        speculateError = "recording the cycle failed: ${dsparkLastError()} ${inklingLastError()}"
+    val cycle2 = recordCycle(backend, model, drafter, ws, spec, 2)
+    val cycle3 = if (maxProposals >= 3) recordCycle(backend, model, drafter, ws, spec, 3) else null
+    val cycle4 = if (maxProposals >= 4) recordCycle(backend, model, drafter, ws, spec, 4) else null
+    if (cycle2 == null || (maxProposals >= 3 && cycle3 == null) || (maxProposals >= 4 && cycle4 == null)) {
+        speculateError = "recording a cycle failed: ${dsparkLastError()} ${inklingLastError()}"
         return false
     }
     // the first generated token is the anchor chosen above (position `length`); later ones come from the token log (log[j] = the token at position j + 1)
@@ -127,25 +122,37 @@ fun speculativeGenerate(
     produced = 1
     var position = length
     var logged = length
-    var useCycle = true
-    var rateCycle = 0.0
-    var ratePlain = 0.0
-    var sinceProbe = 0
+    // Arms: 0 = the plain graph, 1 = cycle with 2 proposals, 2 = 3 proposals, 3 = 4 proposals. Without `adaptive` the top arm runs alone. The controller
+    // keeps a smoothed tokens/s per arm: a sweep visits every arm once (a batch to warm it up, a batch to measure), then the best arm runs and one of its
+    // neighbours is probed every few hundred tokens.
+    val arms = if (maxProposals >= 4) 4 else if (maxProposals >= 3) 3 else 2
+    val rate: array<f64> = [0.0, 0.0, 0.0, 0.0]
+    var arm = arms - 1
+    var best = arm
+    var sweeping = adaptive
+    var probing = false
     var warm = true
+    var sinceProbe = 0
+    var probeRound = 0
+    val started = monotonicNanoseconds()
     while (produced < maxTokens) {
         val before = position
         val t0 = monotonicNanoseconds()
-        if (useCycle) {
+        if (arm == 0) {
+            if (!model.replayMany(backend, plain, SPEC_BATCH_TOKENS)) {
+                speculateError = inklingLastError()
+                return false
+            }
+        } else {
             for (b in 0 until SPEC_BATCH_CYCLES) {
-                if (!backend.replay(cycle)) {
-                    speculateError = "replaying the cycle failed"
+                val replayed = if (arm == 1) backend.replay(cycle2 ?? return false) else if (arm == 2) backend.replay(cycle3 ?? return false)
+                    else backend.replay(cycle4 ?? return false)
+                if (!replayed) {
+                    speculateError = "replaying a cycle failed"
                     return false
                 }
             }
             stats.cycles = stats.cycles + SPEC_BATCH_CYCLES
-        } else if (!model.replayMany(backend, plain, SPEC_BATCH_TOKENS)) {
-            speculateError = inklingLastError()
-            return false
         }
         if (!backend.synchronize()) {
             speculateError = "the device failed while decoding"
@@ -158,8 +165,8 @@ fun speculativeGenerate(
         }
         position = now
         val seconds = f64FromInt(monotonicNanoseconds() - t0) / 1000000000.0
-        val rate = f64FromInt(position - before) / seconds
-        if (useCycle) stats.cycleTokens = stats.cycleTokens + (position - before) else stats.plainTokens = stats.plainTokens + (position - before)
+        val measured = f64FromInt(position - before) / seconds
+        if (arm == 0) stats.plainTokens = stats.plainTokens + (position - before) else stats.cycleTokens = stats.cycleTokens + (position - before)
         // hand the new tokens to the caller: log[logged .. position)
         val fresh = model.readLog(backend, logged, position - logged)
         if (fresh == null) {
@@ -168,36 +175,81 @@ fun speculativeGenerate(
         }
         logged = position
         for (token in fresh) {
-            for (stop in stops) if (stop == token) return true
+            for (stop in stops) if (stop == token) {
+                stats.loopNanos = monotonicNanoseconds() - started
+                return true
+            }
             emit(token)
             produced = produced + 1
-            if (produced >= maxTokens) return true
+            if (produced >= maxTokens) {
+                stats.loopNanos = monotonicNanoseconds() - started
+                return true
+            }
         }
         if (!adaptive) continue
-        if (useCycle) {
-            if (!warm) rateCycle = if (rateCycle == 0.0) rate else 0.5 * rateCycle + 0.5 * rate
-        } else {
-            if (!warm) ratePlain = if (ratePlain == 0.0) rate else 0.5 * ratePlain + 0.5 * rate
-            sinceProbe = sinceProbe + (position - before)
-        }
-        var next = useCycle
-        if (warm) next = useCycle
-        else if (ratePlain == 0.0) next = false
-        else if (rateCycle == 0.0) next = true
-        else if (useCycle) next = rateCycle >= ratePlain * 0.97
-        else next = sinceProbe >= 160 || rateCycle > ratePlain * 1.03
-        warm = false
-        if (next && !useCycle) {
-            if (!drafter.resume(backend, model.taps, position)) {
-                speculateError = dsparkLastError()
-                return false
+        var next = arm
+        if (!warm) {
+            rate[arm] = if (rate[arm] == 0.0) measured else 0.5 * rate[arm] + 0.5 * measured
+            if (sweeping) {
+                if (arm > 0) {
+                    next = arm - 1
+                } else {
+                    sweeping = false
+                    for (a in 0 until arms) if (rate[a] > rate[best]) best = a
+                    next = best
+                    sinceProbe = 0
+                }
+            } else if (probing) {
+                probing = false
+                if (rate[arm] > rate[best] * 1.03) best = arm
+                next = best
+                sinceProbe = 0
+            } else {
+                sinceProbe = sinceProbe + (position - before)
+                if (sinceProbe >= 384) {
+                    probeRound = probeRound + 1
+                    var candidate = if (probeRound % 2 == 1) best + 1 else best - 1
+                    if (candidate >= arms || candidate < 0) candidate = if (best + 1 < arms) best + 1 else best - 1
+                    if (candidate >= 0 && candidate < arms && candidate != best) {
+                        next = candidate
+                        probing = true
+                        rate[candidate] = 0.0
+                    }
+                    sinceProbe = 0
+                }
             }
-            sinceProbe = 0
-            rateCycle = 0.0
-            warm = true
         }
-        if (next != useCycle) stats.switches = stats.switches + 1
-        useCycle = next
+        if (next != arm) {
+            if (arm == 0) {
+                // back to a cycle graph: the drafter catches up on the plain tokens' taps
+                if (!drafter.resume(backend, model.taps, position)) {
+                    speculateError = dsparkLastError()
+                    return false
+                }
+            }
+            stats.switches = stats.switches + 1
+            warm = true
+            arm = next
+        } else {
+            warm = false
+        }
     }
+    stats.loopNanos = monotonicNanoseconds() - started
     true
+}
+
+// Records one speculation cycle with `n` proposals: drafter taps + proposals, an (n + 1)-row verification, greedy acceptance, history commit.
+private fun recordCycle(
+    var backend: Backend, var model: InklingModel, var drafter: DsparkDrafter, ws: PrefillWorkspace, spec: DeviceBuffer, n: int
+): Recording? {
+    if (!backend.beginRecording()) return null
+    var ok = opSpecBegin(backend, model.step, spec)
+    ok = ok && drafter.pushTapsStep(backend, model.taps, model.step, true)
+    ok = ok && drafter.proposeStep(backend, model, model.step, spec, true, n)
+    ok = ok && model.verifyStep(backend, ws, spec, model.step, n + 1, 2)
+    ok = ok && opSpecAcceptN(backend, model.step, spec, model.maxCtx)
+    ok = ok && model.commitStep(backend, ws, model.step)
+    val recording = backend.endRecording()
+    if (!ok) return null
+    recording
 }

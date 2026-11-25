@@ -164,7 +164,7 @@ fun generateTokens(
             var model = inklingLoad(backend, file, config, context + slack) ?? return generateError(inklingLastError())
             if (!model.reset(backend)) return generateError("could not reset Inkling (${cudaLastError()})")
             var stats = SpecStats()
-            if (!speculativeGenerate(backend, model, draftFile, prompt, maxTokens, stops, true, stats, emit))
+            if (!speculativeGenerate(backend, model, draftFile, prompt, maxTokens, stops, true, SPEC_DEFAULT_PROPOSALS, stats, emit))
                 return generateError(speculateLastError())
             return 0
         }
