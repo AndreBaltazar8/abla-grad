@@ -71,3 +71,17 @@ would take 93.40 µs and 26.38 µs at their measured per-call times.
 Replacing the grouped tile kernels in the recorded cycle reduced cycle
 time from 18.1 to 17.4 ms on prompt 03 and from 19.4 to 17.7 ms on
 prompt 05. The verification argmax check passed.
+
+### Four- and five-vector expert unions
+
+RTX 4090 kernel times in µs, using the same CUPTI method. With eight slots
+per vector, the mixed pattern selects 17, 22, and 26 distinct experts at
+R=3, R=4, and R=5. R=4 and R=5 both use capacity 40 in this benchmark.
+
+| Kernel and expert pattern | R=3 before | R=3 after | R=4 | R=5 |
+| --- | ---: | ---: | ---: | ---: |
+| NVFP4, shared | 20.69 | 20.46 | 30.02 | 34.52 |
+| NVFP4, mixed | 27.19 | 28.59 | 39.78 | 45.30 |
+| NVFP4, disjoint | 34.54 | 36.33 | 50.22 | 60.73 |
+| Q5_K, mixed | 72.25 | 73.34 | 100.68 | 123.46 |
+| Q8_0, mixed | 22.07 | 23.99 | 33.63 | 39.20 |
