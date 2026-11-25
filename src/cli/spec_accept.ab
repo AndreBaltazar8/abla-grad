@@ -15,16 +15,22 @@ import "../model/inkling.ab"
 import "../model/inkling_config.ab"
 import "../model/dspark.ab"
 import "../ops.ab"
+import "../model/inkling_prefill.ab"
+import "abla/process/time"
 
 fun cmdSpecAccept(args: array<string>): int {
     var count = 128
     var maxCtx = 0
+    var cost = false
     val positional: array<string> = []
     var index = 0
     while (index < args.size) {
         if (args[index] == "--n" && index + 1 < args.size) {
             count = args[index + 1].parseInt() ?? 0
             index = index + 2
+        } else if (args[index] == "--cost") {
+            cost = true
+            index = index + 1
         } else if (args[index] == "--ctx" && index + 1 < args.size) {
             maxCtx = args[index + 1].parseInt() ?? 0
             index = index + 2
@@ -88,6 +94,33 @@ fun cmdSpecAccept(args: array<string>): int {
         first.append(if (proposals.size > 0) proposals[0] else -1)
         second.append(if (proposals.size > 1) proposals[1] else -1)
         token = if (position + 1 < ids.size) ids[position + 1] else greedy
+    }
+    if (cost) {
+        // the cost of one speculation cycle's parts at the end of the run: drafter propose, 3-row verify (+ argmax), one plain decode step
+        val ws = prefillWorkspace(backend, config, 8, true, 3) ?? return 1
+        val last = total - 1
+        val anchor = nxt[nxt.size - 1]
+        var proposeNs = 0
+        var verifyNs = 0
+        var decodeNs = 0
+        val rounds = 20
+        for (r in 0 until rounds) {
+            val t0 = monotonicNanoseconds()
+            val proposals = drafter.propose(backend, model, last, anchor)
+            val t1 = monotonicNanoseconds()
+            val rows = [anchor, if (proposals.size > 0) proposals[0] else 1, if (proposals.size > 1) proposals[1] else 1]
+            if (!model.verify(backend, ws, rows, last)) return 1
+            val am = model.verifyArgmax(backend, ws, 3) ?? return 1
+            val t2 = monotonicNanoseconds()
+            if (!model.forward(backend, anchor, last)) return 1
+            if (!opArgmax(backend, model.scratch, model.so("logits"), config.nVocab, model.step, 0)) return 1
+            val g = model.readStepWord(backend, 0) ?? return 1
+            val t3 = monotonicNanoseconds()
+            proposeNs = proposeNs + (t1 - t0)
+            verifyNs = verifyNs + (t2 - t1)
+            decodeNs = decodeNs + (t3 - t2)
+        }
+        println("spec-accept: per cycle part (ms): propose ${f64FromInt(proposeNs) / 1000000.0 / f64FromInt(rounds)}, verify 3 rows + argmax ${f64FromInt(verifyNs) / 1000000.0 / f64FromInt(rounds)}, one plain decode step (direct, step mode) ${f64FromInt(decodeNs) / 1000000.0 / f64FromInt(rounds)}")
     }
     // positions p >= ids.size - 1 have a greedy continuation: nxt[p+1] follows the anchor nxt[p]
     var cycles = 0
