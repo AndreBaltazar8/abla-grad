@@ -3,6 +3,7 @@ import "abla/fs"
 import "abla/integer"
 import "abla/io"
 import "abla/math"
+import "abla/text"
 import "abla/process/time"
 import "../backend/backend.ab"
 import "../backend/cuda.ab"
@@ -11,6 +12,7 @@ import "../model/inkling.ab"
 import "../model/inkling_config.ab"
 import "../model/llama.ab"
 import "../model/llama_config.ab"
+import "../model/speculate.ab"
 import "../tokenizer/tokenizer.ab"
 import "chat.ab"
 import "sampler.ab"
@@ -18,7 +20,8 @@ import "utf8_stream.ab"
 
 private class GenerateArgs(
     val model: string, var tokenizer: string = "", var prompt: string = "", var mode: string = "",
-    var maxTokens: int = 32, var temperature: f64 = 0.0, var topP: f64 = 1.0, var seed: int = 0, var context: int = 0
+    var maxTokens: int = 32, var temperature: f64 = 0.0, var topP: f64 = 1.0, var seed: int = 0, var context: int = 0,
+    var drafter: string = "", var speculate: string = "auto"
 )
 
 private fun generateArgs(args: array<string>): GenerateArgs? {
@@ -44,6 +47,14 @@ private fun generateArgs(args: array<string>): GenerateArgs? {
             "--ctx" -> {
                 parsed.context = value.parseInt() ?? return null
                 if (parsed.context <= 0) return null
+            }
+            "--drafter" -> {
+                if (value == "") return null
+                parsed.drafter = value
+            }
+            "--speculate" -> {
+                if (value != "auto" && value != "off") return null
+                parsed.speculate = value
             }
             "--tokenizer" -> {
                 if (value == "") return null
@@ -129,7 +140,7 @@ private fun generateLoop(
 // as soon as it is selected, before computing the next position.
 fun generateTokens(
     file: GgufFile, tokenizer: Tokenizer, prompt: array<int>, context: int,
-    maxTokens: int, var sampler: TokenSampler, var emit: FnMut(int) -> void
+    maxTokens: int, var sampler: TokenSampler, var emit: FnMut(int) -> void, drafterPath: string = ""
 ): int {
     if (prompt.size == 0) return generateError("prompt tokenized to zero tokens")
     if (context < prompt.size || maxTokens < 0 || maxTokens > context - prompt.size)
@@ -146,6 +157,17 @@ fun generateTokens(
         if (config.nVocab != tokenizer.vocabSize()) return generateError("tokenizer vocabulary size does not match the model")
         if (context > (file.getInt("$architecture.context_length") ?? context)) return generateError("--ctx exceeds the model context length")
         var backend = cudaBackend() ?? return generateError(cudaLastError())
+        // greedy decoding with a drafter next to the model (or --drafter): speculative decoding, same tokens as plain greedy up to near-ties
+        val draftFile = if (drafterPath != "" && sampler.temperature == 0.0) ggufOpen(drafterPath) else null
+        if (draftFile != null) {
+            val slack = SPEC_CONTEXT_SLACK
+            var model = inklingLoad(backend, file, config, context + slack) ?? return generateError(inklingLastError())
+            if (!model.reset(backend)) return generateError("could not reset Inkling (${cudaLastError()})")
+            var stats = SpecStats()
+            if (!speculativeGenerate(backend, model, draftFile, prompt, maxTokens, stops, true, stats, emit))
+                return generateError(speculateLastError())
+            return 0
+        }
         val model = inklingLoad(backend, file, config, context) ?? return generateError(inklingLastError())
         if (!model.reset(backend)) return generateError("could not reset Inkling (${cudaLastError()})")
         return generateLoop(backend, model, null, prompt, sampler, maxTokens, stops, emit)
@@ -177,7 +199,16 @@ fun cmdGenerate(args: array<string>): int {
     val sampler = tokenSampler(options.temperature, options.topP, options.seed)
     val stream = Utf8TokenStream()
     val result = generateTokens(file, tokenizer, ids, context, options.maxTokens, sampler,
-        { token -> print(stream.push(tokenizer.decode([token]))) })
+        { token -> print(stream.push(tokenizer.decode([token]))) }, drafterFor(options))
     if (result == 0) print(stream.finish())
     result
+}
+
+// The DSpark drafter for `generate`: --drafter PATH, else dspark-Inkling-2-Mini-Q8_0.gguf next to the model; "" when --speculate off.
+private fun drafterFor(options: GenerateArgs): string {
+    if (options.speculate == "off") return ""
+    if (options.drafter != "") return options.drafter
+    val slash = options.model.lastIndexOf("/")
+    val directory = if (slash >= 0) options.model.codePointSlice(0, slash + 1) else ""
+    "${directory}dspark-Inkling-2-Mini-Q8_0.gguf"
 }
