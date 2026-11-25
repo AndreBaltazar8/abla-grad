@@ -129,6 +129,24 @@ extern "C" __global__ void conv_history(const float *x, float *history, unsigned
 }
 """
 
+// The convolution history after each of the first `tokens` rows, without touching the live history: snapshot k (k = 1..tokens) holds the nConv - 1 last entries
+// of [history, x[0 .. k)]. snapBase points at this convolution's region of snapshot 1; snapshot k is snapStride floats further on per step. problem [channels].
+val kernelPrefillConvHistoryRows = """
+extern "C" __global__ void conv_history_rows(const float *x, const float *history, float *snapBase, unsigned channels, unsigned nConv, unsigned tokens,
+                                             unsigned snapStride) {
+    unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels || nConv > 64) return;
+    for (unsigned k = 1; k <= tokens; ++k) {
+        float *snapshot = snapBase + static_cast<unsigned long long>(k - 1) * snapStride;
+        for (unsigned j = 0; j + 1 < nConv; ++j) {
+            unsigned index = k + j;
+            snapshot[static_cast<unsigned long long>(j) * channels + c] = index + 1 < nConv ? history[static_cast<unsigned long long>(index) * channels + c]
+                : x[static_cast<unsigned long long>(index + 1 - nConv) * channels + c];
+        }
+    }
+}
+"""
+
 // l2clip over T * heads rows where the per-element scale repeats for every token: row r uses scale row (r % scaleRows). problem [rows].
 val kernelPrefillL2Clip = """
 extern "C" __global__ void l2clip_rows(const float *x, const float *scale, float *y, unsigned rows, unsigned dim, float t, unsigned scaleRows) {

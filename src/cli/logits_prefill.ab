@@ -1,5 +1,7 @@
 // Inkling logits through the batched prefill (`abla-grad logits --prefill [--chunk N]`) and the prefill benchmark (`abla-grad prefill-bench`).
 import "abla/io"
+import "abla/fs"
+import "abla/text"
 import "abla/integer"
 import "abla/process/time"
 import "abla/float"
@@ -113,4 +115,88 @@ fun cmdPrefillBench(args: array<string>): int {
         println("prefill-bench ($label): $tokens tokens in ${seconds * 1000.0} ms = ${f64FromInt(tokens) / seconds} tok/s")
     }
     0
+}
+
+private fun maxAbsDifference(a: array<f32>, b: array<f32>): f64 {
+    var largest = 0.0
+    for (i in 0 until a.size) {
+        val d = f32ToF64(a[i]) - f32ToF64(b[i])
+        val m = if (d < 0.0) -d else d
+        if (m > largest) largest = m
+    }
+    largest
+}
+
+private fun argmaxOf(a: array<f32>): int {
+    var best = 0
+    for (i in 1 until a.size) if (a[i] > a[best]) best = i
+    best
+}
+
+// abla-grad verify-check <model.gguf> <ids-file>: prefill 100 tokens, verify the next 3 as one batch and commit 2 or 0 of them, then continue with one decode step,
+// and compare with a plain prefill of the same tokens (rows, and the logits after the decode step).
+fun cmdVerifyCheck(args: array<string>): int {
+    if (args.size != 2) {
+        println("usage: abla-grad verify-check <model.gguf> <ids-file>   (at least 104 ids)")
+        return 2
+    }
+    val idsText = Path(args[1]).readTextResult()
+    val ids: array<int> = []
+    if (idsText.succeeded) for (line in idsText.text.split("\n")) if (line.trim() != "") ids.append(line.trim().parseInt() ?? 0)
+    if (ids.size < 104) {
+        println("verify-check: need at least 104 token ids")
+        return 2
+    }
+    val file = ggufOpen(args[0])
+    if (file == null) {
+        println("verify-check: ${ggufLastError()}")
+        return 2
+    }
+    val config = inklingConfigFrom(file)
+    if (config == null) {
+        println("verify-check: ${inklingConfigLastError()}")
+        return 2
+    }
+    var backend = cudaBackend() ?? return 2
+    var model = inklingLoad(backend, file, config, 160) ?? return loadFailed()
+    val first: array<int> = []
+    for (i in 0 until 100) first.append(ids[i])
+    val rows: array<int> = []
+    for (i in 100 until 103) rows.append(ids[i])
+    val all: array<int> = []
+    for (i in 0 until 103) all.append(ids[i])
+    val wsA = prefillWorkspace(backend, config, 128, true) ?? return 1
+    // reference: logits of every row of the plain prefill of 103 tokens
+    if (!model.reset(backend) || !model.prefill(backend, wsA, all, 0)) {
+        println("verify-check: ${inklingPrefillLastError()}")
+        return 1
+    }
+    val reference: array<array<f32>> = []
+    for (row in 100 until 103) reference.append(model.readPrefillLogits(backend, wsA, row - 0) ?? return 1)
+    var ok = true
+    for (accepted in [2, 0]) {
+        val wsV = prefillWorkspace(backend, config, 4, true, 3) ?? return 1
+        if (!model.reset(backend) || !model.prefill(backend, wsV, first, 0) || !model.verify(backend, wsV, rows, 100)) {
+            println("verify-check: ${inklingPrefillLastError()} (${cudaLastError()})")
+            return 1
+        }
+        val ids3 = model.verifyArgmax(backend, wsV, 3) ?? return 1
+        for (row in 0 until 3) {
+            val logits = model.readPrefillLogits(backend, wsV, row) ?? return 1
+            println("accepted $accepted: row $row argmax ${ids3[row]} (reference ${argmaxOf(reference[row])}), max |dlogit| vs the plain prefill ${maxAbsDifference(logits, reference[row])}")
+            if (ids3[row] != argmaxOf(reference[row])) ok = false
+        }
+        if (!model.commitVerified(backend, wsV, accepted)) return 1
+        // continue with a decode step on the first token after the committed rows
+        val position = 100 + accepted
+        if (!model.forward(backend, ids[position], position)) {
+            println("verify-check: ${inklingLastError()}")
+            return 1
+        }
+        val decoded = model.readLogits(backend) ?? return 1
+        println("accepted $accepted: decode step at position $position: argmax ${argmaxOf(decoded)} (reference ${argmaxOf(reference[accepted])}), max |dlogit| ${maxAbsDifference(decoded, reference[accepted])}")
+        if (argmaxOf(decoded) != argmaxOf(reference[accepted])) ok = false
+    }
+    println(if (ok) "verify-check: ok" else "verify-check: MISMATCH")
+    if (ok) 0 else 1
 }

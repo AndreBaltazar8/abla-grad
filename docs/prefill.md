@@ -33,3 +33,13 @@ times the expert's scale; SiTU runs over the sorted rows; the down projection re
 `kv_store_batch`, `attention_prefill_rel` (the decode kernel with the token as a grid dimension).
 Existing elementwise kernels (`add`, `situ`, `sigmoid_mul`, `softcap`, `control_mix`, `rmsnorm`, `rel_table`, `copy_f32`) take their size as `n`/`rows` and run
 unchanged over `tokens * size`.
+
+## Verification for speculative decoding (`verify`, `commitVerified`)
+`prefillWorkspace(backend, config, chunk, allLogits = true, verifyRows = 3)` adds room for three snapshots of the convolution history (3.8 MB each).
+`model.verify(backend, ws, ids, startPos)` runs the anchor token and up to two proposals as one causal batch: the KV rows of those positions are written,
+the logits of row k are in the workspace (`readPrefillLogits(ws, k)`, `verifyArgmax(ws, rows)` gives the argmax of every row), and the live convolution histories
+are **not** changed: `conv_history_rows` writes the history after row 1, 2, 3 into the snapshots instead. `model.commitVerified(ws, accepted)` copies snapshot
+`accepted` over the live history (one launch; `accepted = 0` keeps the old state). KV rows beyond the accepted prefix are overwritten by later steps; the depth-mixing
+bank and the loop's control state live inside one token's forward, so nothing else is stateful. `abla-grad verify-check <gguf> <ids>` checks the whole chain: prefill 100
+tokens, verify 3, commit 2 or 0, one decode step, against a plain prefill (argmax identical, the decode step after the commit equals the verified row to 1e-3).
+The rows use the f16 tensor-core matmuls, so a logit differs from the decode kernels' by their rounding (KL below 0.005 on the gate prompts); an argmax at a near tie can differ.

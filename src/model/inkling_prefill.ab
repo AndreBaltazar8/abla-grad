@@ -18,6 +18,9 @@ private var prefillError = ""
 // Tokens per tile of the expert-grouped matmuls (64 or 32; the plan and the kernel must agree).
 private var prefillMoeTile = 64
 
+// > 0 while `verify` runs: the convolution histories are left unchanged and the history after each of that many rows goes into the workspace's snapshots.
+private var prefillVerifyRows = 0
+
 // false: the scalar attention kernel (f32 throughout), for A/B checks.
 private var prefillTensorAttention = true
 
@@ -39,7 +42,11 @@ resource class PrefillWorkspace(
     val buffer: DeviceBuffer,
     // [chunk][nLayer + 2][nEmbd] depth-mixing states (the block bank) and the looped core's bank, one set per token
     val blocks: DeviceBuffer,
-    val bank: DeviceBuffer
+    val bank: DeviceBuffer,
+    // `verifyRows` snapshots of the whole convolution history (docs/prefill.md, verify); a one-byte buffer when verification is off
+    val snapshots: DeviceBuffer,
+    val verifyRows: int,
+    val historyBytes: int
 )
 
 private fun wsAdd(var offsets: Map<string, int>, name: string, elements: int, at: int): int {
@@ -47,7 +54,7 @@ private fun wsAdd(var offsets: Map<string, int>, name: string, elements: int, at
     at + alignUp(elements * 4)
 }
 
-fun prefillWorkspace(var backend: Backend, c: InklingConfig, chunk: int, allLogits: bool): PrefillWorkspace? {
+fun prefillWorkspace(var backend: Backend, c: InklingConfig, chunk: int, allLogits: bool, verifyRows: int = 0): PrefillWorkspace? {
     prefillError = ""
     val offsets: Map<string, int> = Map()
     val n = c.nEmbd
@@ -105,7 +112,13 @@ fun prefillWorkspace(var backend: Backend, c: InklingConfig, chunk: int, allLogi
         prefillError = "device memory for the prefill workspace (chunk $chunk) is not available"
         return null
     }
-    val workspace = PrefillWorkspace(chunk, allLogits, offsets, move(buffer), move(blocks), move(bank))
+    val historyBytes = inklingVisits(c) * (c.nConv - 1) * (2 * c.nHeadKv * c.headDim + 2 * n) * 4
+    val snapshots = backend.allocate(if (verifyRows > 0) verifyRows * historyBytes else 256)
+    if (snapshots == null) {
+        prefillError = "device memory for the verification snapshots is not available"
+        return null
+    }
+    val workspace = PrefillWorkspace(chunk, allLogits, offsets, move(buffer), move(blocks), move(bank), move(snapshots), verifyRows, historyBytes)
     // iota[i] = i: the identity row map of the down projection
     val host = nativeByteBuffer(pairs * 4 + 8)
     prefillStoreIota(host, pairs)
@@ -456,8 +469,12 @@ private fun InklingModel.convRows(var backend: Backend, ws: PrefillWorkspace, in
     args.u32(heads)
     args.f32(outScale)
     args.u32(tokens)
-    backend.launch("conv_seq", args, [channels, tokens]) &&
-        backend.launch("conv_history", kernelArgs().pointer(ws.buffer, input).pointer(this.history, historyOffset).u32(channels).u32(c.nConv).u32(tokens), [channels])
+    if (!backend.launch("conv_seq", args, [channels, tokens])) return false
+    if (prefillVerifyRows > 0) {
+        return backend.launch("conv_history_rows", kernelArgs().pointer(ws.buffer, input).pointer(this.history, historyOffset).pointer(ws.snapshots, historyOffset)
+            .u32(channels).u32(c.nConv).u32(tokens).u32(ws.historyBytes / 4), [channels])
+    }
+    backend.launch("conv_history", kernelArgs().pointer(ws.buffer, input).pointer(this.history, historyOffset).u32(channels).u32(c.nConv).u32(tokens), [channels])
 }
 
 private fun InklingModel.grouped(var backend: Backend, ws: PrefillWorkspace, kind: string, wOffset: int, x: int, xmap: int, y: int, useScales: bool, scalesOffset: int,
@@ -593,4 +610,57 @@ trusted fun InklingModel.readPrefillLogits(var backend: Backend, ws: PrefillWork
     for (index in 0 until count) logits.append(f32FromBits(u32(ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * index)))))
     host.close()
     logits
+}
+
+// Speculative-decoding verification: runs `ids` (1 .. ws.verifyRows tokens: the anchor and the proposals) as one causal batch from `startPos`, leaves the logits of each
+// row in the workspace ("logits" row k, readable with `readPrefillLogits(ws, k)`; `verifyArgmax` gives the argmax of every row), writes the KV rows of the batch, and does NOT
+// change the live convolution histories: they stay as they were before the call. `commitVerified(accepted)` then makes the state that of the first `accepted` rows
+// (accepted = 0 keeps the old state; the KV rows beyond the accepted prefix are simply overwritten by later steps).
+fun InklingModel.verify(var backend: Backend, ws: PrefillWorkspace, ids: array<int>, startPos: int): bool {
+    prefillError = ""
+    if (ws.verifyRows < 1 || ids.size < 1 || ids.size > ws.verifyRows || ids.size > ws.chunk || !ws.allLogits) {
+        prefillError = "verify needs a workspace with allLogits and verifyRows >= the number of rows (1 .. ${ws.verifyRows}, got ${ids.size})"
+        return false
+    }
+    prefillVerifyRows = ids.size
+    val ok = this.prefillChunk(backend, ws, ids, 0, ids.size, startPos, true)
+    prefillVerifyRows = 0
+    ok
+}
+
+// Makes the first `accepted` rows of the last `verify` the model's state (the convolution histories after row `accepted`).
+fun InklingModel.commitVerified(var backend: Backend, ws: PrefillWorkspace, accepted: int): bool {
+    if (accepted < 0 || accepted > ws.verifyRows) {
+        prefillError = "commitVerified: $accepted rows were not verified"
+        return false
+    }
+    if (accepted == 0) return true
+    val floats = ws.historyBytes / 4
+    backend.launch("copy_f32", kernelArgs().pointer(ws.snapshots, (accepted - 1) * ws.historyBytes).pointer(this.history).u32(floats), [floats])
+}
+
+// The argmax (lowest index on ties) of the logits of rows 0 .. rows - 1 of the last `verify`.
+trusted fun InklingModel.verifyArgmax(var backend: Backend, ws: PrefillWorkspace, rows: int): array<int>? {
+    val out = backend.allocate(rows * 4 + 16)
+    if (out == null) {
+        prefillError = "device memory for the argmax results is not available"
+        return null
+    }
+    for (row in 0 until rows) {
+        if (!backend.launch("argmax", kernelArgs().pointer(ws.buffer, ws.o("logits") + row * this.config.nVocabPadded * 4).u32(this.config.nVocab).pointer(out, row * 4), [1])) {
+            prefillError = "argmax failed"
+            return null
+        }
+    }
+    val host = nativeByteBuffer(rows * 4 + 8)
+    if (!backend.download(out, 0, nativePointerAddress(host.address), rows * 4)) {
+        prefillError = "downloading the argmax results failed"
+        host.close()
+        return null
+    }
+    val address = nativePointerAddress(host.address)
+    val result: array<int> = []
+    for (row in 0 until rows) result.append(ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * row)))
+    host.close()
+    result
 }
