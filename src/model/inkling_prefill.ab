@@ -106,13 +106,16 @@ fun prefillWorkspace(var backend: Backend, c: InklingConfig, chunk: int, allLogi
     at = wsAdd(offsets, "down", pairs * n, at)
     at = wsAdd(offsets, "moe", chunk * n, at)
     at = wsAdd(offsets, "msgs", chunk * 4 * n, at)
-    at = wsAdd(offsets, "ctrlIn", chunk * 2 * n, at)
-    at = wsAdd(offsets, "ctrlGate", 8 * chunk * c.gateRank, at)
-    at = wsAdd(offsets, "ctrlGain", chunk * n, at)
-    at = wsAdd(offsets, "ctrlForget", chunk * n, at)
-    at = wsAdd(offsets, "ctrlOut", chunk * n, at)
-    at = wsAdd(offsets, "tmpA", chunk * n, at)
-    at = wsAdd(offsets, "tmpB", chunk * n, at)
+    // three lanes of controller scratch: the q, k and v controllers of a layer run as parallel branches in a recording
+    for (lane in 0 until 3) {
+        at = wsAdd(offsets, "ctrlIn$lane", chunk * 2 * n, at)
+        at = wsAdd(offsets, "ctrlGate$lane", 8 * chunk * c.gateRank, at)
+        at = wsAdd(offsets, "ctrlGain$lane", chunk * n, at)
+        at = wsAdd(offsets, "ctrlForget$lane", chunk * n, at)
+        at = wsAdd(offsets, "ctrlOut$lane", chunk * n, at)
+        at = wsAdd(offsets, "tmpA$lane", chunk * n, at)
+        at = wsAdd(offsets, "tmpB$lane", chunk * n, at)
+    }
     at = wsAdd(offsets, "preludeOut", chunk * n, at)
     at = wsAdd(offsets, "bankOut", chunk * n, at)
     at = wsAdd(offsets, "logits", (if (allLogits) chunk else 1) * c.nVocabPadded, at)
@@ -258,24 +261,24 @@ private fun InklingModel.mixRows(var backend: Backend, ws: PrefillWorkspace, ban
 // control(cur, message) for every token (loop passes > 0): cur - tanh(forget) cur + tanh(gain) message with the gates of physical layer `ip`.
 // `message` is token t's n values at messageBase + t * messageStride (floats), `cur` and `output` contiguous [t][n].
 private fun InklingModel.controlRows(var backend: Backend, ws: PrefillWorkspace, ip: int, which: string, cur: int, messageBase: int, messageStride: int,
-    output: int, tokens: int): bool {
+    output: int, tokens: int, lane: int = 0): bool {
     val n = this.config.nEmbd
     val down = this.wr("blk.$ip.loop_${which}_ctrl_down.weight")
     val gain = this.wr("blk.$ip.loop_${which}_ctrl_gain.weight")
     val forget = this.wr("blk.$ip.loop_${which}_ctrl_forget.weight")
-    val tmpA = ws.o("tmpA")
-    val tmpB = ws.o("tmpB")
-    val ctrlIn = ws.o("ctrlIn")
+    val tmpA = ws.o("tmpA$lane")
+    val tmpB = ws.o("tmpB$lane")
+    val ctrlIn = ws.o("ctrlIn$lane")
     // contiguous copy of the message, then both normalized (weightless) into the [t][2n] controller input
     var ok = this.copyRows(backend, ws.buffer, messageBase, messageStride, ws.buffer, tmpB, n, n, tokens)
     ok = ok && opRmsNormPlain(backend, ws.buffer, cur, ws.buffer, tmpA, n, 0.000001, tokens)
     ok = ok && this.copyRows(backend, ws.buffer, tmpA, n, ws.buffer, ctrlIn, 2 * n, n, tokens)
     ok = ok && opRmsNormPlain(backend, ws.buffer, tmpB, ws.buffer, tmpA, n, 0.000001, tokens)
     ok = ok && this.copyRows(backend, ws.buffer, tmpA, n, ws.buffer, ctrlIn + n * 4, 2 * n, n, tokens)
-    ok = ok && this.dense(backend, ws, "blk.$ip.loop_${which}_ctrl_down.weight", ctrlIn, ws.o("ctrlGate"), tokens)
-    ok = ok && this.dense(backend, ws, "blk.$ip.loop_${which}_ctrl_gain.weight", ws.o("ctrlGate"), ws.o("ctrlGain"), tokens)
-    ok = ok && this.dense(backend, ws, "blk.$ip.loop_${which}_ctrl_forget.weight", ws.o("ctrlGate"), ws.o("ctrlForget"), tokens)
-    ok && opControlMix(backend, ws.buffer, cur, ws.buffer, tmpB, ws.buffer, ws.o("ctrlGain"), ws.buffer, ws.o("ctrlForget"), ws.buffer, output, tokens * n)
+    ok = ok && this.dense(backend, ws, "blk.$ip.loop_${which}_ctrl_down.weight", ctrlIn, ws.o("ctrlGate$lane"), tokens)
+    ok = ok && this.dense(backend, ws, "blk.$ip.loop_${which}_ctrl_gain.weight", ws.o("ctrlGate$lane"), ws.o("ctrlGain$lane"), tokens)
+    ok = ok && this.dense(backend, ws, "blk.$ip.loop_${which}_ctrl_forget.weight", ws.o("ctrlGate$lane"), ws.o("ctrlForget$lane"), tokens)
+    ok && opControlMix(backend, ws.buffer, cur, ws.buffer, tmpB, ws.buffer, ws.o("ctrlGain$lane"), ws.buffer, ws.o("ctrlForget$lane"), ws.buffer, output, tokens * n)
 }
 
 // One layer visit for the whole chunk; returns the new block count or -1.
@@ -321,12 +324,15 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
         for (j in 0 until 3) ok = ok && opCopy(backend, ws.buffer, x, ws.buffer, inputs + j * ws.chunk * nb, tokens * n)
     }
     if (!sharedInput && loopPass > 0) {
+        ok = ok && backend.fork(2)
         var j = 0
         for (which in ["q", "k", "v"]) {
-            ok = ok && this.controlRows(backend, ws, ip, which, inputs + j * ws.chunk * nb, ws.o("msgs") + j * nb, 4 * n, ws.o("ctrlOut"), tokens)
-            ok = ok && opCopy(backend, ws.buffer, ws.o("ctrlOut"), ws.buffer, inputs + j * ws.chunk * nb, tokens * n)
+            ok = ok && backend.branch(j)
+            ok = ok && this.controlRows(backend, ws, ip, which, inputs + j * ws.chunk * nb, ws.o("msgs") + j * nb, 4 * n, ws.o("ctrlOut$j"), tokens, j)
+            ok = ok && opCopy(backend, ws.buffer, ws.o("ctrlOut$j"), ws.buffer, inputs + j * ws.chunk * nb, tokens * n)
             j = j + 1
         }
+        ok = ok && backend.join()
     }
     if (sharedInput) {
     } else if (isSwa) {
@@ -476,8 +482,8 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     // MoE
     ok = ok && this.mixRows(backend, ws, ws.blocks, blocks, x, "blk.$ip.ffn_res_query.weight", 1, x, n, tokens)
     if (loopPass > 0) {
-        ok = ok && this.controlRows(backend, ws, ip, "ffn", x, ws.o("msgs") + 3 * nb, 4 * n, ws.o("ctrlOut"), tokens)
-        ok = ok && opCopy(backend, ws.buffer, ws.o("ctrlOut"), ws.buffer, x, tokens * n)
+        ok = ok && this.controlRows(backend, ws, ip, "ffn", x, ws.o("msgs") + 3 * nb, 4 * n, ws.o("ctrlOut0"), tokens)
+        ok = ok && opCopy(backend, ws.buffer, ws.o("ctrlOut0"), ws.buffer, x, tokens * n)
     }
     ok = ok && this.normRows(backend, ws, "blk.$ip.ffn_norm.weight", x, x, tokens)
     if (!ok) return -1
