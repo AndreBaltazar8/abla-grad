@@ -19,6 +19,11 @@ serve_options=()
 while (($#)); do
     case $1 in
         --port) [[ $# -ge 2 ]] || usage; port=$2 ;;
+        --no-speculation)
+            serve_options+=("$1")
+            shift
+            continue
+            ;;
         --ctx|--tokenizer|--drafter|--model-name|--max-tokens)
             [[ $# -ge 2 ]] || usage
             serve_options+=("$1" "$2")

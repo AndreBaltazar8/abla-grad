@@ -1,4 +1,4 @@
-// `abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N] [--capture-requests FILE]`: an OpenAI-compatible server for
+// `abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N] [--capture-requests FILE] [--no-speculation]`: an OpenAI-compatible server for
 // Inkling on the GPU, on 127.0.0.1 only. One request at a time (the rest wait in the listen queue). Endpoints: GET /v1/models, POST /v1/chat/completions
 // (streaming SSE and plain JSON, tools and tool calls, usage), GET /health. The model's KV cache and state stay between requests: a request whose prompt shares
 // its beginning with the previous conversation (opencode resends the whole history every turn) only processes the tokens after the shared part.
@@ -28,6 +28,9 @@ import "openai.ab"
 
 // The context when --ctx is not given: what the free device memory allows. From 65536 positions on the target keeps its cache in F16/Q8 (8192 bytes per
 // position, measured at 65536 and 131072); shorter contexts use the F32 ring (80000 bytes per position with the drafter).
+// Speculation stops paying near this prompt length (replay of the opencode capture: speculation 136.9 / 116.3 tok/s at 19.5k / 38k tokens, plain 124.9 / 115.6;
+// at 56k and 75k plain wins 110.4 / 105.6 against 106.3 / 101.7): longer prompts decode plain.
+private val SERVE_PLAIN_FROM = 45000
 private val SERVE_MAX_CTX = 131072
 private val SERVE_LONG_FROM = 65536
 private val SERVE_LONG_BYTES_PER_POSITION = 8192
@@ -73,7 +76,7 @@ private fun serveUtf8Boundary(text: string, cut: int): int {
     at
 }
 
-class ServeCounters(var requests: int = 0)
+class ServeCounters(var requests: int = 0, var plainOnly: bool = false)
 
 /** The state of one running chat request: what was sent, what is held back for stop strings, and the calls found. */
 class ServeRun(
@@ -183,7 +186,7 @@ private fun serveChat(
     val control = SpecControl()
     val events: array<ServeEvent> = []
     var stats = SpecStats()
-    val ok = session.turn(backend, model, maxTokens, stops, true, false, control, stats, { token ->
+    val ok = session.turn(backend, model, maxTokens, stops, true, counters.plainOnly || tokens.size > SERVE_PLAIN_FROM, control, stats, { token ->
         if (run.firstRaw == 0) run.firstRaw = monotonicNanoseconds()
         parser.feed(token, tokenizer.decode([token]), events)
         for (event in events) run.handle(event)
@@ -238,6 +241,7 @@ fun cmdServe(args: array<string>): int {
     var maxTokens = SERVE_DEFAULT_MAX_TOKENS
     var modelName = "inkling-2-mini"
     var capturePath = ""
+    var plainOnly = false
     var index = 0
     while (index < args.size) {
         val flag = args[index]
@@ -259,6 +263,9 @@ fun cmdServe(args: array<string>): int {
         } else if (flag == "--max-tokens" && index + 1 < args.size) {
             maxTokens = args[index + 1].parseInt() ?? 0
             index = index + 2
+        } else if (flag == "--no-speculation") {
+            plainOnly = true
+            index = index + 1
         } else if (flag == "--capture-requests" && index + 1 < args.size) {
             capturePath = args[index + 1]
             if (capturePath == "") return serveFail("--capture-requests needs a nonempty path")
@@ -272,7 +279,7 @@ fun cmdServe(args: array<string>): int {
         }
     }
     if (modelPath == "" || port < 1 || port > 65535 || (context != 0 && context < 512) || maxTokens < 1) {
-        eprintln("usage: abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N] [--capture-requests FILE]")
+        eprintln("usage: abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N] [--capture-requests FILE] [--no-speculation]")
         return 2
     }
     val file = ggufOpen(modelPath)
@@ -325,6 +332,7 @@ fun cmdServe(args: array<string>): int {
     if (capture != null && capture.descriptor < 0) return serveFail("could not create a new request capture file at $capturePath")
     eprintln("serve: listening on http://127.0.0.1:$port (model '$modelName')")
     val counters = ServeCounters()
+    counters.plainOnly = plainOnly
     val created = realtimeMilliseconds() / 1000
     tcpEnableGracefulShutdown()
     while (!tcpShutdownRequested()) {
