@@ -119,12 +119,17 @@ extern "C" __global__ void l2clip_rows(const float *x, const float *scale, float
 // problem [rowLen, tokens].
 val kernelPrefillScaleTau = """
 extern "C" __global__ void scale_tau_rows(float *x, unsigned rowLen, const unsigned *posPtr, unsigned floorValue, float alpha, unsigned tokens) {
-    const unsigned firstPos = *posPtr;
+    __shared__ float tau;
+    const unsigned t = blockIdx.y;
+    // one double-precision log per block (FP64 is slow on GeForce), not one per element
+    if (threadIdx.x == 0) {
+        const unsigned firstPos = *posPtr;
+        double ratio = (double(firstPos + t) + 1.0) / double(floorValue);
+        tau = float(1.0 + double(alpha) * log(ratio > 1.0 ? ratio : 1.0));
+    }
+    __syncthreads();
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned t = blockIdx.y;
     if (i >= rowLen || t >= tokens) return;
-    double ratio = (double(firstPos + t) + 1.0) / double(floorValue);
-    float tau = float(1.0 + double(alpha) * log(ratio > 1.0 ? ratio : 1.0));
     x[static_cast<unsigned long long>(t) * rowLen + i] *= tau;
 }
 """
