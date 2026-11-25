@@ -145,8 +145,8 @@ fun speculativeGenerate(
             }
         } else {
             for (b in 0 until SPEC_BATCH_CYCLES) {
-                val replayed = if (arm == 1) backend.replay(cycle2 ?? return false) else if (arm == 2) backend.replay(cycle3 ?? return false)
-                    else backend.replay(cycle4 ?? return false)
+                val replayed = if (arm == 1) backend.replay(cycle2) else if (arm == 2) replayOptional(backend, cycle3)
+                    else replayOptional(backend, cycle4)
                 if (!replayed) {
                     speculateError = "replaying a cycle failed"
                     return false
@@ -252,4 +252,9 @@ private fun recordCycle(
     val recording = backend.endRecording()
     if (!ok) return null
     recording
+}
+
+private fun replayOptional(var backend: Backend, recording: Recording?): bool {
+    if (recording == null) return false
+    backend.replay(recording)
 }
