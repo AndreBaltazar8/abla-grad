@@ -87,6 +87,52 @@ device memory with 22,076 MiB free.
 Exact input IDs, commands, raw samples and any failures are in
 `~/src/abla-grad-oracle/tg128-current-main/`.
 
+## Decode and first-token latency through depth 131,072
+
+The RTX 4090 used the original Inkling UD-Q4_K_M GGUF for all four
+runs at each depth. Decode rates are in tokens/s for 128 timed tokens.
+
+| Cached depth | abla-grad plain graph | abla-grad adaptive DSpark | llama.cpp mainline | Unsloth CUDA mix |
+|---:|---:|---:|---:|---:|
+| 8,192 | 117.21 | 116.80 | 74.03 | 95.03 |
+| 32,768 | 92.71 | 85.78 | 64.63 | 89.92 |
+| 131,072 | 35.44 | 35.44 | 48.88 | 64.95 |
+
+abla-grad `56d0e48` used Dickens prefixes of depth-plus-one IDs, with
+one seed ID. Its plain benchmark batched the untimed prefix in a
+scratch build with the same model and timed graph. The adaptive run
+used stock `spec-bench --adaptive --nmax 2 --n 129`. The first token
+comes from prompt ingestion and the timed loop generates the next 128.
+The capacity build uses F32 KV for the 8,192 and 32,768 rows and F16
+sliding rings with block-Q8 global KV for the 131,072 row. The two
+abla-grad modes use different prompt ingestion paths. Their generated
+streams shared 30 initial IDs at depth 8,192, shared 48 initial IDs at depth 32,768, shared 7 initial IDs at depth 131,072. Each adaptive run starts a fresh controller and includes
+its exploration. At 32,768, the controller switched four times and
+produced 100 plain tokens and 28 tokens from 18 speculative cycles.
+
+The reference builds, mainline `33aeb17` and Unsloth
+`b12649-mix-c7059d6`, used their synthetic prefixes, F16 KV, CUDA
+graphs, and full GPU offload. Each result is the mean of three
+`llama-bench -d N -n 128` repetitions, with batch and microbatch 512
+for the original configurations. mainline at depth 131,072 used batch 64 and microbatch 64. All runs used CPU affinity 24–27
+and one GPU lock per invocation.
+
+| Rendered chat prompt tokens | abla-grad server TTFT (s) |
+|---:|---:|
+| 32,768 | 28.68 |
+| 131,072 | 66.45 |
+
+TTFT uses stock `serve` at the same pin, context capacity 256 tokens
+above each prompt length, and the first emitted server token event.
+The server was model-warm from a short request and reused zero prompt
+tokens for each timed request. It chose prefill chunks of 128 at 32,768
+and 512 at 131,072. The timer includes request parsing,
+rendering, tokenization, and prefill. Model loading and network
+transport are outside the timer.
+
+Raw commands, exact IDs, traces and the untimed seed patch are in
+`~/src/abla-grad-oracle/tg128-128k/`.
+
 ## Decode and speculation across cache depths
 
 Throughput on the RTX 4090 in tokens/s on the pinned Inkling UD-Q4_K_M.
