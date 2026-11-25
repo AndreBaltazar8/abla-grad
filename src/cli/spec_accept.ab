@@ -24,11 +24,15 @@ fun cmdSpecAccept(args: array<string>): int {
     var cost = false
     var union = false
     var prefillTaps = false
+    var exactWindow = 0
     val positional: array<string> = []
     var index = 0
     while (index < args.size) {
         if (args[index] == "--n" && index + 1 < args.size) {
             count = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else if (args[index] == "--exact-window" && index + 1 < args.size) {
+            exactWindow = args[index + 1].parseInt() ?? 0
             index = index + 2
         } else if (args[index] == "--prefill-taps") {
             prefillTaps = true
@@ -88,7 +92,8 @@ fun cmdSpecAccept(args: array<string>): int {
         // the prompt's state and taps come from the batched prefill (f16 tensor cores) instead of step-mode decode
         val ws = prefillWorkspace(backend, config, 512, false) ?? return 1
         val head: array<int> = []
-        for (i in 0 until ids.size - 1) head.append(ids[i])
+        // the last `exactWindow` prompt positions stay in step mode (exact taps for the recent context)
+        for (i in 0 until (if (ids.size - 1 > exactWindow) ids.size - 1 - exactWindow else 0)) head.append(ids[i])
         if (!model.prefill(backend, ws, head, 0) || !drafter.pushTaps(backend, model.taps, 0, head.size)) {
             println("spec-accept: prefill: ${inklingPrefillLastError()} ${dsparkLastError()}")
             return 1
