@@ -4,6 +4,7 @@ import "../kernels/elementwise.ab"
 import "../kernels/inkling_small.ab"
 import "../kernels/depth_mix.ab"
 import "../kernels/step.ab"
+import "../kernels/tail_fused.ab"
 import "../kernels/requant.ab"
 import "../kernels/attention_split.ab"
 import "../kernels/matvec_k.ab"
@@ -317,6 +318,16 @@ private val cudaArgsKvStoreStep = [
 private val cudaArgsScaleTau = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_F32, KERNEL_ARG_F32, KERNEL_ARG_U32]
 private val cudaArgsStepAdvance = [KERNEL_ARG_POINTER]
 private val cudaArgsStepRecord = [KERNEL_ARG_POINTER]
+private val cudaArgsConvStepResidual = [
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_F32
+]
+private val cudaArgsCombineConv = [
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
+    KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_F32
+]
+private fun cudaConvStepResidualShape(args: KernelArgs, problem: array<int>): bool = args.words[5] == problem[0] && args.words[6] >= 2 && args.words[6] <= 64
+private fun cudaCombineConvShape(args: KernelArgs, problem: array<int>): bool =
+    args.words[6] == problem[0] && args.words[7] > 0 && args.words[8] >= 2 && args.words[8] <= 64
 private val cudaArgsRequant = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U32]
 private fun cudaRequantShape(args: KernelArgs, problem: array<int>): bool = problem[0] == args.words[2] * args.words[3]
 private val cudaArgsSpecBegin = [KERNEL_ARG_POINTER, KERNEL_ARG_POINTER]
@@ -569,6 +580,8 @@ private val cudaKernels = [
     CudaKernelSpec("scale_tau", kernelScaleTau, 256, 256, cudaArgsScaleTau, cudaScaleTauShape),
     CudaKernelSpec("step_advance", kernelStepAdvance, 1, 1, cudaArgsStepAdvance, cudaStepAdvanceShape),
     CudaKernelSpec("step_record", kernelStepRecord, 1, 1, cudaArgsStepRecord, cudaStepAdvanceShape),
+    CudaKernelSpec("conv_step_residual", kernelConvStepResidual, 256, 256, cudaArgsConvStepResidual, cudaConvStepResidualShape),
+    CudaKernelSpec("moe_combine_conv_residual", kernelMoeCombineConvResidual, 256, 256, cudaArgsCombineConv, cudaCombineConvShape),
     CudaKernelSpec("requant_q8_to_q6k", kernelRequantQ8ToQ6K, 32, 32, cudaArgsRequant, cudaRequantShape),
     CudaKernelSpec("spec_begin", kernelSpecBegin, 1, 1, cudaArgsSpecBegin, cudaStepAdvanceShape),
     CudaKernelSpec("spec_accept", kernelSpecAccept, 1, 1, cudaArgsSpecAccept, cudaStepAdvanceShape),

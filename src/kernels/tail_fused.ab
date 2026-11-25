@@ -1,0 +1,37 @@
+// The elementwise tail chains of a layer visit fused into one launch each (ablac-60-2); every channel c is independent, so the chains are per-thread.
+// Plain short convolution (no dynamic taps), as in conv_step: window = history[0..nConv-2] ++ x; out = (x + sum_k w[c][k] * window[k]) * outScale; history shifts by one.
+
+// post-attention convolution + residual: out = conv(x) + residual (saves the following add)
+val kernelConvStepResidual = """
+extern "C" __global__ void conv_step_residual(const float *x, float *history, const float *w, float *out, const float *residual,
+                                              unsigned channels, unsigned nConv, float outScale) {
+    unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels || nConv > 64) return;
+    float window[64];
+    for (unsigned k = 0; k + 1 < nConv; ++k) window[k] = history[(unsigned long long)k * channels + c];
+    float current = x[c];
+    window[nConv - 1] = current;
+    float sum = current;
+    for (unsigned k = 0; k < nConv; ++k) sum += w[(unsigned long long)c * nConv + k] * window[k];
+    for (unsigned k = 0; k + 1 < nConv; ++k) history[(unsigned long long)k * channels + c] = window[k + 1];
+    out[c] = sum * outScale + residual[c];
+}
+"""
+
+// expert combine + ffn convolution + residual: x = conv(sum_i weights[i] * expertOut[i][c]) + residual (moe_combine, conv_step and the final add in one)
+val kernelMoeCombineConvResidual = """
+extern "C" __global__ void moe_combine_conv_residual(const float *expertOut, const float *weights, float *history, const float *w, float *out,
+                                                     const float *residual, unsigned rows, unsigned nUsed, unsigned nConv, float outScale) {
+    unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= rows || nConv > 64) return;
+    float current = 0.0f;
+    for (unsigned i = 0; i < nUsed; ++i) current += weights[i] * expertOut[(unsigned long long)i * rows + c];
+    float window[64];
+    for (unsigned k = 0; k + 1 < nConv; ++k) window[k] = history[(unsigned long long)k * rows + c];
+    window[nConv - 1] = current;
+    float sum = current;
+    for (unsigned k = 0; k < nConv; ++k) sum += w[(unsigned long long)c * nConv + k] * window[k];
+    for (unsigned k = 0; k + 1 < nConv; ++k) history[(unsigned long long)k * rows + c] = window[k + 1];
+    out[c] = sum * outScale + residual[c];
+}
+"""

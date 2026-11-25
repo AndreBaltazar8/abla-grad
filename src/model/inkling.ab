@@ -396,17 +396,25 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     val postConv = this.w("blk.$ip.attn_post_conv.weight")
     // x (the layer's input) stays untouched until the very end, so it doubles as the residual: no copies
     val attnOut = this.so("attnOut")
-    ok = ok && opConvStep(backend, this.scratch, oproj, this.history, aHistory, this.arena, postConv.offset, this.scratch, 0, false,
-        this.scratch, attnOut, n, c.nConv, 1, plainScale)
+    // The fused tail (no dumps): the convolution of the attention output also adds the residual x, unless this layer starts a block.
+    val fuseTail = this.dumpDir == ""
+    val startsBlock = ip % c.blockSize == 0
+    var ffnInp = attnOut
+    if (!startsBlock) ffnInp = this.so("ffnInp")
+    if (fuseTail && !startsBlock) {
+        ok = ok && opConvStepResidual(backend, this.scratch, oproj, this.history, aHistory, this.arena, postConv.offset, this.scratch, ffnInp, this.scratch, x,
+            n, c.nConv, plainScale)
+    } else {
+        ok = ok && opConvStep(backend, this.scratch, oproj, this.history, aHistory, this.arena, postConv.offset, this.scratch, 0, false,
+            this.scratch, attnOut, n, c.nConv, 1, plainScale)
+    }
     if (!ok) return -1
 
     // block residual: ffnInp = x + attention output, or just the attention output when this layer starts a block (x then joins the blocks)
-    var ffnInp = attnOut
-    if (ip % c.blockSize == 0) {
+    if (startsBlock) {
         ok = opCopy(backend, this.scratch, x, this.blocks, blocks * nb, n)
         blocks = blocks + 1
-    } else {
-        ffnInp = this.so("ffnInp")
+    } else if (!fuseTail) {
         ok = opAdd(backend, this.scratch, x, this.scratch, attnOut, this.scratch, ffnInp, n)
     }
     this.dump(backend, pos, "ffn_inp-$slot", ffnInp, n)
@@ -459,12 +467,18 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     this.dump(backend, pos, "ffn_moe_situ-$slot", this.so("act"), c.nExpertUsed * nFf)
     ok = ok && opMatvecIndexed(backend, downKind, this.arena, downRef.offset, this.scratch, this.so("act"), this.scratch, this.so("down"), n, nFf,
         this.scratch, ids, c.nExpertUsed, downRowBytes * n, nFf, this.arena, downScales.offset, this.has("blk.$ip.ffn_down_exps.scale"))
-    ok = ok && opMoeCombine(backend, this.scratch, this.so("down"), this.scratch, weights, this.scratch, this.so("moe"), n, c.nExpertUsed)
     val ffnPost = this.w("blk.$ip.ffn_post_conv.weight")
-    ok = ok && opConvStep(backend, this.scratch, this.so("moe"), this.history, fHistory, this.arena, ffnPost.offset, this.scratch, 0, false,
-        this.scratch, this.so("ffnConv"), n, c.nConv, 1, plainScale)
-    this.dump(backend, pos, "ffn_out-$slot", this.so("ffnConv"), n)
-    ok = ok && opAdd(backend, this.scratch, ffnInp, this.scratch, this.so("ffnConv"), this.scratch, x, n)
+    if (fuseTail) {
+        // expert combine, the ffn convolution and the residual add in one launch: x = conv(sum) + ffnInp
+        ok = ok && opMoeCombineConvResidual(backend, this.scratch, this.so("down"), this.scratch, weights, this.history, fHistory, this.arena, ffnPost.offset,
+            this.scratch, x, this.scratch, ffnInp, n, c.nExpertUsed, c.nConv, plainScale)
+    } else {
+        ok = ok && opMoeCombine(backend, this.scratch, this.so("down"), this.scratch, weights, this.scratch, this.so("moe"), n, c.nExpertUsed)
+        ok = ok && opConvStep(backend, this.scratch, this.so("moe"), this.history, fHistory, this.arena, ffnPost.offset, this.scratch, 0, false,
+            this.scratch, this.so("ffnConv"), n, c.nConv, 1, plainScale)
+        this.dump(backend, pos, "ffn_out-$slot", this.so("ffnConv"), n)
+        ok = ok && opAdd(backend, this.scratch, ffnInp, this.scratch, this.so("ffnConv"), this.scratch, x, n)
+    }
     this.dump(backend, pos, "l_out-$slot", x, n)
     if (!ok) {
         inklingError = "a launch failed in layer $ip (visit $visit)"

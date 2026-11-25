@@ -354,3 +354,25 @@ fun opCopySelect(var backend: Backend, src: DeviceBuffer, srcOffset: int, dst: D
 // Layout v2 (up to 4 proposals): see src/kernels/step.ab.
 fun opSpecAcceptN(var backend: Backend, step: DeviceBuffer, spec: DeviceBuffer, maxCtx: int): bool =
     backend.launch("spec_accept_n", kernelArgs().pointer(step, 0).pointer(spec, 0).u32(maxCtx), [1])
+
+// ---- fused elementwise tails (src/kernels/tail_fused.ab) ----
+fun opConvStepResidual(
+    var backend: Backend, x: DeviceBuffer, xOffset: int, history: DeviceBuffer, historyOffset: int, w: DeviceBuffer, wOffset: int,
+    out: DeviceBuffer, outOffset: int, residual: DeviceBuffer, residualOffset: int, channels: int, nConv: int, outScale: f32
+): bool = backend.launch(
+    "conv_step_residual",
+    kernelArgs().pointer(x, xOffset).pointer(history, historyOffset).pointer(w, wOffset).pointer(out, outOffset).pointer(residual, residualOffset)
+        .u32(channels).u32(nConv).f32(outScale),
+    [channels]
+)
+
+fun opMoeCombineConvResidual(
+    var backend: Backend, expertOut: DeviceBuffer, expertOutOffset: int, weights: DeviceBuffer, weightsOffset: int, history: DeviceBuffer, historyOffset: int,
+    w: DeviceBuffer, wOffset: int, out: DeviceBuffer, outOffset: int, residual: DeviceBuffer, residualOffset: int,
+    rows: int, nUsed: int, nConv: int, outScale: f32
+): bool = backend.launch(
+    "moe_combine_conv_residual",
+    kernelArgs().pointer(expertOut, expertOutOffset).pointer(weights, weightsOffset).pointer(history, historyOffset).pointer(w, wOffset)
+        .pointer(out, outOffset).pointer(residual, residualOffset).u32(rows).u32(nUsed).u32(nConv).f32(outScale),
+    [rows]
+)

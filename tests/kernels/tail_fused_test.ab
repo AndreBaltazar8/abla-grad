@@ -1,0 +1,70 @@
+// conv_step_residual and moe_combine_conv_residual against the unfused chains they replace (conv_step + add; moe_combine + conv_step + add): equal up to the
+// last bit of the output (the fused kernel contracts the scale and the residual add into one FMA); the history must match exactly.
+import "abla/io"
+import "abla/float"
+import "abla/float/text"
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "support.ab"
+
+fun same(name: string, a: array<f32>, b: array<f32>, tolerance: f64 = 0.0): bool {
+    for (i in 0 until a.size) {
+        val difference = f32ToF64(a[i]) - f32ToF64(b[i])
+        if (difference > tolerance || -difference > tolerance) {
+            println("$name: element $i differs: ${a[i]} vs ${b[i]}")
+            return false
+        }
+    }
+    true
+}
+
+fun run(var backend: Backend): bool {
+    val channels = 300
+    val nConv = 4
+    val hist = testSignal((nConv - 1) * channels, 41)
+    val weights = testSignal(channels * nConv, 42)
+    val x = testSignal(channels, 43)
+    val residual = testSignal(channels, 44)
+    val scale: f32 = 0.4472136
+    // conv + residual
+    val h1 = uploadFloats(backend, hist) ?? return false
+    val h2 = uploadFloats(backend, hist) ?? return false
+    val dw = uploadFloats(backend, weights) ?? return false
+    val dx = uploadFloats(backend, x) ?? return false
+    val dres = uploadFloats(backend, residual) ?? return false
+    val conv = uploadFloats(backend, testSignal(channels, 45)) ?? return false
+    val sum = uploadFloats(backend, testSignal(channels, 46)) ?? return false
+    val fused = uploadFloats(backend, testSignal(channels, 47)) ?? return false
+    if (!backend.launch("conv_step", kernelArgs().pointer(dx).pointer(h1).pointer(dw).u64(0).pointer(conv).u32(channels).u32(nConv).u32(1).f32(scale), [channels])) return false
+    if (!backend.launch("add", kernelArgs().pointer(dres).pointer(conv).pointer(sum).u32(channels), [channels])) return false
+    if (!backend.launch("conv_step_residual", kernelArgs().pointer(dx).pointer(h2).pointer(dw).pointer(fused).pointer(dres).u32(channels).u32(nConv).f32(scale), [channels])) return false
+    var ok = same("conv_step_residual output", downloadFloats(backend, sum, channels) ?? return false, downloadFloats(backend, fused, channels) ?? return false, 0.000001)
+    ok = ok && same("conv_step_residual history", downloadFloats(backend, h1, (nConv - 1) * channels) ?? return false, downloadFloats(backend, h2, (nConv - 1) * channels) ?? return false)
+    // combine + conv + residual
+    val nUsed = 8
+    val down = uploadFloats(backend, testSignal(nUsed * channels, 51)) ?? return false
+    val wts = uploadFloats(backend, testSignal(nUsed, 52)) ?? return false
+    val g1 = uploadFloats(backend, hist) ?? return false
+    val g2 = uploadFloats(backend, hist) ?? return false
+    val moe = uploadFloats(backend, testSignal(channels, 53)) ?? return false
+    val conv2 = uploadFloats(backend, testSignal(channels, 54)) ?? return false
+    val sum2 = uploadFloats(backend, testSignal(channels, 55)) ?? return false
+    val fused2 = uploadFloats(backend, testSignal(channels, 56)) ?? return false
+    if (!backend.launch("moe_combine", kernelArgs().pointer(down).pointer(wts).pointer(moe).u32(channels).u32(nUsed), [channels])) return false
+    if (!backend.launch("conv_step", kernelArgs().pointer(moe).pointer(g1).pointer(dw).u64(0).pointer(conv2).u32(channels).u32(nConv).u32(1).f32(scale), [channels])) return false
+    if (!backend.launch("add", kernelArgs().pointer(dres).pointer(conv2).pointer(sum2).u32(channels), [channels])) return false
+    if (!backend.launch("moe_combine_conv_residual", kernelArgs().pointer(down).pointer(wts).pointer(g2).pointer(dw).pointer(fused2).pointer(dres).u32(channels).u32(nUsed).u32(nConv).f32(scale), [channels])) return false
+    ok = ok && same("moe_combine_conv_residual output", downloadFloats(backend, sum2, channels) ?? return false, downloadFloats(backend, fused2, channels) ?? return false, 0.000001)
+    ok = ok && same("moe_combine_conv_residual history", downloadFloats(backend, g1, (nConv - 1) * channels) ?? return false, downloadFloats(backend, g2, (nConv - 1) * channels) ?? return false)
+    ok
+}
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    if (!run(backend)) {
+        println("tail fused kernel test FAILED (${cudaLastError()})")
+        return 1
+    }
+    println("tail fused kernel test passed")
+    0
+}
