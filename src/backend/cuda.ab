@@ -379,7 +379,7 @@ private fun cudaPrefillTapRowsShape(args: KernelArgs, problem: array<int>): bool
     args.words[3] == problem[0] && args.words[6] == problem[1] && args.words[4] < args.words[5]
 private fun cudaPrefillCommitSelectShape(args: KernelArgs, problem: array<int>): bool = args.words[3] == problem[0]
 private val cudaArgsMoeMapRows = [prefillArgP, prefillArgU, prefillArgU, prefillArgP, prefillArgU]
-private fun cudaPrefillMoeMapRowsShape(args: KernelArgs, problem: array<int>): bool = problem[0] == 1 && args.words[1] >= 1 && args.words[1] <= 3 && args.words[2] > 0 && args.words[4] > 0
+private fun cudaPrefillMoeMapRowsShape(args: KernelArgs, problem: array<int>): bool = problem[0] == 1 && args.words[1] >= 1 && args.words[1] <= 5 && args.words[2] > 0 && args.words[4] > 0
 private val cudaArgsPrefillAttSplit = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgP, prefillArgU, prefillArgU, prefillArgF, prefillArgU, prefillArgU, prefillArgP, prefillArgP]
 private val cudaArgsPrefillAttMerge = [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU]
 private fun cudaPrefillAttentionSplitShape(args: KernelArgs, problem: array<int>): bool =
