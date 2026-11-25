@@ -371,6 +371,12 @@ private fun cudaPrefillTapRowsShape(args: KernelArgs, problem: array<int>): bool
 private fun cudaPrefillCommitSelectShape(args: KernelArgs, problem: array<int>): bool = args.words[3] == problem[0]
 private val cudaArgsMoeMapRows = [prefillArgP, prefillArgU, prefillArgU, prefillArgP, prefillArgU]
 private fun cudaPrefillMoeMapRowsShape(args: KernelArgs, problem: array<int>): bool = problem[0] == 1 && args.words[1] >= 1 && args.words[1] <= 3 && args.words[2] > 0 && args.words[4] > 0
+private val cudaArgsPrefillAttSplit = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgP, prefillArgU, prefillArgU, prefillArgF, prefillArgU, prefillArgU, prefillArgP, prefillArgP]
+private val cudaArgsPrefillAttMerge = [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU]
+private fun cudaPrefillAttentionSplitShape(args: KernelArgs, problem: array<int>): bool =
+    args.words[5] == problem[0] && args.words[6] > 0 && args.words[5] % args.words[6] == 0 && args.words[12] > 0 && args.words[13] > 0 &&
+        problem[1] == (args.words[12] + 31) / 32 * args.words[13] && args.words[0] % 16 == 0 && args.words[1] % 16 == 0 && args.words[2] % 16 == 0
+private fun cudaPrefillAttentionMergeShape(args: KernelArgs, problem: array<int>): bool = args.words[3] == problem[0] && args.words[4] == problem[1] && args.words[5] > 0
 private val cudaArgsGatherRows = [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU]
 private val cudaArgsCopyRows = [prefillArgP, prefillArgU, prefillArgP, prefillArgU, prefillArgU, prefillArgU]
 private val cudaArgsDepthMixBatch = [prefillArgP, prefillArgU, prefillArgU, prefillArgP, prefillArgU, prefillArgP, prefillArgU, prefillArgP, prefillArgU, prefillArgU, prefillArgF, prefillArgU]
@@ -565,6 +571,8 @@ private val cudaPrefillKernels = [
     CudaKernelSpec("tap_rows", kernelPrefillTapRows, 256, 256, cudaArgsTapRows, cudaPrefillTapRowsShape, 2),
     CudaKernelSpec("commit_select", kernelPrefillCommitSelect, 256, 256, cudaArgsCommitSelect, cudaPrefillCommitSelectShape),
     CudaKernelSpec("moe_map_rows", kernelPrefillMoeMapRows, 1, 1, cudaArgsMoeMapRows, cudaPrefillMoeMapRowsShape),
+    CudaKernelSpec("attention_prefill_tc_split", kernelPrefillAttentionTc, 1, 64, cudaArgsPrefillAttSplit, cudaPrefillAttentionSplitShape, 2),
+    CudaKernelSpec("attention_prefill_merge", kernelPrefillAttentionTc, 1, 128, cudaArgsPrefillAttMerge, cudaPrefillAttentionMergeShape, 2),
     CudaKernelSpec("matmul_f32_exact_split", kernelPrefillMatmulF32ExactSplit, 16, 256, cudaArgsMatmulSplit, cudaPrefillExactSplitShape, 2),
     CudaKernelSpec("matmul_f32_exact", kernelPrefillMatmulF32Exact, 16, 256, cudaArgsPrefillMatmul, cudaPrefillMatmulExactShape, 2),
     CudaKernelSpec("gather_rows_q8_0", kernelPrefillGatherQ8_0, 256, 256, cudaArgsGatherRows, cudaPrefillGatherShape, 2),

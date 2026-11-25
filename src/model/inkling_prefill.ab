@@ -97,6 +97,8 @@ fun prefillWorkspace(var backend: Backend, c: InklingConfig, chunk: int, allLogi
     at = wsAdd(offsets, "sortedToken", pairs, at)
     at = wsAdd(offsets, "slotOfPair", pairs, at)
     at = wsAdd(offsets, "iota", pairs, at)
+    at = wsAdd(offsets, "attPartO", 8 * chunk * c.nHead * 128, at)
+    at = wsAdd(offsets, "attPartML", 8 * chunk * c.nHead * 2, at)
     at = wsAdd(offsets, "expertMap", 4 * 3 * c.nExpertUsed, at)
     at = wsAdd(offsets, "plan", c.nExpert + 2 + 2 * maxTiles, at)
     at = wsAdd(offsets, "gu", pairs * 2 * c.nFfExp, at)
@@ -402,6 +404,14 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
         ok = ok && backend.launch("attention_prefill_rel", kernelArgs().pointer(ws.buffer, q).pointer(this.kCache, visit * layerCacheBytes)
             .pointer(this.vCache, visit * layerCacheBytes).pointer(ws.buffer, table).pointer(ws.buffer, att).u32(c.nHead).u32(c.nHeadKv).u32(c.headDim)
             .u32(if (isSwa) c.nSwa else 0).u32(firstPos).u32(extent).u32(this.maxCtx).f32(scale), [c.nHead, tokens])
+    } else if (prefillVerifyRows > 0 && tokens <= 32) {
+        // few rows, many keys: split the keys over 8 blocks per head and merge (with the sink)
+        ok = ok && backend.launch("attention_prefill_tc_split", kernelArgs().pointer(ws.buffer, q).pointer(this.kCache, visit * layerCacheBytes)
+            .pointer(this.vCache, visit * layerCacheBytes).pointer(ws.buffer, table).pointer(ws.buffer, att).u32(c.nHead).u32(c.nHeadKv)
+            .u32(if (isSwa) c.nSwa else 0).pointer(posBuf, posOff).u32(extent).u32(this.maxCtx).f32(scale).u32(tokens).u32(8)
+            .pointer(ws.buffer, ws.o("attPartO")).pointer(ws.buffer, ws.o("attPartML")), [c.nHead, (tokens + 31) / 32 * 8])
+        ok = ok && backend.launch("attention_prefill_merge", kernelArgs().pointer(ws.buffer, ws.o("attPartO")).pointer(ws.buffer, ws.o("attPartML"))
+            .pointer(ws.buffer, att).u32(c.nHead).u32(tokens).u32(8), [c.nHead, tokens])
     } else {
     ok = ok && backend.launch("attention_prefill_tc", kernelArgs().pointer(ws.buffer, q).pointer(this.kCache, visit * layerCacheBytes)
         .pointer(this.vCache, visit * layerCacheBytes).pointer(ws.buffer, table).pointer(ws.buffer, att).u32(c.nHead).u32(c.nHeadKv)

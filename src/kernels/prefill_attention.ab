@@ -218,4 +218,206 @@ extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc(
         if (validB) *reinterpret_cast<float2 *>(out + (static_cast<unsigned long long>(rowB) * nHead + head) * AT_DIM + dim) = make_float2(o[dt][2] * invB, o[dt][3] * invB);
     }
 }
+extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc_split(
+    const float *q, const float *kCache, const float *vCache, const float *table, float *out, unsigned nHead, unsigned nKvHead,
+    unsigned window, const unsigned *posPtr, unsigned extent, unsigned maxCtx, float scale, unsigned tokens, unsigned splits, float *partO, float *partML) {
+    const unsigned firstPos = *posPtr;
+    __shared__ __align__(16) unsigned short ks[AT_KEYS * AT_PITCH];
+    __shared__ __align__(16) unsigned short kl[AT_KEYS * AT_PITCH];
+    __shared__ __align__(16) unsigned short vs[AT_KEYS * AT_PITCH];
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned warp = tid >> 5;
+    const unsigned head = blockIdx.x;
+    const unsigned kvHead = head / (nHead / nKvHead);
+    const unsigned tileFirst = (blockIdx.y / splits) * (AT_WARPS * 16);
+    const unsigned split = blockIdx.y % splits;
+    const unsigned group = lane >> 2;
+    const unsigned quad = lane & 3u;
+    const unsigned rowA = tileFirst + warp * 16 + group;
+    const unsigned rowB = rowA + 8;
+    const bool validA = rowA < tokens;
+    const bool validB = rowB < tokens;
+    const unsigned posA = firstPos + rowA;
+    const unsigned posB = firstPos + rowB;
+    const float *kBase = kCache + static_cast<unsigned long long>(kvHead) * maxCtx * AT_DIM;
+    const float *vBase = vCache + static_cast<unsigned long long>(kvHead) * maxCtx * AT_DIM;
+
+    // Q fragments (A operand, 8 k-steps of 16 dims)
+    unsigned qa[8][4];
+    unsigned ql[8][4];
+    {
+        const float *qa0 = q + (static_cast<unsigned long long>(validA ? rowA : 0) * nHead + head) * AT_DIM;
+        const float *qb0 = q + (static_cast<unsigned long long>(validB ? rowB : 0) * nHead + head) * AT_DIM;
+        #pragma unroll
+        for (int ks2 = 0; ks2 < 8; ++ks2) {
+            unsigned c = ks2 * 16 + 2 * quad;
+            float2 a0 = validA ? *reinterpret_cast<const float2 *>(qa0 + c) : make_float2(0.f, 0.f);
+            float2 a1 = validB ? *reinterpret_cast<const float2 *>(qb0 + c) : make_float2(0.f, 0.f);
+            float2 a2 = validA ? *reinterpret_cast<const float2 *>(qa0 + c + 8) : make_float2(0.f, 0.f);
+            float2 a3 = validB ? *reinterpret_cast<const float2 *>(qb0 + c + 8) : make_float2(0.f, 0.f);
+            at_split(a0.x, a0.y, qa[ks2][0], ql[ks2][0]);
+            at_split(a1.x, a1.y, qa[ks2][1], ql[ks2][1]);
+            at_split(a2.x, a2.y, qa[ks2][2], ql[ks2][2]);
+            at_split(a3.x, a3.y, qa[ks2][3], ql[ks2][3]);
+        }
+    }
+    // key range of the block: from the first row's window start to the last valid row's position
+    const unsigned lastRow = (tileFirst + AT_WARPS * 16 < tokens ? tileFirst + AT_WARPS * 16 : tokens) - 1;
+    const unsigned posFirst = firstPos + tileFirst;
+    const unsigned posLast = firstPos + lastRow;
+    const unsigned keyFirst = window != 0 && posFirst + 1 > window ? posFirst + 1 - window : 0;
+
+    // this block's share of the keys: `per` (a multiple of 32) keys starting at keyFirst + split * per
+    const unsigned total = posLast + 1 - keyFirst;
+    const unsigned per = ((total + splits - 1) / splits + 31) / 32 * 32;
+    const unsigned startKey = keyFirst + split * per;
+    const unsigned endKey = startKey + per < posLast + 1 ? startKey + per : posLast + 1;
+
+    float o[16][4];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) { o[i][0] = 0.f; o[i][1] = 0.f; o[i][2] = 0.f; o[i][3] = 0.f; }
+    float mA = -1.0e30f, mB = -1.0e30f, lA = 0.0f, lB = 0.0f;   // no sink here: the merge adds its logit 0
+    const float *tableA = table + (static_cast<unsigned long long>(validA ? rowA : 0) * nHead + head) * (extent + 1ull);
+    const float *tableB = table + (static_cast<unsigned long long>(validB ? rowB : 0) * nHead + head) * (extent + 1ull);
+
+    for (unsigned j0 = startKey; j0 < endKey; j0 += AT_KEYS) {
+        __syncthreads();
+        // load the K and V tiles (rows beyond the last key are zero)
+        for (unsigned idx = tid; idx < AT_KEYS * (AT_DIM / 4); idx += 64) {
+            unsigned row = idx >> 5;
+            unsigned c4 = (idx & 31u) * 4;
+            unsigned key = j0 + row;
+            float4 kv = make_float4(0.f, 0.f, 0.f, 0.f);
+            float4 vv = kv;
+            if (key < endKey) {
+                kv = *reinterpret_cast<const float4 *>(kBase + static_cast<unsigned long long>(key) * AT_DIM + c4);
+                vv = *reinterpret_cast<const float4 *>(vBase + static_cast<unsigned long long>(key) * AT_DIM + c4);
+            }
+            unsigned h0, l0, h1, l1;
+            at_split(kv.x, kv.y, h0, l0);
+            at_split(kv.z, kv.w, h1, l1);
+            *reinterpret_cast<uint2 *>(&ks[row * AT_PITCH + c4]) = make_uint2(h0, h1);
+            *reinterpret_cast<uint2 *>(&kl[row * AT_PITCH + c4]) = make_uint2(l0, l1);
+            *reinterpret_cast<uint2 *>(&vs[row * AT_PITCH + c4]) = make_uint2(at_pack(vv.x, vv.y), at_pack(vv.z, vv.w));
+        }
+        __syncthreads();
+        // S = Q K^T for 4 key tiles of 8, with the f16 hi/lo split of Q and K: Qh Kh + Qh Kl + Ql Kh
+        float s[4][4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) { s[i][0] = 0.f; s[i][1] = 0.f; s[i][2] = 0.f; s[i][3] = 0.f; }
+        #pragma unroll
+        for (int ks2 = 0; ks2 < 8; ++ks2) {
+            #pragma unroll
+            for (int np = 0; np < 2; ++np) {
+                unsigned r[4];
+                unsigned rl[4];
+                unsigned key = np * 16 + (lane & 7u) + (lane >> 4) * 8u;
+                unsigned at = key * AT_PITCH + ks2 * 16 + ((lane >> 3) & 1u) * 8u;
+                at_ldmatrix(r, &ks[at]);
+                at_ldmatrix(rl, &kl[at]);
+                at_mma(s[2 * np], qa[ks2], r[0], r[1]);
+                at_mma(s[2 * np + 1], qa[ks2], r[2], r[3]);
+                at_mma(s[2 * np], qa[ks2], rl[0], rl[1]);
+                at_mma(s[2 * np + 1], qa[ks2], rl[2], rl[3]);
+                at_mma(s[2 * np], ql[ks2], r[0], r[1]);
+                at_mma(s[2 * np + 1], ql[ks2], r[2], r[3]);
+            }
+        }
+        // logits, masks, online softmax
+        float maxA = mA, maxB = mB;
+        #pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const bool lower = e >= 2;
+                const unsigned pos = lower ? posB : posA;
+                const bool valid = lower ? validB : validA;
+                const unsigned key = j0 + nt * 8 + 2 * quad + (e & 1);
+                const unsigned d = pos - key;   // wraps for key > pos
+                const bool visible = valid && key <= pos && key < endKey && (window == 0 || d < window);
+                float value = -3.0e38f;
+                if (visible) value = s[nt][e] * scale + (lower ? tableB : tableA)[d < extent ? d : extent];
+                s[nt][e] = value;
+                if (lower) maxB = fmaxf(maxB, value); else maxA = fmaxf(maxA, value);
+            }
+        }
+        maxA = fmaxf(maxA, __shfl_xor_sync(0xffffffffu, maxA, 1));
+        maxA = fmaxf(maxA, __shfl_xor_sync(0xffffffffu, maxA, 2));
+        maxB = fmaxf(maxB, __shfl_xor_sync(0xffffffffu, maxB, 1));
+        maxB = fmaxf(maxB, __shfl_xor_sync(0xffffffffu, maxB, 2));
+        const float alphaA = __expf(mA - maxA);
+        const float alphaB = __expf(mB - maxB);
+        mA = maxA;
+        mB = maxB;
+        float sumA = 0.f, sumB = 0.f;
+        unsigned p[4][2];
+        #pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            float e0 = s[nt][0] > -1.0e29f ? __expf(s[nt][0] - mA) : 0.0f;
+            float e1 = s[nt][1] > -1.0e29f ? __expf(s[nt][1] - mA) : 0.0f;
+            float e2 = s[nt][2] > -1.0e29f ? __expf(s[nt][2] - mB) : 0.0f;
+            float e3 = s[nt][3] > -1.0e29f ? __expf(s[nt][3] - mB) : 0.0f;
+            sumA += e0 + e1;
+            sumB += e2 + e3;
+            p[nt][0] = at_pack(e0, e1);
+            p[nt][1] = at_pack(e2, e3);
+        }
+        sumA += __shfl_xor_sync(0xffffffffu, sumA, 1);
+        sumA += __shfl_xor_sync(0xffffffffu, sumA, 2);
+        sumB += __shfl_xor_sync(0xffffffffu, sumB, 1);
+        sumB += __shfl_xor_sync(0xffffffffu, sumB, 2);
+        lA = lA * alphaA + sumA;
+        lB = lB * alphaB + sumB;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            o[i][0] *= alphaA; o[i][1] *= alphaA;
+            o[i][2] *= alphaB; o[i][3] *= alphaB;
+        }
+        // O += P V: two k-steps of 16 keys, sixteen dimension tiles of 8
+        #pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+            unsigned a[4] = {p[2 * kk][0], p[2 * kk][1], p[2 * kk + 1][0], p[2 * kk + 1][1]};
+            #pragma unroll
+            for (int dp = 0; dp < 8; ++dp) {
+                unsigned r[4];
+                unsigned key = kk * 16 + (lane & 7u) + ((lane >> 3) & 1u) * 8u;
+                unsigned dim = dp * 16 + (lane >> 4) * 8u;
+                at_ldmatrix_trans(r, &vs[key * AT_PITCH + dim]);
+                at_mma(o[2 * dp], a, r[0], r[1]);
+                at_mma(o[2 * dp + 1], a, r[2], r[3]);
+            }
+        }
+    }
+    // unnormalized partial output and the (max, sum) of this split
+    #pragma unroll
+    for (int dt = 0; dt < 16; ++dt) {
+        unsigned dim = dt * 8 + 2 * quad;
+        if (validA) *reinterpret_cast<float2 *>(partO + ((static_cast<unsigned long long>(split) * tokens + rowA) * nHead + head) * AT_DIM + dim) = make_float2(o[dt][0], o[dt][1]);
+        if (validB) *reinterpret_cast<float2 *>(partO + ((static_cast<unsigned long long>(split) * tokens + rowB) * nHead + head) * AT_DIM + dim) = make_float2(o[dt][2], o[dt][3]);
+    }
+    if (quad == 0) {
+        if (validA) { float *ml = partML + ((static_cast<unsigned long long>(split) * tokens + rowA) * nHead + head) * 2; ml[0] = mA; ml[1] = lA; }
+        if (validB) { float *ml = partML + ((static_cast<unsigned long long>(split) * tokens + rowB) * nHead + head) * 2; ml[0] = mB; ml[1] = lB; }
+    }
+}
+
+// Combines the splits of attention_prefill_tc_split: out = sum_s e^(m_s - M) o_s / (e^(0 - M) + sum_s e^(m_s - M) l_s) with M the largest of 0 (the sink's logit) and the m_s.
+// problem [nHead, tokens]; one block of 128 threads (one per dimension).
+extern "C" __global__ void __launch_bounds__(128) attention_prefill_merge(const float *partO, const float *partML, float *out, unsigned nHead, unsigned tokens, unsigned splits) {
+    const unsigned head = blockIdx.x;
+    const unsigned t = blockIdx.y;
+    const unsigned d = threadIdx.x;
+    float maximum = 0.0f;
+    for (unsigned s = 0; s < splits; ++s) maximum = fmaxf(maximum, partML[((static_cast<unsigned long long>(s) * tokens + t) * nHead + head) * 2]);
+    float denominator = __expf(-maximum);
+    float numerator = 0.0f;
+    for (unsigned s = 0; s < splits; ++s) {
+        const unsigned long long at = (static_cast<unsigned long long>(s) * tokens + t) * nHead + head;
+        const float weight = __expf(partML[at * 2] - maximum);
+        denominator += weight * partML[at * 2 + 1];
+        numerator += weight * partO[at * AT_DIM + d];
+    }
+    out[(static_cast<unsigned long long>(t) * nHead + head) * AT_DIM + d] = numerator / denominator;
+}
 """
