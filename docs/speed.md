@@ -298,6 +298,17 @@ greeting, which makes its larger gain a poor estimate for original prose.
 Exact prompt text and IDs, traces, replay scripts and baseline R5
 `spec-bench` logs are in `~/archive/abla-grad-retrieval-1244/`.
 
+## Native BF16 reads for exact router and controller weights
+
+On the RTX 4090, the matrix-only packed GGUF saved 0.097 and 0.084 ms/token
+at d15 and 0.092 and 0.068 ms/token at d512 in two counterbalanced file
+pairs. Each graph decode-bench run generated 128 tokens from the same fixed
+prefix with context capacity 700. Timed generation excludes loading. All
+128 generated IDs matched the original at each depth. The native reader
+preserves 70,778,880 bytes of weight storage savings on the device. The
+converter, model hashes, per-arm rates and full-logit comparisons are in
+[the GGUF packing measurements](gguf-packing.md).
+
 ## Small-row verification on the RTX 4090
 
 The table follows the five changes in commit order, from the same Q4_K_M

@@ -67,7 +67,7 @@ on prose, 150-250 tok/s on predictable text such as lists and code. The first tu
 
 ## Lossless packing for the Inkling target
 
-The packer checks every FP32 word in each router and loop-controller matrix. It requires every selected word to have zero low 16 bits. An inexact word produces an error identifying its tensor and element before the converter publishes the output. For the pinned UD-Q4_K_M model this saves 70,778,880 bytes across 168 matrices. Abla expands those weights at upload to preserve the original kernels and logits. The conversion reduces disk usage.
+The packer checks every FP32 word in each router and loop-controller matrix. It requires every selected word to have zero low 16 bits. An inexact word produces an error identifying its tensor and element before the converter publishes the output. For the pinned UD-Q4_K_M model this saves 70,778,880 bytes across 168 matrices. Abla reads the packed router and controller weights natively. Decode and verification expand each BF16 value exactly inside their FP32 reductions. Prefill keeps its original router and controller reduction order. Loading the original GGUF uses its existing F32 path.
 
 From the project’s Nix shell, choose a new output path.
 
@@ -82,6 +82,6 @@ The packed file for the pinned original has SHA-256 `d081fc3aafe0e2868a016ef3c9d
 ## Rules
 
 - GPU is the primary target; a CPU path comes later from the same kernels. No separate CPU engine first.
-- Quantized weights stay packed on the GPU and matvec kernels dequantize them. Activations are f32. The lossless disk packer’s router and controller matrices expand to f32 during upload.
+- Quantized weights stay packed on the GPU and matvec kernels dequantize them. Activations are f32. The losslessly packed router and controller matrices also retain BF16 storage on device.
 - Every kernel has a test with a CPU reference **in the test only**, and a tolerance written down.
 - A change to a contract in `docs/interfaces.md` is announced to the owners of both sides first.

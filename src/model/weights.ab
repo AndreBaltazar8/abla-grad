@@ -2,9 +2,6 @@
 import "../backend/backend.ab"
 import "../gguf/reader.ab"
 import "../gguf/quant.ab"
-import "../gguf/inkling_packing.ab"
-import "abla/unsafe/memory"
-import "abla/unsafe/memory/raw"
 import "abla/text"
 
 private var weightsError = ""
@@ -42,7 +39,6 @@ fun alignUp(value: int): int = (value + 255) / 256 * 256
 fun planWeights(file: GgufFile, names: array<string>): ArenaPlan? {
     weightsError = ""
     val refs: Map<string, WeightRef> = Map()
-    val inkling = file.getString("general.architecture") == "inkling2_loop"
     var at = 0
     for (name in names) {
         val info = file.tensor(name)
@@ -53,38 +49,14 @@ fun planWeights(file: GgufFile, names: array<string>): ArenaPlan? {
         var rows = 1
         for (index in 1 until info.dims.size) rows = rows * info.dims[index]
         val requant = requantTarget(name, info)
-        // Router and controller kernels consume FP32, including expert selection during prefill.
-        val expand = inkling && info.dims.size == 2 && info.type == GGML_TYPE_BF16 && inklingPackableMatrix(name)
-        if (expand && info.bytes > (9223372036854775807 - at - 255) / 2) return null
-        val stored = if (expand) info.bytes * 2 else if (requant) rows * (info.dims[0] / 256) * 210 else info.bytes
-        refs.set(name, WeightRef(at, stored, if (expand) GGML_TYPE_F32 else if (requant) GGML_TYPE_Q6_K else info.type, rows, info.dims[0]))
+        val stored = if (requant) rows * (info.dims[0] / 256) * 210 else info.bytes
+        refs.set(name, WeightRef(at, stored, if (requant) GGML_TYPE_Q6_K else info.type, rows, info.dims[0]))
         at = at + alignUp(stored)
     }
     ArenaPlan(refs, names, at)
 }
 
 fun weightOf(plan: ArenaPlan, name: string): WeightRef = plan.refs.get(name) ?? WeightRef(0, 0, 0, 0, 0)
-
-private trusted fun uploadBf16AsF32(var backend: Backend, arena: DeviceBuffer, offset: int, src: int, bytes: int): bool {
-    val elements = bytes / 2
-    val capacity = if (elements < 262144) elements else 262144
-    val buffer = nativeByteBuffer(capacity * 4)
-    val address = nativePointerAddress(buffer.address)
-    var first = 0
-    var ok = true
-    while (ok && first < elements) {
-        val left = elements - first
-        val count = if (left < capacity) left else capacity
-        for (i in 0 until count) {
-            val word = ablaUnsafeLoadU16(nativePointerFromAddress(src + (first + i) * 2))
-            ablaUnsafeStoreU32(nativePointerFromAddress(address + i * 4), word << 16)
-        }
-        ok = backend.upload(arena, offset + first * 4, address, count * 4)
-        first = first + count
-    }
-    buffer.close()
-    ok
-}
 
 /** Allocates the arena and copies every planned tensor from the mapped file. */
 fun uploadWeights(var backend: Backend, file: GgufFile, plan: ArenaPlan): DeviceBuffer? {
@@ -110,11 +82,6 @@ fun uploadWeights(var backend: Backend, file: GgufFile, plan: ArenaPlan): Device
                 !backend.launch("requant_q8_to_q6k", kernelArgs().pointer(temp, 0).pointer(arena, ref.offset).u32(ref.rows).u32(blocksPerRow), [ref.rows * blocksPerRow]) ||
                 !backend.synchronize()) {
                 weightsError = "re-quantizing $name failed"
-                return null
-            }
-        } else if (ref.type == GGML_TYPE_F32 && info.type == GGML_TYPE_BF16) {
-            if (!uploadBf16AsF32(backend, arena, ref.offset, address, info.bytes)) {
-                weightsError = "expanding BF16 weight $name failed"
                 return null
             }
         } else if (!backend.upload(arena, ref.offset, address, info.bytes)) {

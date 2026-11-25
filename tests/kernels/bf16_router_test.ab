@@ -1,0 +1,45 @@
+// Check each split before summation. Integer inputs keep every expected product and partial sum exactly representable in FP32.
+import "../../src/backend/backend.ab"
+import "device_test_support.ab"
+import "abla/float"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+fun routerWeight(row: int, col: int): int = (row * 7 + col * 3) % 17 - 8
+fun routerInput(token: int, col: int): int = (token * 5 + col * 7) % 19 - 9
+
+trusted fun verify(backend: Backend): bool {
+    val rows = 19
+    val cols = 256
+    val tokens = 17
+    val split = 4
+    val weights = nativeByteBuffer(rows * cols * 2)
+    val x = nativeByteBuffer(tokens * cols * 4)
+    val y = nativeByteBuffer(split * tokens * rows * 4)
+    val scalar = nativeByteBuffer(4)
+    val word = nativePointerAddress(scalar.address)
+    val wa = nativePointerAddress(weights.address)
+    val xa = nativePointerAddress(x.address)
+    val ya = nativePointerAddress(y.address)
+    for (r in 0 until rows) for (c in 0 until cols) {
+        testStoreFloat(word, 0, f32FromInt(routerWeight(r, c)))
+        ablaUnsafeStoreU16(nativePointerFromAddress(wa + 2 * (r * cols + c)), ablaUnsafeLoadU32(nativePointerFromAddress(word)) >> 16)
+    }
+    for (t in 0 until tokens) for (c in 0 until cols) testStoreFloat(xa, t * cols + c, f32FromInt(routerInput(t, c)))
+    val dw = backend.allocate(weights.capacity) ?? return false
+    val dx = backend.allocate(x.capacity) ?? return false
+    val dy = backend.allocate(y.capacity) ?? return false
+    if (!backend.upload(dw, 0, wa, weights.capacity) || !backend.upload(dx, 0, xa, x.capacity)) return false
+    val args = kernelArgs().pointer(dw).pointer(dx).pointer(dy).u32(rows).u32(cols).u32(tokens).u32(split)
+    if (!backend.launch("matmul_bf16_exact_split", args, [rows, (tokens + 15) / 16 * split]) ||
+        !backend.download(dy, 0, ya, y.capacity)) return false
+    for (s in 0 until split) for (t in 0 until tokens) for (r in 0 until rows) {
+        var sum = 0
+        for (c in s * (cols / split) until (s + 1) * (cols / split)) sum += routerWeight(r, c) * routerInput(t, c)
+        val at = (s * tokens + t) * rows + r
+        if (!testNear("BF16 router split", at, testLoadFloat(ya, at), f64FromInt(sum), 0.0, 0.0)) return false
+    }
+    true
+}
+
+fun main: int = runCudaKernelTest("native BF16 split router", verify)

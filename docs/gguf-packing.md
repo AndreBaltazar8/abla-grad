@@ -32,9 +32,8 @@ archive compression has a different access pattern.
 A trial file converting all 394 eligible tensors failed during
 llama.cpp CPU evaluation. Its elementwise kernel rejected an F32
 activation paired with a BF16 operand. The distributed file therefore
-packs the 24 router matrices and 144 controller matrices. Abla expands
-them at upload, retaining FP32 router decisions and the existing
-prefill, verify and decode kernels. llama.cpp 33aeb17 loaded the
+packs the 24 router matrices and 144 controller matrices. The first Abla reader (`1463b52`) expanded
+them at upload, preserving the existing prefill, verify and decode kernels. llama.cpp 33aeb17 loaded the
 matrix-only file and generated tokens on CPU and on the RTX 4090.
 
 The original SHA-256 is
@@ -71,3 +70,33 @@ GRDLs for every position on 01–06 in step mode (6,248 rows), and on
 FP32 logits. The original tensor payload audit, the gate comparisons
 and the final file's SHA-256 were checked independently. The distributed
 file and its checksum are under `~/models/inkling-2-mini/`.
+
+## Native reads from the packed file
+
+The native reader retains these 168 matrices as BF16 in the device
+arena, saving 70,778,880 device bytes as well as the disk saving.
+Plain matvecs and the multi-row verifier widen each matrix word within
+the existing FP32 warp reduction. The prefill router widens at the
+load in the same four-way split, accumulates in the same tile order
+and calls the same slice sum. The prefill controllers keep their
+tensor-core tile and split choices. The original GGUF retains F32
+storage and execution for the same matrices.
+
+A same-process diagnostic captured one graph per storage type against
+the same arena and prefix. In four counterbalanced pairs of 128 tokens,
+the median paired saving was 0.119 ms/token at d15 and 0.091 ms/token
+at d512. All 128 IDs matched across both arms at both depths.
+
+Using native reads, the packed-file step gate again matched the original
+GRDLs byte for byte on all 6,248 rows, and the chunk-256 gate matched all
+324 short-prompt rows. The long-prompt rules passed on 05 and 06.
+`verify-check` passed all five accepted lengths. On 05, 40 fixed
+windows per row count had zero argmax mismatches at R3 and R5.
+`spec-check` passed 01–05 at proposal maxima two and four.
+
+Using the final single-copy device layout, two counterbalanced file pairs gave the following graph decode rates. Each arm loaded its GGUF before timing 128 tokens.
+
+| Depth | Original F32 file, tok/s | Packed BF16 file, tok/s |
+|---|---:|---:|
+| d15 | 131.85, 133.26 | 133.56, 134.76 |
+| d512 | 126.54, 127.35 | 128.03, 128.46 |

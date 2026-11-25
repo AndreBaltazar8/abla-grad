@@ -389,7 +389,11 @@ extern "C" __global__ void matmul_f32_exact(const float *w, const float *x, floa
 // matmul_f32_exact with the k range split over blocks: block (rowTile, tileIndex + slice * tokenTiles) sums slice `slice` of kSplit into y + slice * tokens * rows
 // (add the slices with sum_slices). cols % (32 * kSplit) == 0. problem [rows, tokenTiles * kSplit].
 val kernelPrefillMatmulF32ExactSplit = """
-extern "C" __global__ void matmul_f32_exact_split(const float *w, const float *x, float *y, unsigned rows, unsigned cols, unsigned tokens, unsigned kSplit) {
+static __device__ __forceinline__ float exact_weight(float w) { return w; }
+static __device__ __forceinline__ float exact_weight(unsigned short w) { return __uint_as_float(unsigned(w) << 16); }
+
+template <typename Weight>
+static __device__ __forceinline__ void exact_split(const Weight *w, const float *x, float *y, unsigned rows, unsigned cols, unsigned tokens, unsigned kSplit) {
     __shared__ float xs[16][33];
     __shared__ float ws[16][33];
     unsigned tx = threadIdx.x & 15u;
@@ -407,7 +411,7 @@ extern "C" __global__ void matmul_f32_exact_split(const float *w, const float *x
             unsigned c = i & 31u;
             unsigned gr = blockIdx.x * 16 + r;
             unsigned gt = tile * 16 + r;
-            ws[r][c] = gr < rows ? w[static_cast<unsigned long long>(gr) * cols + k0 + c] : 0.0f;
+            ws[r][c] = gr < rows ? exact_weight(w[static_cast<unsigned long long>(gr) * cols + k0 + c]) : 0.0f;
             xs[r][c] = gt < tokens ? x[static_cast<unsigned long long>(gt) * cols + k0 + c] : 0.0f;
         }
         __syncthreads();
@@ -416,6 +420,16 @@ extern "C" __global__ void matmul_f32_exact_split(const float *w, const float *x
         __syncthreads();
     }
     if (row < rows && token < tokens) y[(static_cast<unsigned long long>(slice) * tokens + token) * rows + row] = sum;
+}
+
+extern "C" __global__ void matmul_f32_exact_split(const float *w, const float *x, float *y,
+    unsigned rows, unsigned cols, unsigned tokens, unsigned kSplit) {
+    exact_split(w, x, y, rows, cols, tokens, kSplit);
+}
+
+extern "C" __global__ void matmul_bf16_exact_split(const unsigned short *w, const float *x, float *y,
+    unsigned rows, unsigned cols, unsigned tokens, unsigned kSplit) {
+    exact_split(w, x, y, rows, cols, tokens, kSplit);
 }
 """
 

@@ -9,6 +9,7 @@ import "abla/unsafe/memory/raw"
 import "../backend/backend.ab"
 import "../ops.ab"
 import "../gguf/quant.ab"
+import "../gguf/inkling_packing.ab"
 import "inkling_config.ab"
 import "weights.ab"
 import "inkling.ab"
@@ -175,21 +176,22 @@ private fun InklingModel.hasWeight(name: string): bool = this.plan.refs.get(name
 private fun InklingModel.dense(var backend: Backend, ws: PrefillWorkspace, name: string, xOffset: int, yOffset: int, tokens: int, exact: bool = false): bool {
     val ref = this.wr(name)
     val kind = weightKind(ref.type)
+    val packedMatrix = kind == "bf16" && inklingPackableMatrix(name)
     var kernel = ""
     var problem: array<int> = []
-    if (prefillVerifyRows > 0 && tokens <= 5 && kind == "bf16" && ref.rows <= 128 && ref.cols >= 1024) {
+    if (prefillVerifyRows > 0 && tokens <= 5 && kind == "bf16" && !packedMatrix && ref.rows <= 128 && ref.cols >= 1024) {
         return backend.launch("matvec_bf16_output", kernelArgs().pointer(this.arena, ref.offset).pointer(ws.buffer, xOffset).pointer(ws.buffer, yOffset)
             .u32(ref.rows).u32(ref.cols).u32(tokens), [ref.rows, tokens])
     }
-    if (prefillVerifyRows > 0 && tokens <= prefillRowsMax && (kind == "q8_0" || kind == "f32")) {
+    if (prefillVerifyRows > 0 && tokens <= prefillRowsMax && (kind == "q8_0" || kind == "f32" || packedMatrix)) {
         // the few rows of a verification: one weight read for all of them (e7's R-row matvecs, exact f32 arithmetic on the activations)
         return backend.launch("matvec_${kind}_rows", kernelArgs().pointer(this.arena, ref.offset).pointer(ws.buffer, xOffset).pointer(ws.buffer, yOffset)
             .u32(ref.rows).u32(ref.cols).u32(tokens), [ref.rows])
     }
-    if (exact && kind == "f32") {
+    if (exact && (kind == "f32" || packedMatrix)) {
         var split = 4
         while (split > 1 && ref.cols / 32 % split != 0) split = split / 2
-        val launched = backend.launch("matmul_f32_exact_split", kernelArgs().pointer(this.arena, ref.offset).pointer(ws.buffer, xOffset).pointer(ws.buffer, yOffset)
+        val launched = backend.launch("matmul_${kind}_exact_split", kernelArgs().pointer(this.arena, ref.offset).pointer(ws.buffer, xOffset).pointer(ws.buffer, yOffset)
             .u32(ref.rows).u32(ref.cols).u32(tokens).u32(split), [ref.rows, (tokens + 15) / 16 * split])
         if (!launched) return false
         if (split == 1) return true

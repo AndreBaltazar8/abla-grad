@@ -226,9 +226,9 @@ private fun InklingModel.control(var backend: Backend, ip: int, which: string, c
     val ctrlForget = this.so("ctrlForget") + lane * n * 4
     var ok = opRmsNormPlain(backend, this.scratch, curOffset, this.scratch, ctrlIn, n, 0.000001, 1)
     ok = ok && opRmsNormPlain(backend, this.scratch, messageOffset, this.scratch, ctrlIn + n * 4, n, 0.000001, 1)
-    ok = ok && opMatvec(backend, "f32", this.arena, down.offset, this.scratch, ctrlIn, this.scratch, ctrlGate, down.rows, down.cols)
-    ok = ok && opMatvec(backend, "f32", this.arena, gain.offset, this.scratch, ctrlGate, this.scratch, ctrlGain, gain.rows, gain.cols)
-    ok = ok && opMatvec(backend, "f32", this.arena, forget.offset, this.scratch, ctrlGate, this.scratch, ctrlForget, forget.rows, forget.cols)
+    ok = ok && opMatvec(backend, weightKind(down.type), this.arena, down.offset, this.scratch, ctrlIn, this.scratch, ctrlGate, down.rows, down.cols)
+    ok = ok && opMatvec(backend, weightKind(gain.type), this.arena, gain.offset, this.scratch, ctrlGate, this.scratch, ctrlGain, gain.rows, gain.cols)
+    ok = ok && opMatvec(backend, weightKind(forget.type), this.arena, forget.offset, this.scratch, ctrlGate, this.scratch, ctrlForget, forget.rows, forget.cols)
     ok && opControlMix(backend, this.scratch, curOffset, this.scratch, messageOffset, this.scratch, ctrlGain,
         this.scratch, ctrlForget, this.scratch, output, n)
 }
