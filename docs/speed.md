@@ -2,6 +2,29 @@
 
 Goal: beat mainline llama.cpp and Unsloth's build at every depth and in prefill, with `tools/gate-inkling.sh` passing; stretch line 200 tok/s decode.
 
+## Current plain decode through 128k
+
+RTX 4090, Inkling UD-Q4_K_M, 128 timed greedy tokens. The Abla rows use
+the same Dickens prefixes and exclude loading, graph capture and prefix
+ingestion. Both use CUDA C RMSNorm and depth mix. Global attention uses
+Q8 and 64 partitions from an 8,192-position allocation.
+
+| Plain tg128, tok/s | d0 | d8,192 | d32,768 | d65,536 | d131,072 |
+|---|---:|---:|---:|---:|---:|
+| Initial grouped-Q8 run | 137.69 | 123.76 | 115.25 | 108.60 | 92.50 |
+| Integrated confirmation | **138.69** | **126.78** | **119.09** | **110.29** | **95.90** |
+| Pinned Unsloth CUDA mix | 102.85 | 95.03 | 89.92 | — | 64.95 |
+
+Each Abla cell is one unprofiled run. The confirmation retains 85.9% of
+d0 throughput at 32k and 87.0% of 64k throughput at 128k. It reproduced
+all 128 generated IDs of the previous plain implementation at 128k.
+The Unsloth results are three-run means with llama-bench synthetic
+inputs. The 64k reference was not measured in this series. Per-family
+timings, bandwidth and precision comparisons are in the
+[global-attention measurements](#what-grows-during-plain-decode).
+
+## Earlier short-context measurements
+
 Method: ours = `abla-grad decode-bench <gguf> <ids> --n 128 --mode graph` (greedy, N cached tokens then 128 generated; the cached tokens are prompt 04's ids cycled, so the text is junk but the routing realistic); gate = `GATE_LOGITS_FLAGS=--step tools/gate-inkling.sh`. llama.cpp mainline 33aeb17 and Unsloth b12649-mix-c7059d6: llama-bench tg128 -d N, same UD-Q4_K_M, CUDA graphs, F16 KV (ablac-df, raw data in ~/src/abla-grad-oracle/).
 
 | tg128, tok/s | d0 | d15 | d300 | d512 |
@@ -882,3 +905,24 @@ and F32 sliding K/V, chunk 256 and the pinned mainline CUDA logits. It had
 3,061, and max absolute logit difference 17.27565. It passed the calibrated
 limits, including the .726532 worst-KL ceiling from the matched Unsloth
 comparison on these same IDs.
+
+The fixed step gates also passed with a short allocation and with a
+33,024-position allocation that selects Q8 global K/V. The counts
+below use the same pinned llama.cpp CUDA references.
+
+| Prompt | Allocation | Rows above KL .04 | Argmax differences | Worst KL |
+|---|---:|---:|---:|---:|
+| 05 (1,624 rows) | 1,724 | 30 | 24 | .800399 |
+| 06 (4,300 rows) | 4,400 | 27 | 96 | .208716 |
+| 05 | 33,024 | 30 | 27 | .811584 |
+| 06 | 33,024 | 31 | 98 | .168726 |
+
+At the 33,024-position allocation, the five-row verification check
+matched the reference argmax after each possible commit length, zero
+through four. The grouped-kernel test matched per-query FP32 softmax
+partials bit for bit at equal partition counts for F32, F16 and Q8 K/V.
+
+After integrating the int8 prefill projection GEMMs from `4bae40a`, the
+same 32,768-row external gate had 137 rows over KL .04, 778 argmax
+differences, worst KL .595350 at position 3,061 and max absolute logit
+difference 12.83186. This passes the same .726532 ceiling.
