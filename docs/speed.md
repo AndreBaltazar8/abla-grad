@@ -1,6 +1,6 @@
 # Inkling-2-Mini decode and prefill speed (RTX 4090)
 
-One table, updated with every speed change. Goal: beat mainline llama.cpp and Unsloth's build at every depth and in prefill, with `tools/gate-inkling.sh` passing; stretch line 200 tok/s decode.
+Goal: beat mainline llama.cpp and Unsloth's build at every depth and in prefill, with `tools/gate-inkling.sh` passing; stretch line 200 tok/s decode.
 
 Method: ours = `abla-grad decode-bench <gguf> <ids> --n 128 --mode graph` (greedy, N cached tokens then 128 generated; the cached tokens are prompt 04's ids cycled, so the text is junk but the routing realistic); gate = `GATE_LOGITS_FLAGS=--step tools/gate-inkling.sh`. llama.cpp mainline 33aeb17 and Unsloth b12649-mix-c7059d6: llama-bench tg128 -d N, same UD-Q4_K_M, CUDA graphs, F16 KV (ablac-df, raw data in ~/src/abla-grad-oracle/).
 
@@ -35,38 +35,83 @@ Raw benchmark samples are in
 `~/src/abla-grad-oracle/artifacts/bench-depth-33aeb17/` and
 `~/src/abla-grad-oracle/unsloth-b12649-mix-c7059d6/`.
 
-## Decode across cache depths
+## Decode and speculation across cache depths
 
-Decode throughput in tokens/second on the RTX 4090, with the same
-Inkling UD-Q4_K_M GGUF and no drafter.
+Throughput on the RTX 4090 in tokens/s on the pinned Inkling UD-Q4_K_M.
+abla-grad `5104a3f` used the same fixture 06 prefix in every mode, with
+cached depth equal to the input ID count minus one. All three used
+F32 KV, step seeding, and context capacity equal to input IDs + requested
+tokens + 28. The speculative rows used the Q8_0 DSpark drafter with two
+proposals and a replay batch of four cycles. Adaptive switches between
+that cycle and plain decode.
+Each cell is one GPU-locked run on E-cores 24–27. Timing starts after
+seeding. Throughput divides the requested count by elapsed time to exclude
+extra tokens from the final replay batch. The adaptive timer includes
+recording the plain graph.
 
-| Cached depth | Generated tokens | abla-grad graph | llama.cpp 33aeb17 | Unsloth b12649-mix-c7059d6 |
-|---:|---:|---:|---:|---:|
-| 0 | 128 | 105.39 | 77.39 | 105.27 |
-| 0 | 1024 | 102.60 | 77.80 | 104.62 |
-| 512 | 128 | 102.27 | 77.97 | 105.53 |
-| 512 | 1024 | 100.29 | 76.58 | 103.74 |
-| 1024 | 128 | 99.63 | 76.90 | 104.13 |
-| 1024 | 1024 | 99.21 | 75.92 | 102.94 |
-| 2048 | 128 | n/a (accuracy pending 06) | 75.58 | 102.62 |
-| 2048 | 1024 | n/a (accuracy pending 06) | 75.58 | 102.56 |
-| 4096 | 128 | n/a (accuracy pending 06) | 74.92 | 100.74 |
-| 4096 | 1024 | n/a (accuracy pending 06) | 74.85 | 100.78 |
+| tg128 | d0 | d512 | d1024 | d2048 | d4096 |
+|---|---:|---:|---:|---:|---:|
+| abla-grad plain graph | 130.06 | 126.44 | 122.06 | 120.62 | 117.74 |
+| abla-grad DSpark cycle graph | 115.20 | 110.62 | 111.37 | 103.62 | 90.72 |
+| abla-grad DSpark adaptive | 113.43 | 108.43 | 105.24 | 104.18 | 101.61 |
 
-Each llama.cpp result is the mean of three `llama-bench` repetitions
-with F16 KV, CUDA graphs and synthetic tokens. abla-grad `85b7bee`
-used one graph run per cell, F32 KV, and greedy continuation of a
-natural-text prefix (fixture 06). Its context was
-`depth + generation + 1` rounded up to 256. Depth counts cached
-tokens before the seed. All timings exclude prefill and use E-cores 24–27.
-Supplemental abla-grad tg1024 runs reached 102.68 at d15 and 101.19 at d300.
+| tg1024 | d0 | d512 | d1024 | d2048 | d4096 |
+|---|---:|---:|---:|---:|---:|
+| abla-grad plain graph | 126.98 | 123.11 | 121.30 | 120.33 | 117.22 |
+| abla-grad DSpark cycle graph | 118.01 | 157.89 | 157.21 | 159.62 | 136.03 |
+| abla-grad DSpark adaptive | 123.18 | 162.34 | 153.73 | 146.94 | 140.99 |
 
-The 1,624-position natural-text gate qualified the sliding-window path
-on fixture 05. Among its 1,624 rows, abla-grad exceeded KL 0.04 on 28,
-mainline CPU vs CUDA on 42, and mainline CUDA vs Unsloth CUDA on 36.
-The 4,300-position fixture 06 is the remaining accuracy check for
-the d2048 and d4096 rows. Raw samples and reproduction commands are in
-`~/src/abla-grad-oracle/long-depth/`.
+Plain step-mode validation on fixture 05 found 28 of 1,624 rows above KL
+0.04. Mainline CPU versus CUDA found 42 and Unsloth CUDA versus mainline
+CUDA found 36. The 4,300-position fixture 06 gate reported 25 rows over
+0.04, 97 argmax differences and worst KL 0.209, within the measured
+CPU/CUDA noise floor of 35, 111 and 0.230.
+
+### llama-bench reference
+
+The following means are from three CUDA graph runs with synthetic tokens
+and F16 KV. Both llama-bench builds ran without a drafter.
+
+| Generated tokens | Engine | d0 | d512 | d1024 | d2048 | d4096 |
+|---:|---|---:|---:|---:|---:|---:|
+| 128 | llama.cpp 33aeb17 | 77.39 | 77.97 | 76.90 | 75.58 | 74.92 |
+| 128 | Unsloth b12649-mix-c7059d6 | 105.27 | 105.53 | 104.13 | 102.62 | 100.74 |
+| 1024 | llama.cpp 33aeb17 | 77.80 | 76.58 | 75.92 | 75.58 | 74.85 |
+| 1024 | Unsloth b12649-mix-c7059d6 | 104.62 | 103.74 | 102.94 | 102.56 | 100.78 |
+
+### DSpark on fixed prompts
+
+Tokens per cycle include the target token and accepted proposals. For adaptive
+runs, the acceptance column only counts tokens produced by speculative
+cycles. The speculative CLI seeds one anchor in advance. ID checks
+align the logged sequences after that anchor.
+
+| Prompt (cached depth) | Requested | Plain tok/s | Cycle tok/s | Cycle tokens/cycle | Adaptive tok/s | Adaptive tokens/cycle | Unsloth DSpark n2 tok/s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 03 (14) | 128 | 131.30 | 154.85 | 2.36 | 145.97 | 2.58 | 126.31 |
+| 03 (14) | 1024 | 126.64 | 168.51 | 2.62 | 167.16 | 2.66 | — |
+| 05 (1623) | 128 | 121.15 | 104.86 | 1.75 | 110.46 | 1.75 | 82.51 |
+| 05 (1623) | 1024 | 120.73 | 154.49 | 2.56 | 152.23 | 2.72 | — |
+
+The aligned greedy logs agree through every compared ID in 25 of
+34 mode comparisons. On the 1,024-token prompt 05 run, cycle-only
+matched all 1023 aligned IDs and adaptive shared a 504-ID prefix.
+
+### DSpark on matched cached prefixes
+
+Both engines used identical depth-plus-one prefixes of fixture 05.
+Unsloth values are means of three server completions. Unsloth used F16 KV
+and abla-grad used F32 KV. Each engine used its native generation timer.
+
+| Cached depth | abla-grad plain | abla-grad cycle | abla-grad adaptive | Unsloth plain | Unsloth DSpark n2 |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 131.16 | 121.25 | 127.15 | 100.07 | 94.20 |
+| 15 | 130.98 | 109.85 | 113.36 | 100.64 | 87.83 |
+| 300 | 127.92 | 150.95 | 154.33 | 99.44 | 125.16 |
+
+Raw timings, emitted IDs, and reproduction commands are in
+`~/src/abla-grad-oracle/spec-5104a3f/`. The Unsloth server samples are in
+`~/src/abla-grad-oracle/dspark-b12649/`.
 
 ## Decode profiles at d15 and d512
 
