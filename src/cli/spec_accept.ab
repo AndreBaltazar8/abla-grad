@@ -24,6 +24,7 @@ fun cmdSpecAccept(args: array<string>): int {
     var cost = false
     var union = false
     var nmax = 2
+    var tracePath = ""
     var prefillTaps = false
     var exactWindow = 0
     val positional: array<string> = []
@@ -38,6 +39,9 @@ fun cmdSpecAccept(args: array<string>): int {
         } else if (args[index] == "--prefill-taps") {
             prefillTaps = true
             index = index + 1
+        } else if (args[index] == "--trace" && index + 1 < args.size) {
+            tracePath = args[index + 1]
+            index = index + 2
         } else if (args[index] == "--nmax" && index + 1 < args.size) {
             nmax = args[index + 1].parseInt() ?? 2
             index = index + 2
@@ -192,6 +196,15 @@ fun cmdSpecAccept(args: array<string>): int {
             for (size in config.nExpertUsed until hist.size) if (hist[size] > 0) line = line + " $size:${hist[size]}"
             println("spec-accept: distinct experts per layer visit over $rows rows: mean ${f64FromInt(sum) / f64FromInt(windows)} (of ${rows * config.nExpertUsed}); histogram$line")
         }
+    }
+    if (tracePath != "") {
+        // one line per position p >= ids.size - 1: p, the anchor (the target's greedy token after position p), the drafter's four proposals for the next
+        // tokens, and the target's actual greedy continuation (the anchor is nxt[p]; nxt[p + 1 ..] follow it): "p anchor | p1 p2 p3 p4 | n1 n2 n3 n4"
+        var lines = ""
+        for (p in ids.size - 1 until nxt.size - 4) {
+            lines = lines + "$p ${nxt[p]} | ${first[p]} ${second[p]} ${third[p]} ${fourth[p]} | ${nxt[p + 1]} ${nxt[p + 2]} ${nxt[p + 3]} ${nxt[p + 4]}\n"
+        }
+        Path(tracePath).writeText(lines)
     }
     // positions p >= ids.size - 1 have a greedy continuation: nxt[p+1] follows the anchor nxt[p]
     var cycles = 0
