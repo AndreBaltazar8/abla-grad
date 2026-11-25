@@ -1,6 +1,7 @@
 // The Inkling 2 Mini DSpark drafter. Target taps enter only after verification commits them.
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
+import "../gguf/quant.ab"
 import "../backend/backend.ab"
 import "../gguf/reader.ab"
 import "../ops.ab"
@@ -24,8 +25,8 @@ private fun dsparkScratch(): ScratchMap {
     val widths = [dsparkWidth * DSPARK_BLOCK, dsparkWidth * dsparkBatchRows, dsparkQuery * DSPARK_BLOCK,
         dsparkKv * dsparkBatchRows, dsparkKv * dsparkBatchRows, DSPARK_FFN * DSPARK_BLOCK,
         DSPARK_FFN * DSPARK_BLOCK, 2 * (DSPARK_RANK + dsparkWidth), 3 * DSPARK_RANK, DSPARK_RANK,
-        DSPARK_VOCAB, DSPARK_VOCAB, 1]
-    val names = ["x", "norm", "q", "k", "v", "gate", "up", "joint", "projected", "latent", "base", "delta", "id"]
+        DSPARK_VOCAB, DSPARK_VOCAB, 1, 1]
+    val names = ["x", "norm", "q", "k", "v", "gate", "up", "joint", "projected", "latent", "base", "delta", "id", "cursor"]
     for (i in 0 until names.size) {
         offsets.set(names[i], total)
         total = total + alignUp(widths[i] * 4)
@@ -102,9 +103,14 @@ private fun DsparkDrafter.rope(var backend: Backend, offset: int, heads: int, po
 
 private fun DsparkDrafter.storeKv(var backend: Backend, layer: int, first: int, rows: int): bool {
     val cache = this.cacheOffset(layer)
-    backend.launch("kv_store_batch", kernelArgs().pointer(this.scratch, this.o("k")).pointer(this.scratch, this.o("v"))
-        .pointer(this.kCache, cache).pointer(this.vCache, cache).u32(first).u32(DSPARK_KV_HEADS)
-        .u32(DSPARK_HEAD_DIM).u32(this.cacheCtx()).u32(rows), [dsparkKv, rows])
+    val k = this.o("k")
+    val v = this.o("v")
+    for (row in 0 until rows) {
+        val at = row * dsparkKv * 4
+        if (!opKvStore(backend, this.scratch, k + at, this.scratch, v + at, this.kCache, cache, this.vCache, cache,
+            first + row, DSPARK_KV_HEADS, DSPARK_HEAD_DIM, this.cacheCtx())) return false
+    }
+    true
 }
 
 private fun DsparkDrafter.mixTaps(var backend: Backend, taps: DeviceBuffer, offset: int, mix: string, norm: string, rows: int): bool {
@@ -158,7 +164,97 @@ fun DsparkDrafter.pushTaps(var backend: Backend, taps: DeviceBuffer, first: int,
     true
 }
 
-private fun DsparkDrafter.layer(var backend: Backend, layer: int, anchor: int): bool {
+/** Seeds the device cursor from the prefix already injected by pushTaps. Call outside recording. */
+trusted fun DsparkDrafter.prepareStep(var backend: Backend): bool {
+    val host = nativeByteBuffer(8)
+    val address = nativePointerAddress(host.address)
+    ablaUnsafeStoreU32(nativePointerFromAddress(address), this.committed)
+    backend.upload(this.scratch, this.o("cursor"), address, 4)
+}
+
+private fun DsparkDrafter.mixStep(var backend: Backend, taps: DeviceBuffer, step: DeviceBuffer,
+    mix: string, norm: string, limit: int, lastOnly: bool): bool {
+    val dst = this.o("norm")
+    val rows = if (lastOnly) 1 else 3
+    backend.launch("dspark_mix_step", kernelArgs().pointer(taps).pointer(this.arena, this.w(mix).offset)
+        .pointer(this.scratch, dst).pointer(step).pointer(this.scratch, this.o("cursor")).u32(dsparkWidth)
+        .u32(limit).u32(if (lastOnly) 1 else 0), [dsparkWidth * rows]) &&
+        this.norm(backend, norm, dst, dst, dsparkWidth, rows)
+}
+
+private fun DsparkDrafter.rotateStep(var backend: Backend, offset: int, positions: DeviceBuffer, positionOffset: int,
+    heads: int, rows: int): bool =
+    backend.launch("dspark_rope_step", kernelArgs().pointer(this.scratch, offset).pointer(positions, positionOffset)
+        .u32(heads).u32(DSPARK_HEAD_DIM).u32(rows).f32(this.config.ropeBase).u32(this.maxCtx),
+        [heads * (DSPARK_HEAD_DIM / 2) * rows])
+
+private fun DsparkDrafter.storeKvStep(var backend: Backend, layer: int, step: DeviceBuffer, limit: int, blockRows: int): bool {
+    val cache = this.cacheOffset(layer)
+    val rows = if (blockRows > 0) blockRows else 3
+    backend.launch("dspark_kv_step", kernelArgs().pointer(this.scratch, this.o("k")).pointer(this.scratch, this.o("v"))
+        .pointer(this.kCache, cache).pointer(this.vCache, cache).pointer(step).pointer(this.scratch, this.o("cursor"))
+        .u32(DSPARK_HEAD_DIM).u32(dsparkKv).u32(this.cacheCtx()).u32(limit).u32(blockRows), [dsparkKv, rows])
+}
+
+/** Appends the accepted cycle's taps using the device cursor and step[1,3]. A seeded first replay appends zero rows. */
+fun DsparkDrafter.pushTapsStep(var backend: Backend, taps: DeviceBuffer, step: DeviceBuffer): bool {
+    if (step.bytes < 16 || taps.bytes < DSPARK_TAP_BYTES) return false
+    val available = taps.bytes / DSPARK_TAP_BYTES
+    val limit = if (available < this.maxCtx) available else this.maxCtx
+    val k = this.o("k")
+    val norm = this.o("norm")
+    for (layer in 0 until DSPARK_LAYERS) {
+        val prefix = "blk.$layer"
+        if (!this.mixStep(backend, taps, step, "$prefix.ctx_mix.weight", "$prefix.ctx_norm.weight", limit, false) ||
+            !this.dense(backend, "$prefix.attn_k_ctx.weight", norm, k, 3) ||
+            !this.dense(backend, "$prefix.attn_v_ctx.weight", norm, this.o("v"), 3) ||
+            !this.norm(backend, "$prefix.attn_k_ctx_norm.weight", k, k, DSPARK_HEAD_DIM, 3 * DSPARK_KV_HEADS) ||
+            !this.rotateStep(backend, k, this.scratch, this.o("cursor"), DSPARK_KV_HEADS, 3) ||
+            !this.storeKvStep(backend, layer, step, limit, 0)) return false
+    }
+    this.mixStep(backend, taps, step, "markov_ctx_mix.weight", "markov_ctx_norm.weight", limit, true) &&
+        backend.launch("dspark_commit_taps_step", kernelArgs().pointer(this.scratch, norm)
+            .pointer(this.scratch, this.o("joint") + dsparkHiddenContext).pointer(step)
+            .pointer(this.scratch, this.o("cursor")).u32(dsparkWidth).u32(limit), [1])
+}
+
+private fun DsparkDrafter.attention(var backend: Backend, layer: int, anchor: int, step: DeviceBuffer?): bool {
+    val rows = DSPARK_BLOCK
+    val q = this.o("q")
+    val k = this.o("k")
+    val norm = this.o("norm")
+    val window = if (layer == 1) 0 else DSPARK_WINDOW
+    val cache = this.cacheOffset(layer)
+    val scale: f32 = 0.08838834764831845
+    if (step != null) {
+        return this.rotateStep(backend, q, step, 4, DSPARK_HEADS, rows) &&
+            this.rotateStep(backend, k, step, 4, DSPARK_KV_HEADS, rows) &&
+            this.storeKvStep(backend, layer, step, this.maxCtx, rows) &&
+            backend.launch("dspark_attention_step", kernelArgs().pointer(this.scratch, q).pointer(this.kCache, cache)
+                .pointer(this.vCache, cache).pointer(this.scratch, norm).pointer(step).u32(DSPARK_HEADS)
+                .u32(DSPARK_KV_HEADS).u32(DSPARK_HEAD_DIM).u32(rows).u32(this.cacheCtx()).u32(window).f32(scale),
+                [DSPARK_HEADS, rows])
+    }
+
+    // All rows see the whole noise block, and the SWA cutoff is relative to its anchor.
+    for (row in 0 until rows) {
+        val pos = anchor + row
+        if (!this.rope(backend, q + row * dsparkQuery * 4, DSPARK_HEADS, pos) ||
+            !this.rope(backend, k + row * dsparkKv * 4, DSPARK_KV_HEADS, pos)) return false
+    }
+    if (!this.storeKv(backend, layer, anchor, rows)) return false
+    val first = if (window > 0 && anchor >= window) anchor + 1 - window else 0
+    val last = anchor + rows - 1
+    for (row in 0 until rows) {
+        val offset = row * dsparkQuery * 4
+        if (!opAttentionDecode(backend, this.scratch, q + offset, this.kCache, cache, this.vCache, cache,
+            this.scratch, norm + offset, DSPARK_HEADS, DSPARK_KV_HEADS, DSPARK_HEAD_DIM,
+            first, last, this.cacheCtx(), scale)) return false
+    }
+    true
+}
+
+private fun DsparkDrafter.layer(var backend: Backend, layer: int, anchor: int, step: DeviceBuffer? = null): bool {
     val prefix = "blk.$layer"
     val x = this.o("x")
     val norm = this.o("norm")
@@ -174,23 +270,7 @@ private fun DsparkDrafter.layer(var backend: Backend, layer: int, anchor: int): 
         !this.dense(backend, "$prefix.attn_v.weight", norm, v, rows) ||
         !this.norm(backend, "$prefix.attn_q_norm.weight", q, q, DSPARK_HEAD_DIM, rows * DSPARK_HEADS) ||
         !this.norm(backend, "$prefix.attn_k_norm.weight", k, k, DSPARK_HEAD_DIM, rows * DSPARK_KV_HEADS)) return false
-    for (row in 0 until rows) {
-        val pos = anchor + row
-        if (!this.rope(backend, q + row * dsparkQuery * 4, DSPARK_HEADS, pos) ||
-            !this.rope(backend, k + row * dsparkKv * 4, DSPARK_KV_HEADS, pos)) return false
-    }
-    if (!this.storeKv(backend, layer, anchor, rows)) return false
-
-    // All rows see the whole noise block, and the SWA cutoff is relative to its anchor.
-    val first = if (layer != 1 && anchor >= DSPARK_WINDOW) anchor + 1 - DSPARK_WINDOW else 0
-    val last = anchor + rows - 1
-    val cache = this.cacheOffset(layer)
-    for (row in 0 until rows) {
-        val offset = row * dsparkQuery * 4
-        if (!opAttentionDecode(backend, this.scratch, q + offset, this.kCache, cache, this.vCache, cache,
-            this.scratch, norm + offset, DSPARK_HEADS, DSPARK_KV_HEADS, DSPARK_HEAD_DIM, first, last,
-            this.cacheCtx(), 0.08838834764831845)) return false
-    }
+    if (!this.attention(backend, layer, anchor, step)) return false
     val width = dsparkWidth * rows
     this.dense(backend, "$prefix.attn_output.weight", norm, q, rows) &&
         opAdd(backend, this.scratch, x, this.scratch, q, this.scratch, x, width) &&
@@ -202,19 +282,16 @@ private fun DsparkDrafter.layer(var backend: Backend, layer: int, anchor: int): 
         opAdd(backend, this.scratch, x, this.scratch, norm, this.scratch, x, width)
 }
 
-private trusted fun DsparkDrafter.choose(var backend: Backend, target: InklingModel, output: WeightRef, prev: int, row: int, host: NativeByteBuffer): int {
+private fun DsparkDrafter.head(var backend: Backend, target: InklingModel, output: WeightRef,
+    row: int, ids: DeviceBuffer, idOffset: int): bool {
     val joint = this.o("joint")
     val projected = this.o("projected")
     val latent = this.o("latent")
     val base = this.o("base")
     val delta = this.o("delta")
-    val out = this.o("id")
     val rank = DSPARK_RANK
     val hidden = this.o("x") + row * dsparkWidth * 4
-    val embedding = this.w("markov_w1.weight")
-    val address = nativePointerAddress(host.address)
-    val ok = opGatherRow(backend, weightKind(embedding.type), this.arena, embedding.offset, prev, this.scratch, joint + rank * 4, rank) &&
-        opCopy(backend, this.scratch, hidden, this.scratch, joint + 2 * rank * 4, dsparkWidth) &&
+    opCopy(backend, this.scratch, hidden, this.scratch, joint + 2 * rank * 4, dsparkWidth) &&
         this.dense(backend, "joint_proj.weight", joint, projected, 1) &&
         backend.launch("dspark_markov", kernelArgs().pointer(this.scratch, projected).pointer(this.arena, this.w("joint_proj.bias").offset)
             .pointer(this.scratch, joint).pointer(this.scratch, latent).u32(rank), [rank]) &&
@@ -223,18 +300,73 @@ private trusted fun DsparkDrafter.choose(var backend: Backend, target: InklingMo
         opMatvec(backend, weightKind(output.type), target.arena, output.offset, this.scratch, hidden, this.scratch, base, DSPARK_VOCAB, dsparkWidth) &&
         opAdd(backend, this.scratch, base, this.scratch, delta, this.scratch, base, DSPARK_VOCAB) &&
         opSoftcap(backend, this.scratch, base, this.config.softcap, DSPARK_VOCAB) &&
-        opArgmax(backend, this.scratch, base, DSPARK_VOCAB, this.scratch, out) &&
-        backend.download(this.scratch, out, address, 4)
-    if (!ok) return -1
+        opArgmax(backend, this.scratch, base, DSPARK_VOCAB, ids, idOffset)
+}
+
+private trusted fun DsparkDrafter.choose(var backend: Backend, target: InklingModel, output: WeightRef,
+    prev: int, row: int, host: NativeByteBuffer): int {
+    val embedding = this.w("markov_w1.weight")
+    val out = this.o("id")
+    val address = nativePointerAddress(host.address)
+    if (!opGatherRow(backend, weightKind(embedding.type), this.arena, embedding.offset, prev, this.scratch,
+        this.o("joint") + DSPARK_RANK * 4, DSPARK_RANK) ||
+        !this.head(backend, target, output, row, this.scratch, out) ||
+        !backend.download(this.scratch, out, address, 4)) return -1
     int(ablaUnsafeLoadU32(nativePointerFromAddress(address)))
+}
+
+private fun DsparkDrafter.maskAndBlock(var backend: Backend, anchor: int, step: DeviceBuffer?): bool {
+    val x = this.o("x")
+    val mask = this.w("mask_embd.weight")
+    for (row in 1 until DSPARK_BLOCK) {
+        if (!opGatherRow(backend, weightKind(mask.type), this.arena, mask.offset, row - 1, this.scratch,
+            x + row * dsparkWidth * 4, dsparkWidth)) return false
+    }
+    for (layer in 0 until DSPARK_LAYERS) if (!this.layer(backend, layer, anchor, step)) return false
+    this.norm(backend, "output_norm.weight", x, x, dsparkWidth, DSPARK_BLOCK) &&
+        backend.launch("dspark_zero", kernelArgs().pointer(this.scratch, this.o("joint")).u32(DSPARK_RANK), [DSPARK_RANK])
+}
+
+private fun dsparkTargetShape(target: InklingModel, embedding: WeightRef, output: WeightRef): bool =
+    target.config.nVocab == DSPARK_VOCAB && target.config.nEmbd == dsparkWidth && target.visits == 48 &&
+        embedding.cols == dsparkWidth && embedding.rows >= DSPARK_VOCAB &&
+        output.cols == dsparkWidth && output.rows >= DSPARK_VOCAB
+
+private fun DsparkDrafter.gatherStep(var backend: Backend, arena: DeviceBuffer, weight: WeightRef,
+    ids: DeviceBuffer, idOffset: int, dst: int): bool {
+    val args = kernelArgs().pointer(arena, weight.offset).pointer(ids, idOffset).pointer(this.scratch, dst).u32(weight.cols)
+    if (weight.type == GGML_TYPE_Q8_0) return backend.launch("gather_row_q8_0_step", args, [weight.cols])
+    if (weight.type != GGML_TYPE_F32 && weight.type != GGML_TYPE_BF16) return false
+    backend.launch("dspark_gather_step", args.u32(if (weight.type == GGML_TYPE_BF16) 1 else 0), [weight.cols])
+}
+
+/** Records fixed-shape draft work. Reads [anchor,P] from step, writes [anchor,p1,p2,count] into spec. */
+fun DsparkDrafter.proposeStep(var backend: Backend, target: InklingModel, step: DeviceBuffer, spec: DeviceBuffer): bool {
+    val embedding = weightOf(target.plan, "token_embd.weight")
+    val output = weightOf(target.plan, "output.weight")
+    if (step.bytes < 16 || spec.bytes < 32 || !dsparkTargetShape(target, embedding, output)) return false
+    val limit = if (this.maxCtx < target.maxCtx) this.maxCtx else target.maxCtx
+    val x = this.o("x")
+    if (!backend.launch("dspark_begin_step", kernelArgs().pointer(step).pointer(spec).pointer(this.scratch, this.o("cursor"))
+            .u32(limit).u32(this.config.maxPositions - DSPARK_BLOCK).u32(DSPARK_VOCAB).u32(this.maxProposals), [1]) ||
+        !this.gatherStep(backend, target.arena, embedding, spec, 0, x) ||
+        !this.norm(backend, "token_embd_norm.weight", x, x, dsparkWidth, 1) ||
+        !this.maskAndBlock(backend, 0, step)) return false
+
+    // Argmax writes the token where the next Markov gather can read it.
+    val markov = this.w("markov_w1.weight")
+    for (row in 1 until this.maxProposals + 1) {
+        if (!this.gatherStep(backend, this.arena, markov, spec, (row - 1) * 4, this.o("joint") + DSPARK_RANK * 4) ||
+            !this.head(backend, target, output, row, spec, row * 4)) return false
+    }
+    backend.launch("dspark_pad_step", kernelArgs().pointer(spec), [1])
 }
 
 /** Returns up to the configured number of greedy proposals. ctxLen is the anchor position. */
 fun DsparkDrafter.propose(var backend: Backend, target: InklingModel, ctxLen: int, anchorToken: int): array<int> {
     dsparkError = ""
     if (ctxLen != this.committed || ctxLen < 0 || ctxLen >= this.maxCtx || ctxLen >= target.maxCtx ||
-        anchorToken < 0 || anchorToken >= DSPARK_VOCAB || target.config.nVocab != DSPARK_VOCAB ||
-        target.config.nEmbd != dsparkWidth || target.visits != 48) {
+        anchorToken < 0 || anchorToken >= DSPARK_VOCAB) {
         dsparkError = "incompatible Inkling target, anchor or committed prefix"
         return []
     }
@@ -243,34 +375,15 @@ fun DsparkDrafter.propose(var backend: Backend, target: InklingModel, ctxLen: in
     if (ctxLen == 0 || remaining == 0 || ctxLen > this.config.maxPositions - DSPARK_BLOCK) return []
     val embedding = weightOf(target.plan, "token_embd.weight")
     val output = weightOf(target.plan, "output.weight")
-    if (embedding.cols != dsparkWidth || embedding.rows < DSPARK_VOCAB ||
-        output.cols != dsparkWidth || output.rows < DSPARK_VOCAB) {
+    if (!dsparkTargetShape(target, embedding, output)) {
         dsparkError = "target embedding or output projection has an incompatible shape"
         return []
     }
-    val mask = this.w("mask_embd.weight")
     val x = this.o("x")
     if (!opGatherRow(backend, weightKind(embedding.type), target.arena, embedding.offset, anchorToken, this.scratch, x, dsparkWidth) ||
-        !this.norm(backend, "token_embd_norm.weight", x, x, dsparkWidth, 1)) {
-        dsparkError = "embedding the DSpark anchor failed"
-        return []
-    }
-    for (row in 1 until DSPARK_BLOCK) {
-        if (!opGatherRow(backend, weightKind(mask.type), this.arena, mask.offset, row - 1, this.scratch,
-            x + row * dsparkWidth * 4, dsparkWidth)) {
-            dsparkError = "embedding the DSpark mask failed"
-            return []
-        }
-    }
-    for (layer in 0 until DSPARK_LAYERS) {
-        if (!this.layer(backend, layer, ctxLen)) {
-            dsparkError = "DSpark draft layer $layer failed"
-            return []
-        }
-    }
-    if (!this.norm(backend, "output_norm.weight", x, x, dsparkWidth, DSPARK_BLOCK) ||
-        !backend.launch("dspark_zero", kernelArgs().pointer(this.scratch, this.o("joint")).u32(DSPARK_RANK), [DSPARK_RANK])) {
-        dsparkError = "preparing the DSpark Markov head failed"
+        !this.norm(backend, "token_embd_norm.weight", x, x, dsparkWidth, 1) ||
+        !this.maskAndBlock(backend, ctxLen, null)) {
+        dsparkError = "preparing the DSpark draft block and Markov head failed"
         return []
     }
 

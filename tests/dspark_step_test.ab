@@ -1,0 +1,136 @@
+// Real-weight replay parity. The host changes P and anchor between replays, as spec_accept will on device.
+import "abla/float"
+import "abla/float/text"
+import "abla/fs"
+import "abla/integer"
+import "abla/io"
+import "abla/process"
+import "abla/process/time"
+import "abla/text"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "../src/backend/backend.ab"
+import "../src/backend/cuda.ab"
+import "../src/gguf/reader.ab"
+import "../src/model/dspark.ab"
+import "../src/model/inkling.ab"
+import "../src/model/inkling_config.ab"
+import "kernels/support.ab"
+
+private fun failure(text: string): int {
+    eprintln(text)
+    1
+}
+
+private fun promptIds(path: string): array<int>? {
+    val text = Path(path).readTextResult()
+    if (!text.succeeded) return null
+    val ids: array<int> = []
+    for (line in text.text.split("\n")) {
+        val word = line.trim()
+        if (word != "") ids.append(word.parseInt() ?? return null)
+    }
+    ids
+}
+
+private trusted fun setStep(var backend: Backend, step: DeviceBuffer, anchor: int, pos: int, accepted: int): bool {
+    val host = nativeByteBuffer(16)
+    val start = nativePointerAddress(host.address)
+    ablaUnsafeStoreU32(nativePointerFromAddress(start), anchor)
+    ablaUnsafeStoreU32(nativePointerFromAddress(start + 4), pos)
+    ablaUnsafeStoreU32(nativePointerFromAddress(start + 8), 0)
+    ablaUnsafeStoreU32(nativePointerFromAddress(start + 12), accepted)
+    backend.upload(step, 0, start, 16)
+}
+
+private fun cost(var backend: Backend, target: InklingModel, direct: DsparkDrafter,
+    recording: Recording, p: int, anchor: int): bool {
+    val rounds = 40
+    val start = monotonicNanoseconds()
+    for (i in 0 until rounds) if (direct.propose(backend, target, p, anchor).size != 2) return false
+    val hostNs = monotonicNanoseconds() - start
+    val graphStart = monotonicNanoseconds()
+    for (i in 0 until rounds) if (!backend.replay(recording)) return false
+    if (!backend.synchronize()) return false
+    val graphNs = monotonicNanoseconds() - graphStart
+    val scale = f64FromInt(rounds) * 1000000.0
+    println("P=$p rounds=$rounds host_ms=${f64FromInt(hostNs) / scale} recorded_ms=${f64FromInt(graphNs) / scale}")
+    true
+}
+
+fun main: int {
+    val argc = processArgumentCount()
+    if (argc != 3 && (argc != 4 || processArgument(3) != "--cost"))
+        return failure("usage: dspark_step_test TARGET DRAFT PROMPT.ids [--cost]")
+    val ids = promptIds(processArgument(2)) ?? return failure("cannot read the prompt IDs")
+    if (ids.size == 0) return failure("empty prompt")
+    val targetFile = ggufOpen(processArgument(0)) ?? return failure(ggufLastError())
+    val draftFile = ggufOpen(processArgument(1)) ?? return failure(ggufLastError())
+    val cfg = inklingConfigFrom(targetFile) ?? return failure(inklingConfigLastError())
+    val ctx = ids.size + 9
+    var backend = cudaBackend() ?? return failure(cudaLastError())
+    var target = inklingLoad(backend, targetFile, cfg, ctx) ?? return failure(inklingLastError())
+    val direct = dsparkLoad(backend, draftFile, ctx) ?? return failure(dsparkLastError())
+    val graph = dsparkLoad(backend, draftFile, ctx) ?? return failure(dsparkLastError())
+    targetFile.close()
+    draftFile.close()
+    if (!target.reset(backend) || !target.enableTaps(backend)) return failure(inklingLastError())
+    target.useStep = true
+    val extra = [68014, 40, 23064, 11, 0, 15, 11, 0]
+    for (p in 0 until ids.size + extra.size) {
+        val token = if (p < ids.size) ids[p] else extra[p - ids.size]
+        if (token < 0 || token >= cfg.nVocab || !target.forward(backend, token, p)) return failure(inklingLastError())
+    }
+    val step = backend.allocate(16) ?? return failure(cudaLastError())
+    val spec = uploadWords(backend, [0, 0, 0, 0, 29, 30, 31, 32]) ?? return failure(cudaLastError())
+    if (!direct.pushTaps(backend, target.taps, 0, ids.size) || !graph.pushTaps(backend, target.taps, 0, ids.size) ||
+        !graph.prepareStep(backend) || !setStep(backend, step, extra[0], ids.size, 0)) return failure("seed: " + dsparkLastError())
+    if (!backend.beginRecording()) return failure(cudaLastError())
+    val captured = graph.pushTapsStep(backend, target.taps, step) && graph.proposeStep(backend, target, step, spec)
+    val recording = backend.endRecording() ?? return failure(cudaLastError())
+    if (!captured) return failure("capture failed: " + cudaLastError())
+
+    // Replay the same graph after accepting zero, one, and two proposals. The target
+    // has already written taps for these positions, including the never-committed suffix.
+    // A mismatched P/accepted pair must leave the cursor untouched and publish padding.
+    if (!setStep(backend, step, extra[0], ids.size + 1, 2) || !backend.replay(recording)) return failure(cudaLastError())
+    val invalid = downloadWords(backend, spec, 8) ?? return failure(cudaLastError())
+    if (invalid[1] != 0 || invalid[2] != 0 || invalid[3] != 0) return failure("invalid cursor published proposals")
+
+    var pos = ids.size
+    var accept = 0
+    for (round in 0 until 5) {
+        val anchor = extra[pos - ids.size]
+        if (!setStep(backend, step, anchor, pos, accept) || !backend.replay(recording)) return failure(cudaLastError())
+        val out = downloadWords(backend, spec, 8) ?? return failure(cudaLastError())
+        val control = downloadWords(backend, step, 4) ?? return failure(cudaLastError())
+        val expected = direct.propose(backend, target, pos, anchor)
+        if (dsparkLastError() != "" || out[0] != anchor || out[3] != expected.size || control[2] != expected.size ||
+            out[4] != 29 || out[5] != 30 || out[6] != 31 || out[7] != 32) return failure("bad spec ABI at P=$pos")
+        for (i in 0 until 2) {
+            val id = if (i < expected.size) expected[i] else 0
+            if (out[i + 1] != id) return failure("P=$pos proposal $i: got ${out[i + 1]}, expected $id")
+        }
+        if (round == 4) break
+        accept = if (round < 3) round else 0
+        val delta = accept + 1
+        if (!direct.pushTaps(backend, target.taps, pos, delta)) return failure(dsparkLastError())
+        pos = pos + delta
+    }
+    println("DSpark graph matches direct proposal at five cursors, including partial capacity and 0/1/2 accepts")
+    if (argc == 4) {
+        // Reseed both paths from scratch, with room for two proposals during every timed replay.
+        direct.reset()
+        graph.reset()
+        val anchor = extra[0]
+        val p = ids.size
+        if (!direct.pushTaps(backend, target.taps, 0, p) || !graph.pushTaps(backend, target.taps, 0, p) ||
+            !graph.prepareStep(backend) || !setStep(backend, step, anchor, p, 0)) return failure("cost setup failed")
+        if (!backend.beginRecording()) return failure(cudaLastError())
+        val draftOnly = graph.proposeStep(backend, target, step, spec)
+        val timed = backend.endRecording() ?? return failure(cudaLastError())
+        if (!draftOnly || !backend.replay(timed) || !backend.synchronize() ||
+            !cost(backend, target, direct, timed, p, anchor)) return failure("cost run failed")
+    }
+    0
+}
