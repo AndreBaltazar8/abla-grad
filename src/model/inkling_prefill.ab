@@ -170,7 +170,7 @@ private fun InklingModel.dense(var backend: Backend, ws: PrefillWorkspace, name:
         if (!launched) return false
         if (split == 1) return true
         return backend.launch("sum_slices", kernelArgs().pointer(ws.buffer, yOffset).u32(tokens * ref.rows).u32(split), [tokens * ref.rows])
-    } else if ((kind == "f32" || kind == "bf16") && ref.rows <= 128 && ref.cols >= 1024 && tokens >= 64) {
+    } else if ((kind == "f32" || kind == "bf16") && ref.rows <= 128 && ref.cols >= 1024 && (tokens >= 64 || prefillVerifyRows > 0)) {
         // few rows, long k: split k over blocks so the whole GPU works, then add the slices
         var split = 8
         while (split > 1 && ref.cols / 32 % split != 0) split = split / 2
