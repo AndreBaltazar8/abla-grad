@@ -21,6 +21,13 @@ private var prefillMoeTile = 64
 // NVFP4 experts through the register-direct kernel (64-token tiles only).
 private var prefillRegisterDirect = false
 
+// NVFP4 experts through the int8 kernels (activations quantized to Q8_1-style s8 with one f32 scale per 32 values; ablac-90's `matmul_nvfp4_grouped_i8`). Off by default.
+private var prefillInt8Experts = false
+
+fun setPrefillInt8Experts(on: bool): void {
+    prefillInt8Experts = on
+}
+
 fun setPrefillRegisterDirect(on: bool): void {
     prefillRegisterDirect = on
 }
@@ -102,6 +109,11 @@ fun prefillWorkspace(var backend: Backend, c: InklingConfig, chunk: int, allLogi
     at = wsAdd(offsets, "iota", pairs, at)
     at = wsAdd(offsets, "attPartO", 8 * chunk * c.nHead * 128, at)
     at = wsAdd(offsets, "attPartML", 8 * chunk * c.nHead * 2, at)
+    // int8 activations of the expert matmuls (bytes, in float units): the gate/up input (one row per token) and the down input (one row per pair)
+    at = wsAdd(offsets, "qxA", (chunk * c.nEmbd + 3) / 4, at)
+    at = wsAdd(offsets, "sxA", chunk * (c.nEmbd / 32), at)
+    at = wsAdd(offsets, "qxB", (pairs * c.nFfExp + 3) / 4, at)
+    at = wsAdd(offsets, "sxB", pairs * (c.nFfExp / 32), at)
     at = wsAdd(offsets, "expertMap", 8 * 5 * c.nExpertUsed, at)
     at = wsAdd(offsets, "plan", c.nExpert + 2 + 2 * maxTiles, at)
     at = wsAdd(offsets, "gu", pairs * 2 * c.nFfExp, at)
@@ -560,10 +572,10 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     val guStride = ggmlRowBytes(guRef.type, guRef.cols) * 2 * nFf
     val downStride = ggmlRowBytes(downRef.type, downRef.cols) * n
     ok = ok && this.grouped(backend, ws, guKind, guRef.offset, x, sortedToken, ws.o("gu"), this.hasWeight("blk.$ip.ffn_gate_up_exps.scale"), guScales.offset, plan,
-        2 * nFf, n, c.nExpert, guStride, maxTiles)
+        2 * nFf, n, c.nExpert, guStride, maxTiles, tokens, "A")
     ok = ok && opSitu(backend, ws.buffer, ws.o("gu"), ws.buffer, ws.o("act"), pairs, nFf, c.situBeta, c.situLinear)
     ok = ok && this.grouped(backend, ws, downKind, downRef.offset, ws.o("act"), ws.o("iota"), ws.o("down"), this.hasWeight("blk.$ip.ffn_down_exps.scale"),
-        downScales.offset, plan, n, nFf, c.nExpert, downStride, maxTiles)
+        downScales.offset, plan, n, nFf, c.nExpert, downStride, maxTiles, pairs, "B")
     ok = ok && backend.launch("moe_combine_batch", kernelArgs().pointer(ws.buffer, ws.o("down")).pointer(ws.buffer, slotOfPair).pointer(ws.buffer, weights)
         .pointer(ws.buffer, ws.o("moe")).u32(n).u32(c.nExpertUsed).u32(tokens), [n, tokens])
     }
@@ -599,7 +611,22 @@ private fun InklingModel.convRows(var backend: Backend, ws: PrefillWorkspace, in
 }
 
 private fun InklingModel.grouped(var backend: Backend, ws: PrefillWorkspace, kind: string, wOffset: int, x: int, xmap: int, y: int, useScales: bool, scalesOffset: int,
-    plan: int, rows: int, cols: int, nExpert: int, stride: int, maxTiles: int): bool {
+    plan: int, rows: int, cols: int, nExpert: int, stride: int, maxTiles: int, xRows: int = 0, quantName: string = "A"): bool {
+    if (kind == "nvfp4" && prefillInt8Experts && xRows > 0 && cols % 32 == 0) {
+        // int8: quantize the f32 rows once (the kernel gathers rows through xmap), then the s8 grouped matmul
+        val qx = ws.o("qx" + quantName)
+        val sx = ws.o("sx" + quantName)
+        if (!backend.launch("quantize_rows_i8", kernelArgs().pointer(ws.buffer, x).pointer(ws.buffer, qx).pointer(ws.buffer, sx).u32(xRows).u32(cols), [cols / 4, xRows])) return false
+        var iargs = kernelArgs().pointer(this.arena, wOffset).pointer(ws.buffer, qx).pointer(ws.buffer, xmap).pointer(ws.buffer, y)
+        if (useScales) iargs.pointer(this.arena, scalesOffset) else iargs.u64(0)
+        iargs.pointer(ws.buffer, plan)
+        iargs.u32(rows)
+        iargs.u32(cols)
+        iargs.u32(nExpert)
+        iargs.u64(stride)
+        iargs.pointer(ws.buffer, sx)
+        return backend.launch("matmul_nvfp4_grouped_i8", iargs, [rows, maxTiles])
+    }
     var args = kernelArgs().pointer(this.arena, wOffset).pointer(ws.buffer, x).pointer(ws.buffer, xmap).pointer(ws.buffer, y)
     if (useScales) args.pointer(this.arena, scalesOffset) else args.u64(0)
     args.pointer(ws.buffer, plan)
