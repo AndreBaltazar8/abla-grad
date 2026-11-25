@@ -1,0 +1,87 @@
+// Inkling's output grammar for the OpenAI-style server: a reply is a sequence of messages `<|message_model|>` HEADER BODY `<|end_message|>` ending with
+// `<|content_model_end_sampling|>` (the stop token; not fed here). BODY kinds by the token that opens it: `<|content_thinking|>` (reasoning), `<|content_text|>`
+// (the answer) and, after a tool name, `<|content_invoke_tool_json|>` (a call: {"name": NAME, "args": {...}}). The parser consumes one token at a time and yields
+// the events the API needs: reasoning text, answer text, complete tool calls.
+import "abla/text"
+import "abla/json"
+import "../cli/utf8_stream.ab"
+
+// kind: 1 reasoning delta (text), 2 content delta (text), 3 tool call (name, arguments = the JSON text of the args object)
+class ServeEvent(val kind: int, val text: string, val name: string, val arguments: string)
+
+class ServeOutputParser(
+    val idMessage: int,
+    val idThinking: int,
+    val idText: int,
+    val idTool: int,
+    val idEnd: int,
+    var state: int = 0,      // 0 between messages, 1 in a header, 2 in a body
+    var kind: int = 0,       // 1 thinking, 2 text, 3 tool call
+    var header: string = "",
+    var body: string = "",
+    var stream: Utf8TokenStream = Utf8TokenStream()
+)
+
+private fun isSpecialPiece(piece: string): bool = piece.size > 4 && piece.startsWith("<|") && piece.endsWith("|>")
+
+/** Feeds one generated token (its id and decoded text); events are appended to `events`. */
+fun ServeOutputParser.feed(token: int, piece: string, var events: array<ServeEvent>): void {
+    if (token == this.idMessage) {
+        this.state = 1
+        this.header = ""
+        this.body = ""
+        this.stream = Utf8TokenStream()
+        return
+    }
+    if (this.state == 1) {
+        if (token == this.idThinking) {
+            this.kind = 1
+            this.state = 2
+        } else if (token == this.idText) {
+            this.kind = 2
+            this.state = 2
+        } else if (token == this.idTool) {
+            this.kind = 3
+            this.state = 2
+        } else if (!isSpecialPiece(piece)) {
+            this.header = this.header + piece
+        }
+        return
+    }
+    if (this.state == 2) {
+        if (token == this.idEnd) {
+            this.finishBody(events)
+            this.state = 0
+        } else if (!isSpecialPiece(piece)) {
+            if (this.kind == 3) {
+                this.body = this.body + piece
+            } else {
+                val text = this.stream.push(piece)
+                if (text != "") events.append(ServeEvent(this.kind, text, "", ""))
+            }
+        }
+        return
+    }
+    // outside a message: stray text from a malformed reply is shown as an answer
+    if (!isSpecialPiece(piece) && token != this.idEnd) {
+        val text = this.stream.push(piece)
+        if (text != "") events.append(ServeEvent(2, text, "", ""))
+    }
+}
+
+private fun ServeOutputParser.finishBody(var events: array<ServeEvent>): void {
+    if (this.kind == 3) {
+        val parsed = jsonParse(this.body)
+        val name = this.header.trim()
+        if (parsed.succeeded && parsed.value.isObject() && parsed.value.has("args") && parsed.value.get("args").isObject()) {
+            val called = if (parsed.value.get("name").isString() && parsed.value.getString("name") != "") parsed.value.getString("name") else name
+            events.append(ServeEvent(3, "", called, jsonStringify(parsed.value.get("args"))))
+        } else {
+            // not a well-formed call: the model's text is passed on as an answer
+            events.append(ServeEvent(2, "${name}${this.body}", "", ""))
+        }
+    } else {
+        val tail = this.stream.finish()
+        if (tail != "") events.append(ServeEvent(this.kind, tail, "", ""))
+    }
+}

@@ -1,0 +1,309 @@
+// `abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N]`: an OpenAI-compatible server for
+// Inkling on the GPU, on 127.0.0.1 only. One request at a time (the rest wait in the listen queue). Endpoints: GET /v1/models, POST /v1/chat/completions
+// (streaming SSE and plain JSON, tools and tool calls, usage), GET /health. The model's KV cache and state stay between requests: a request whose prompt shares
+// its beginning with the previous conversation (opencode resends the whole history every turn) only processes the tokens after the shared part.
+import "abla/io"
+import "abla/text"
+import "abla/integer"
+import "abla/float"
+import "abla/float/text"
+import "abla/json"
+import "abla/http"
+import "abla/net"
+import "abla/process/time"
+import "../backend/backend.ab"
+import "../backend/cuda.ab"
+import "../gguf/reader.ab"
+import "../model/inkling.ab"
+import "../model/inkling_config.ab"
+import "../model/speculate.ab"
+import "../tokenizer/tokenizer.ab"
+import "../cli/generate.ab"
+import "../cli/chat.ab"
+import "template.ab"
+import "outparse.ab"
+import "openai.ab"
+
+private val SERVE_DEFAULT_CTX = 12288
+private val SERVE_DEFAULT_MAX_TOKENS = 4096
+
+private fun serveDrafterPath(model: string): string {
+    val slash = model.lastIndexOf("/")
+    val directory = if (slash >= 0) model.codePointSlice(0, slash + 1) else ""
+    "${directory}dspark-Inkling-2-Mini-Q8_0.gguf"
+}
+
+private fun serveSpecialId(tokenizer: Tokenizer, text: string): int {
+    val ids = tokenizer.encode(text, false, true)
+    if (ids.size == 1) ids[0] else -1
+}
+
+// Writes `text` to the socket `descriptor` without taking ownership (closures cannot capture the connection itself).
+private fun serveSend(descriptor: int, text: string): bool {
+    var link = TcpConnection(descriptor)
+    val written = link.write(text)
+    link.descriptor = -1
+    written >= 0
+}
+
+private fun serveWriteJson(var connection: TcpConnection, status: int, body: string): void {
+    val response = HttpResponse(status, [HttpHeader("Content-Type", "application/json"), HttpHeader("Access-Control-Allow-Origin", "*")], body)
+    connection.write(response.render())
+    return
+}
+
+private fun serveWriteError(var connection: TcpConnection, status: int, message: string, kind: string, code: string): void =
+    serveWriteJson(connection, status, serveErrorBody(message, kind, code))
+
+// The largest index <= cut that is not inside a UTF-8 sequence of `text`.
+private fun serveUtf8Boundary(text: string, cut: int): int {
+    var at = cut
+    while (at > 0 && at < text.size && text[at] >= 128 && text[at] < 192) at = at - 1
+    at
+}
+
+class ServeCounters(var requests: int = 0)
+
+/** The state of one running chat request: what was sent, what is held back for stop strings, and the calls found. */
+class ServeRun(
+    val fd: int, val streaming: bool, val id: string, val created: int, val name: string, val stop: array<string>, val callPrefix: string,
+    var content: string = "", var reasoning: string = "", var pending: string = "", var stopMatched: bool = false, var firstToken: int = 0,
+    var connected: bool = true, var cancel: bool = false, val calls: array<Json> = []
+) {
+    fun send(chunk: string): void {
+        if (this.connected && !serveSend(this.fd, chunk)) {
+            this.connected = false
+            this.cancel = true
+        }
+        return
+    }
+
+    fun delta(field: string, piece: string): void {
+        this.send(serveChunk(this.id, this.created, this.name, jsonObject([field], [jsonString(piece)]), "", -1, 0, 0, true))
+        return
+    }
+
+    fun deliverContent(piece: string): void {
+        if (piece == "") return
+        this.content = this.content + piece
+        if (this.streaming) this.delta("content", piece)
+        return
+    }
+
+    fun handle(event: ServeEvent): void {
+        if (this.firstToken == 0) this.firstToken = monotonicNanoseconds()
+        if (event.kind == 1) {
+            this.reasoning = this.reasoning + event.text
+            if (this.streaming) this.delta("reasoning_content", event.text)
+        } else if (event.kind == 2) {
+            if (this.stop.size == 0) {
+                this.deliverContent(event.text)
+            } else if (!this.stopMatched) {
+                var maxStop = 0
+                for (s in this.stop) if (s.size > maxStop) maxStop = s.size
+                this.pending = this.pending + event.text
+                var cut = -1
+                for (s in this.stop) {
+                    val at = this.pending.indexOf(s)
+                    if (at >= 0 && (cut < 0 || at < cut)) cut = at
+                }
+                if (cut >= 0) {
+                    this.stopMatched = true
+                    this.cancel = true
+                    this.deliverContent(this.pending.slice(0, cut))
+                    this.pending = ""
+                } else if (this.pending.size > maxStop - 1) {
+                    val upto = serveUtf8Boundary(this.pending, this.pending.size - (maxStop - 1))
+                    this.deliverContent(this.pending.slice(0, upto))
+                    this.pending = this.pending.slice(upto, this.pending.size)
+                }
+            }
+        } else {
+            val index = this.calls.size
+            val callId = "${this.callPrefix}_$index"
+            this.calls.append(serveToolCallJson(index, callId, event.name, event.arguments, this.streaming))
+            if (this.streaming) {
+                this.send(serveChunk(this.id, this.created, this.name, jsonObject(["tool_calls"], [jsonArray([serveToolCallJson(index, callId, event.name, event.arguments, true)])]), "", -1, 0, 0, true))
+            }
+        }
+        return
+    }
+}
+
+/** Handles one chat-completions request on `connection`. */
+private fun serveChat(
+    var backend: Backend, var model: InklingModel, var session: SpecSession, var connection: TcpConnection, tokenizer: Tokenizer, stops: array<int>,
+    ids: array<int>, body: string, modelName: string, context: int, defaultMaxTokens: int, var counters: ServeCounters
+): void {
+    val started = monotonicNanoseconds()
+    val errors: array<string> = []
+    val request = serveParseRequest(body, errors)
+    if (request == null) {
+        serveWriteError(connection, 400, if (errors.size > 0) errors[0] else "invalid request", "invalid_request_error", "")
+        return
+    }
+    val tools = if (request.toolChoiceNone) [] else request.tools
+    val text = serveRenderPrompt(request.messages, tools, request.effort, errors)
+    if (text == "") {
+        serveWriteError(connection, 400, if (errors.size > 0) errors[0] else "the prompt could not be rendered", "invalid_request_error", "")
+        return
+    }
+    val tokens = tokenizer.encode(text, true, true)
+    val room = context - tokens.size
+    if (room < 16) {
+        serveWriteError(connection, 400, "This model's context is ${context} tokens, but the conversation has ${tokens.size} tokens.", "invalid_request_error", "context_length_exceeded")
+        return
+    }
+    var maxTokens = if (request.maxTokens > 0) request.maxTokens else defaultMaxTokens
+    if (maxTokens > room) maxTokens = room
+    counters.requests = counters.requests + 1
+    val id = "chatcmpl-${counters.requests}-${monotonicMilliseconds()}"
+    val created = realtimeMilliseconds() / 1000
+    val name = if (request.model != "") request.model else modelName
+    val kept = session.reuse(backend, model, tokens)
+    val parser = ServeOutputParser(ids[0], ids[1], ids[2], ids[3], ids[4])
+    val streaming = request.stream
+    val fd = connection.descriptor
+    if (streaming) {
+        connection.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n")
+        connection.write(serveChunk(id, created, name, jsonObject(["role", "content"], [jsonString("assistant"), jsonString("")]), "", -1, 0, 0, true))
+    }
+    val run = ServeRun(fd, streaming, id, created, name, request.stop, "call_${counters.requests}")
+    val control = SpecControl()
+    val events: array<ServeEvent> = []
+    var stats = SpecStats()
+    val ok = session.turn(backend, model, maxTokens, stops, true, false, control, stats, { token ->
+        parser.feed(token, tokenizer.decode([token]), events)
+        for (event in events) run.handle(event)
+        if (run.cancel) control.cancel = true
+        events.clear()
+    })
+    if (!ok) {
+        eprintln("serve: generation failed: ${speculateLastError()}")
+        if (!streaming) serveWriteError(connection, 500, "generation failed: ${speculateLastError()}", "server_error", "")
+        else run.send("data: ${serveErrorBody("generation failed", "server_error", "")}\n\n")
+        connection.close()
+        return
+    }
+    if (!run.stopMatched && run.pending != "") run.deliverContent(run.pending)
+    val finish = if (run.calls.size > 0) "tool_calls" else if (run.stopMatched || stats.stopped) "stop" else "length"
+    val seconds = f64FromInt(monotonicNanoseconds() - started) / 1000000000.0
+    val decodeSeconds = f64FromInt(stats.loopNanos) / 1000000000.0
+    if (streaming) {
+        run.send(serveChunk(id, created, name, jsonObject([], []), finish, -1, 0, 0, true))
+        if (request.includeUsage) run.send(serveChunk(id, created, name, jsonObject([], []), "", tokens.size, stats.generated, kept, false))
+        run.send("data: [DONE]\n\n")
+    } else {
+        serveWriteJson(connection, 200, serveCompletionBody(id, created, name, run.content, run.reasoning, run.calls, finish, tokens.size, stats.generated, kept))
+    }
+    connection.close()
+    val ttft = if (run.firstToken > 0) f64FromInt(run.firstToken - started) / 1000000000.0 else seconds
+    eprintln("[serve] ${tokens.size} prompt tokens (${kept} reused), ${stats.generated} generated, first token after ${ttft} s, ${f64FromInt(stats.generated) / (if (decodeSeconds > 0.0) decodeSeconds else 1.0)} tok/s, finish $finish${if (streaming) ", streamed" else ""}")
+}
+
+fun cmdServe(args: array<string>): int {
+    var modelPath = ""
+    var tokenizerPath = ""
+    var drafterPath = ""
+    var port = 8080
+    var context = SERVE_DEFAULT_CTX
+    var maxTokens = SERVE_DEFAULT_MAX_TOKENS
+    var modelName = "inkling-2-mini"
+    var index = 0
+    while (index < args.size) {
+        val flag = args[index]
+        if (flag == "--port" && index + 1 < args.size) {
+            port = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else if (flag == "--ctx" && index + 1 < args.size) {
+            context = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else if (flag == "--tokenizer" && index + 1 < args.size) {
+            tokenizerPath = args[index + 1]
+            index = index + 2
+        } else if (flag == "--drafter" && index + 1 < args.size) {
+            drafterPath = args[index + 1]
+            index = index + 2
+        } else if (flag == "--model-name" && index + 1 < args.size) {
+            modelName = args[index + 1]
+            index = index + 2
+        } else if (flag == "--max-tokens" && index + 1 < args.size) {
+            maxTokens = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else if (modelPath == "" && !flag.startsWith("--")) {
+            modelPath = flag
+            index = index + 1
+        } else {
+            eprintln("serve: unknown or incomplete option $flag")
+            return 2
+        }
+    }
+    if (modelPath == "" || port < 1 || port > 65535 || context < 512 || maxTokens < 1) {
+        eprintln("usage: abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N]")
+        return 2
+    }
+    val file = ggufOpen(modelPath)
+    if (file == null) {
+        eprintln("serve: ${ggufLastError()}")
+        return 1
+    }
+    val architecture = file.getString("general.architecture") ?? ""
+    if (!isInklingChat(architecture)) {
+        eprintln("serve: only Inkling models are supported (architecture '$architecture')")
+        return 1
+    }
+    val config = inklingConfigFrom(file) ?? return 1
+    val tokenizer = (if (tokenizerPath == "") tokenizerFromGguf(file) else tokenizerFromJson(tokenizerPath)) ?? return 1
+    val draftFile = ggufOpen(if (drafterPath != "") drafterPath else serveDrafterPath(modelPath))
+    if (draftFile == null) {
+        eprintln("serve: the drafter model is missing (${ggufLastError()}); put dspark-Inkling-2-Mini-Q8_0.gguf next to the model or pass --drafter PATH")
+        return 1
+    }
+    val stops = generationStops(file, tokenizer, architecture)
+    val ids = [serveSpecialId(tokenizer, "<|message_model|>"), serveSpecialId(tokenizer, "<|content_thinking|>"), serveSpecialId(tokenizer, "<|content_text|>"),
+        serveSpecialId(tokenizer, "<|content_invoke_tool_json|>"), serveSpecialId(tokenizer, "<|end_message|>")]
+    var backend = cudaBackend() ?? return 1
+    eprintln("serve: loading the model (context $context tokens)...")
+    var model = inklingLoad(backend, file, config, context + SPEC_CONTEXT_SLACK) ?? return 1
+    if (!model.reset(backend)) return 1
+    var session = specSessionCreate(backend, model, draftFile, SPEC_DEFAULT_PROPOSALS) ?? return 1
+    session.exactWindow = 192
+    var listener = tcpListenAddress(ipv4SocketAddress("127.0.0.1", port), 16)
+    if (listener.descriptor < 0) {
+        eprintln("serve: cannot listen on 127.0.0.1:$port")
+        return 1
+    }
+    eprintln("serve: listening on http://127.0.0.1:$port (model '$modelName')")
+    val counters = ServeCounters()
+    val created = realtimeMilliseconds() / 1000
+    tcpEnableGracefulShutdown()
+    while (!tcpShutdownRequested()) {
+        var connection = listener.acceptUntilShutdown()
+        if (connection.descriptor < 0) continue
+        val raw = httpReadRequest(connection, 65536, 67108864)
+        if (raw == "") {
+            connection.close()
+            continue
+        }
+        val request = httpParseRequest(raw)
+        val path = request.path
+        if (request.method == "OPTIONS") {
+            connection.write("HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nConnection: close\r\n\r\n")
+            connection.close()
+        } else if (request.method == "GET" && (path == "/v1/models" || path == "/models")) {
+            serveWriteJson(connection, 200, serveModelsBody(modelName, created))
+            connection.close()
+        } else if (request.method == "GET" && (path == "/health" || path == "/")) {
+            serveWriteJson(connection, 200, "{\"status\":\"ok\"}")
+            connection.close()
+        } else if (request.method == "POST" && (path == "/v1/chat/completions" || path == "/chat/completions")) {
+            serveChat(backend, model, session, connection, tokenizer, stops, ids, request.body, modelName, context, maxTokens, counters)
+            connection.close()
+        } else {
+            serveWriteError(connection, 404, "no such endpoint: ${request.method} $path", "invalid_request_error", "not_found")
+            connection.close()
+        }
+    }
+    listener.close()
+    0
+}

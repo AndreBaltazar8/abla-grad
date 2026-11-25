@@ -23,6 +23,10 @@ fun cmdInfo(args: array<string>): int {
         val type = file.tensorAt(i).type
         counts.set(type, (counts.get(type) ?? 0) + 1)
     }
+    for (key in ["inkling2_loop.attention.sliding_window", "inkling2_loop.attention.relative_extent", "inkling2_loop.context_length", "inkling2_loop.block_count"]) {
+        val v = file.getInt(key)
+        if (v != null) println("  $key = $v")
+    }
     println("tensors (${file.tensorCount()})")
     for (type in counts.keys()) println("  ${ggmlTypeName(type)}: ${counts.get(type) ?? 0}")
     file.close()

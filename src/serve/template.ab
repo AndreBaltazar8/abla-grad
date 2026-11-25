@@ -1,0 +1,166 @@
+// Inkling's chat template for the OpenAI-style server (the GGUF's own Jinja template, rendered by hand): messages, tool declarations, tool calls and tool
+// results. The output text carries the special tokens as text (`<|message_user|>` ...) and is tokenized with special parsing.
+//   - tools: one leading system message `<|message_system|>tool_declare<|content_xml|>[specs]<|end_message|>` (specs: description, name, parameters, type; keys sorted
+//     at every level, compact separators);
+//   - the thinking-effort system message goes before the first non-system message;
+//   - a message is `<role>` + `<|content_text|>` + text + `<|end_message|>`; an assistant's reasoning comes first as `<|content_thinking|>`; its tool calls are
+//     `<|message_model|>NAME<|content_invoke_tool_json|>{"name":"NAME","args":{sorted args}}<|end_message|>`; an assistant message ends with
+//     `<|content_model_end_sampling|>`; a tool result's role token is followed by the tool's name.
+import "abla/bytes"
+import "abla/text"
+import "abla/json"
+
+class ServeToolCall(val id: string, val name: string, val arguments: string)
+
+class ServeMessage(
+    val role: string,
+    val content: string,
+    val hasContent: bool,
+    // an array-valued content: one segment per part (the template renders each text part as its own message)
+    val parts: array<string>,
+    val reasoning: string,
+    val toolCalls: array<ServeToolCall>,
+    val name: string,
+    val toolCallId: string
+)
+
+private val inklingEffortNames = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+private val inklingEffortValues = ["0", "0.1", "0.2", "0.7", "0.9", "0.99", "0.99"]
+
+/** The effort text for `reasoning_effort` (a name or a number in [0, 0.99]); "" when it is not valid. Default 0.9. */
+fun serveEffortText(effort: string): string {
+    if (effort == "") return "0.9"
+    for (i in 0 until inklingEffortNames.size) if (inklingEffortNames[i] == effort) return inklingEffortValues[i]
+    val parsed = jsonParse(effort)
+    if (!parsed.succeeded || !parsed.value.isNumber()) return ""
+    effort
+}
+
+// A copy of `value` with the keys of every object in sorted (byte) order: the template's tojson(sort_keys=true).
+fun serveSortKeys(value: Json): Json {
+    if (value.isObject()) {
+        val keys: array<string> = []
+        for (key in value.keys) keys.append(key)
+        // insertion sort by byte order; objects are small
+        for (i in 1 until keys.size) {
+            var j = i
+            while (j > 0 && keys[j - 1] > keys[j]) {
+                val swap = keys[j]
+                keys[j] = keys[j - 1]
+                keys[j - 1] = swap
+                j = j - 1
+            }
+        }
+        val values: array<Json> = []
+        for (key in keys) values.append(serveSortKeys(value.get(key)))
+        return jsonObject(keys, values)
+    }
+    if (value.isArray()) {
+        val values: array<Json> = []
+        for (item in value.values) values.append(serveSortKeys(item))
+        return jsonArray(values)
+    }
+    value
+}
+
+// The tool declaration message for a list of OpenAI tool objects ({"type":"function","function":{name, description, parameters}}); "" without tools.
+fun serveToolDeclaration(tools: array<Json>): string {
+    if (tools.size == 0) return ""
+    val specs: array<Json> = []
+    for (tool in tools) {
+        val fn = if (tool.has("function")) tool.get("function") else tool
+        val parameters = if (fn.has("parameters") && fn.get("parameters").isObject() && fn.get("parameters").size() > 0) fn.get("parameters") else jsonObject([], [])
+        val type = if (tool.has("type") && tool.get("type").isString() && tool.get("type").asString() != "") tool.get("type").asString() else "function"
+        val description = if (fn.has("description") && fn.get("description").isString()) fn.get("description").asString() else ""
+        specs.append(serveSortKeys(jsonObject(["description", "name", "parameters", "type"],
+            [jsonString(description), jsonString(fn.getString("name")), parameters, jsonString(type)])))
+    }
+    "<|message_system|>tool_declare<|content_xml|>${jsonStringify(jsonArray(specs))}<|end_message|>"
+}
+
+private fun serveRoleToken(role: string): string = when (role) {
+    "user" -> "<|message_user|>"
+    "assistant" -> "<|message_model|>"
+    "system" -> "<|message_system|>"
+    "tool" -> "<|message_tool|>"
+    else -> ""
+}
+
+// A tool call's arguments (a JSON object as text) as the template writes them: keys sorted, compact; "" when they are not an object.
+fun serveCanonicalArguments(arguments: string): string {
+    if (arguments.trim() == "") return "{}"
+    val parsed = jsonParse(arguments)
+    if (!parsed.succeeded || !parsed.value.isObject()) return ""
+    val keys: array<string> = []
+    for (key in parsed.value.keys) keys.append(key)
+    for (i in 1 until keys.size) {
+        var j = i
+        while (j > 0 && keys[j - 1] > keys[j]) {
+            val swap = keys[j]
+            keys[j] = keys[j - 1]
+            keys[j - 1] = swap
+            j = j - 1
+        }
+    }
+    // values keep their own key order (the template sorts only the top level of args)
+    var text = "{"
+    for (i in 0 until keys.size) {
+        if (i > 0) text = text + ","
+        text = text + jsonStringify(jsonString(keys[i])) + ":" + jsonStringify(parsed.value.get(keys[i]))
+    }
+    text + "}"
+}
+
+/** The prompt text of a conversation, or "" with `error` set (the first entry of the returned array is the text; a failure puts the message in `errors`). */
+fun serveRenderPrompt(messages: array<ServeMessage>, tools: array<Json>, effort: string, var errors: array<string>): string {
+    val effortText = serveEffortText(effort)
+    if (effortText == "") {
+        errors.append("reasoning_effort must be one of none, minimal, low, medium, high, xhigh, max or a number in [0, 0.99]")
+        return ""
+    }
+    val out = byteBuffer()
+    out.appendText(serveToolDeclaration(tools))
+    var effortEmitted = false
+    for (message in messages) {
+        val role = serveRoleToken(message.role)
+        if (role == "") {
+            errors.append("unknown message role: ${message.role}")
+            return ""
+        }
+        if (!effortEmitted && message.role != "system") {
+            out.appendText("<|message_system|><|content_text|>Thinking effort level: $effortText<|end_message|>")
+            effortEmitted = true
+        }
+        var header = role
+        if (message.role == "tool") {
+            if (message.name != "") {
+                header = header + message.name
+            } else if (message.toolCallId != "") {
+                for (previous in messages) {
+                    if (previous.role == "assistant") {
+                        for (call in previous.toolCalls) if (call.id == message.toolCallId) header = header + call.name
+                    }
+                }
+            }
+        }
+        if (message.role == "assistant" && message.reasoning != "") out.appendText("$header<|content_thinking|>${message.reasoning}<|end_message|>")
+        if (message.parts.size > 0) {
+            for (part in message.parts) out.appendText("$header<|content_text|>$part<|end_message|>")
+        } else if (message.hasContent && (message.content != "" || !(message.role == "assistant" && (message.toolCalls.size > 0 || message.reasoning != "")))) {
+            out.appendText("$header<|content_text|>${message.content}<|end_message|>")
+        }
+        if (message.role == "assistant") {
+            for (call in message.toolCalls) {
+                val args = serveCanonicalArguments(call.arguments)
+                if (args == "") {
+                    errors.append("the arguments of tool call ${call.name} are not a JSON object")
+                    return ""
+                }
+                out.appendText("<|message_model|>${call.name}<|content_invoke_tool_json|>{\"name\":${jsonStringify(jsonString(call.name))},\"args\":$args}<|end_message|>")
+            }
+            out.appendText("<|content_model_end_sampling|>")
+        }
+    }
+    if (!effortEmitted) out.appendText("<|message_system|><|content_text|>Thinking effort level: $effortText<|end_message|>")
+    out.toText()
+}

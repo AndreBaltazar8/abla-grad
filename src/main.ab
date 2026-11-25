@@ -11,6 +11,7 @@ import "cli/spec_accept.ab"
 import "cli/spec_bench.ab"
 import "cli/spec_check.ab"
 import "cli/chat_session.ab"
+import "serve/server.ab"
 import "cli/decode_bench.ab"
 
 // Commands: compare, info; tokenize and logits arrive with the tokenizer (ablac-90) and the model graph.
@@ -31,6 +32,7 @@ fun main: int {
     if (command == "spec-bench") return cmdSpecBench(args)
     if (command == "spec-check") return cmdSpecCheck(args)
     if (command == "chat") return cmdChat(args)
+    if (command == "serve") return cmdServe(args)
     if (command == "decode-bench") return cmdDecodeBench(args)
     if (command == "compare-tensors") return cmdCompareTensors(args)
     println("abla-grad: commands: compare <oracle.grdl> <ours.grdl> [--tolerances file]\n       abla-grad info <model.gguf>   (tokenize, logits, generate; see README.md)")

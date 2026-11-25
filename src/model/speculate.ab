@@ -2,6 +2,7 @@
 // greedy acceptance, history commit) and, when `adaptive`, the plain decode graph whenever it is faster for the text at hand. Used by `generate` and
 // `spec-check`. Greedy only: a proposal is accepted when it is the target's argmax, so the output is the plain greedy output up to numerical near-ties.
 import "abla/process/time"
+import "abla/array"
 import "abla/io"
 import "abla/float/text"
 import "abla/float"
@@ -18,8 +19,13 @@ private var speculateError = ""
 
 fun speculateLastError(): string = if (speculateError != "") speculateError else dsparkLastError()
 
+// Set by the caller (from the emit callback) to end the running turn after the current batch of tokens.
+class SpecControl(var cancel: bool = false)
+
 class SpecStats(
-    var cycleTokens: int = 0, var plainTokens: int = 0, var cycles: int = 0, var switches: int = 0, var loopNanos: int = 0, var feedNanos: int = 0, var fedTokens: int = 0
+    var cycleTokens: int = 0, var plainTokens: int = 0, var cycles: int = 0, var switches: int = 0, var loopNanos: int = 0, var feedNanos: int = 0, var fedTokens: int = 0,
+    // set when a stop token ended the turn (not the token limit, not a cancel)
+    var stopped: bool = false, var generated: int = 0
 )
 
 // Extra positions the context needs beyond prompt + generated tokens (a batch of cycles can overshoot the last token by up to 3 rows each).
@@ -53,6 +59,7 @@ resource class SpecSession(
     val ws: PrefillWorkspace,
     val spec: DeviceBuffer,
     val snap: DeviceBuffer,
+    val promptSnap: DeviceBuffer,
     val plain: Recording,
     val cycle2: Recording,
     val cycle3: Recording?,
@@ -60,6 +67,8 @@ resource class SpecSession(
     val maxProposals: int,
     val seq: array<int> = [],
     var position: int = 0,
+    // the length of the prompt of the last turn (positions < promptPos hold its state; promptSnap the convolution histories at that point)
+    var promptPos: int = 0,
     val tc: array<f64> = [0.0, 0.0, 0.0, 0.0],
     var tp: f64 = 0.0,
     val hist: array<f64> = [],
@@ -111,7 +120,12 @@ fun specSessionCreate(var backend: Backend, var model: InklingModel, draftFile: 
         speculateError = "recording a cycle failed: ${dsparkLastError()} ${inklingLastError()}"
         return null
     }
-    val session = SpecSession(move(drafter), move(ws), move(spec), move(snap), move(plain), move(cycle2), move(cycle3), move(cycle4), maxProposals)
+    val promptSnap = backend.allocate(model.history.bytes + 16)
+    if (promptSnap == null) {
+        speculateError = "device memory for the prompt snapshot is not available"
+        return null
+    }
+    val session = SpecSession(move(drafter), move(ws), move(spec), move(snap), move(promptSnap), move(plain), move(cycle2), move(cycle3), move(cycle4), maxProposals)
     for (i in 0 until 20) session.hist.append(0.0)
     session
 }
@@ -120,6 +134,39 @@ fun specSessionCreate(var backend: Backend, var model: InklingModel, draftFile: 
 fun SpecSession.restart(): void {
     this.seq.clear()
     this.position = 0
+    this.promptPos = 0
+}
+
+/** Prepares the session for a conversation whose full token list is `tokens` (the prompt of a request): keeps the longest usable prefix of what the model
+ *  already holds, resets the rest, and queues the remaining tokens (fed by the next `turn`). Returns the number of leading tokens that are reused (not fed
+ *  again). The state is valid at `position` (the start of the last batch of the last turn) and at `promptPos` (the last prompt token's position): a request that
+ *  shares at least that many leading tokens continues from the later of them; otherwise the model starts from zero. At least the last token is always fed.
+ *  
+ *  The caller keeps the model's context in mind: seq.size + maxTokens + SPEC_CONTEXT_SLACK <= model.maxCtx. */
+fun SpecSession.reuse(var backend: Backend, var model: InklingModel, tokens: array<int>): int {
+    var common = 0
+    while (common < tokens.size && common < this.seq.size && tokens[common] == this.seq[common]) common = common + 1
+    if (common > tokens.size - 1) common = tokens.size - 1
+    if (common < 0) common = 0
+    var kept = 0
+    if (this.position > 0 && common >= this.position) {
+        kept = this.position
+    } else if (this.promptPos > 0 && common >= this.promptPos) {
+        // back to the end of the last prompt: the convolution histories come from its snapshot
+        val floats = model.history.bytes / 4
+        if (backend.launch("copy_f32", kernelArgs().pointer(this.promptSnap).pointer(model.history).u32(floats), [floats]) && backend.synchronize()) {
+            this.position = this.promptPos
+            kept = this.promptPos
+        }
+    }
+    if (kept == 0) {
+        model.reset(backend)
+        this.position = 0
+        this.promptPos = 0
+    }
+    while (this.seq.size > kept) this.seq.removeLast()
+    for (i in kept until tokens.size) this.seq.append(tokens[i])
+    kept
 }
 
 /** Appends tokens to the conversation without generating them (fed at the start of the next turn). */
@@ -131,7 +178,8 @@ fun SpecSession.append(tokens: array<int>): void {
  *  soon as a batch commits it. The generated tokens (and the stop token, if one ended the turn) join `seq`. The model's context must hold seq.size + maxTokens
  *  + SPEC_CONTEXT_SLACK positions. With `adaptive` the controller chooses between the plain graph and the cycles; otherwise the top cycle arm runs. */
 fun SpecSession.turn(
-    var backend: Backend, var model: InklingModel, maxTokens: int, stops: array<int>, adaptive: bool, plainOnly: bool, var stats: SpecStats, var emit: FnMut(int) -> void
+    var backend: Backend, var model: InklingModel, maxTokens: int, stops: array<int>, adaptive: bool, plainOnly: bool, control: SpecControl, var stats: SpecStats,
+    var emit: FnMut(int) -> void
 ): bool {
     speculateError = ""
     val config = model.config
@@ -162,6 +210,15 @@ fun SpecSession.turn(
         seeded = start + head.size
     }
     for (p in seeded until length) {
+        if (p == length - 1) {
+            // the state before the last prompt token: a later request that shares the prompt continues from here (its last token is always fed again)
+            val historyFloats = model.history.bytes / 4
+            if (!backend.launch("copy_f32", kernelArgs().pointer(model.history).pointer(this.promptSnap).u32(historyFloats), [historyFloats])) {
+                speculateError = "the prompt snapshot failed"
+                return false
+            }
+            this.promptPos = length - 1
+        }
         if (!model.forward(backend, this.seq[p], p)) {
             speculateError = inklingLastError()
             return false
@@ -186,9 +243,14 @@ fun SpecSession.turn(
     }
     var produced = 0
     this.seq.append(anchor)
-    for (stop in stops) if (stop == anchor) return true
+    for (stop in stops) if (stop == anchor) {
+        stats.stopped = true
+        return true
+    }
     emit(anchor)
     produced = 1
+    stats.generated = 1
+    if (control.cancel) return true
     var position = length
     var logged = length
     // Arms: 0 = the plain graph, 1 = cycle with 2 proposals, 2 = 3 proposals, 3 = 4 proposals. Without `adaptive` the top arm runs alone. The controller
@@ -260,11 +322,17 @@ fun SpecSession.turn(
             var isStop = false
             for (stop in stops) if (stop == token) isStop = true
             if (isStop) {
+                stats.stopped = true
                 ended = true
                 break
             }
             emit(token)
             produced = produced + 1
+            stats.generated = produced
+            if (control.cancel) {
+                ended = true
+                break
+            }
             if (produced >= maxTokens) {
                 ended = true
                 break
@@ -366,7 +434,7 @@ fun speculativeGenerate(
 ): bool {
     var session = specSessionCreate(backend, model, draftFile, maxProposals) ?? return false
     session.append(prompt)
-    session.turn(backend, model, maxTokens, stops, adaptive, false, stats, emit)
+    session.turn(backend, model, maxTokens, stops, adaptive, false, SpecControl(), stats, emit)
 }
 
 // Tokens per second of an arm from the measured costs: plain 1 / tp; a cycle arm with n proposals yields 1 + sum_{j <= n} P(accepted >= j) tokens per cycle, with the

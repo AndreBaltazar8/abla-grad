@@ -150,7 +150,7 @@ fun cmdChat(args: array<string>): int {
         var generated = 0
         var stats = SpecStats()
         val started = monotonicNanoseconds()
-        val ok = session.turn(backend, model, maxTokens, stops, true, !speculate, stats, { token ->
+        val ok = session.turn(backend, model, maxTokens, stops, true, !speculate, SpecControl(), stats, { token ->
             generated = generated + 1
             if (token == idThinking) {
                 mode = 1

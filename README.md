@@ -65,6 +65,21 @@ on prose, 150-250 tok/s on predictable text such as lists and code. The first tu
 - After every turn a line on stderr reports the tokens processed, the tokens generated and the decode speed.
 - Piped input works (`printf 'Hi\n/quit\n' | abla-grad chat ...`): one line per turn.
 
+## Serving Inkling over HTTP
+
+`abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N]` starts an OpenAI-compatible
+server on 127.0.0.1 (default port 8080, context 12288 tokens; the drafter `dspark-Inkling-2-Mini-Q8_0.gguf` is looked for next to the model). Point a coding
+tool at `http://127.0.0.1:8080/v1`; any API key works.
+
+- `GET /v1/models`, `GET /health`, `POST /v1/chat/completions` (JSON, or `"stream": true` as server-sent events with `stream_options.include_usage`).
+- Tools: `tools` / `tool_choice` go in, `tool_calls` come out (`finish_reason: "tool_calls"`), `role: "tool"` messages go back. The prompt is rendered the way
+  Inkling's own chat template does it. The model's thinking arrives as `reasoning_content`, the answer as `content`.
+- `max_tokens`, `stop` and `reasoning_effort` are honoured. Decoding is greedy: `temperature` and `top_p` are accepted and ignored.
+- One request at a time (the rest wait in the listen queue). The KV cache and speculation state stay between requests: a request whose prompt starts with
+  the previous conversation only processes the tokens after it (`usage.prompt_tokens_details.cached_tokens` tells how many were reused). Each request is
+  logged on stderr with prompt, reused and generated tokens, time to first token and tok/s.
+- `tools/test-serve.sh` (under `tools/gpu-lock.sh`) checks the shapes, a tool-call round trip, prefix reuse and that greedy output equals `generate`.
+
 ## Lossless packing for the Inkling target
 
 The packer checks every FP32 word in each router and loop-controller matrix. It requires every selected word to have zero low 16 bits. An inexact word produces an error identifying its tensor and element before the converter publishes the output. For the pinned UD-Q4_K_M model this saves 70,778,880 bytes across 168 matrices. Abla reads the packed router and controller weights natively. Decode and verification expand each BF16 value exactly inside their FP32 reductions. Prefill keeps its original router and controller reduction order. Loading the original GGUF uses its existing F32 path.

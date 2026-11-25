@@ -1,0 +1,142 @@
+// The OpenAI chat-completions request and response shapes for `abla-grad serve`: parsing a request body into messages, tools and parameters, and building the
+// JSON of responses and streaming chunks.
+import "abla/text"
+import "abla/json"
+import "template.ab"
+
+class ServeRequest(
+    val model: string,
+    val messages: array<ServeMessage>,
+    val tools: array<Json>,
+    val stream: bool,
+    val includeUsage: bool,
+    val maxTokens: int,          // 0 when absent
+    val stop: array<string>,
+    val effort: string,
+    val toolChoiceNone: bool
+)
+
+private fun contentOf(value: Json, var parts: array<string>): string {
+    if (value.isString()) return value.asString()
+    if (value.isArray()) {
+        for (part in value.values) {
+            if (part.isString()) parts.append(part.asString())
+            else if (part.isObject() && (!part.has("type") || part.getString("type") == "text" || part.getString("type") == "input_text")) parts.append(part.getString("text"))
+        }
+    }
+    ""
+}
+
+/** Parses a request body; on failure returns null and puts a message in `errors`. */
+fun serveParseRequest(body: string, var errors: array<string>): ServeRequest? {
+    val parsed = jsonParse(body, jsonPermissiveLimits)
+    if (!parsed.succeeded || !parsed.value.isObject()) {
+        errors.append("the request body is not a JSON object")
+        return null
+    }
+    val root = parsed.value
+    if (!root.has("messages") || !root.get("messages").isArray()) {
+        errors.append("messages must be an array")
+        return null
+    }
+    val messages: array<ServeMessage> = []
+    for (item in root.get("messages").values) {
+        if (!item.isObject() || !item.get("role").isString()) {
+            errors.append("every message needs a role")
+            return null
+        }
+        val parts: array<string> = []
+        val content = item.get("content")
+        val text = contentOf(content, parts)
+        val calls: array<ServeToolCall> = []
+        if (item.has("tool_calls") && item.get("tool_calls").isArray()) {
+            var n = 0
+            for (call in item.get("tool_calls").values) {
+                val fn = call.get("function")
+                val arguments = fn.get("arguments")
+                val argumentText = if (arguments.isString()) arguments.asString() else if (arguments.isObject()) jsonStringify(arguments) else "{}"
+                val id = if (call.get("id").isString()) call.getString("id") else "call_$n"
+                calls.append(ServeToolCall(id, fn.getString("name"), argumentText))
+                n = n + 1
+            }
+        }
+        val reasoning = if (item.get("reasoning_content").isString()) item.getString("reasoning_content")
+            else if (item.get("reasoning").isString()) item.getString("reasoning") else ""
+        messages.append(ServeMessage(item.getString("role"), text, content.isString(), parts, reasoning, calls,
+            item.getString("name"), item.getString("tool_call_id")))
+    }
+    val tools: array<Json> = []
+    if (root.has("tools") && root.get("tools").isArray()) for (tool in root.get("tools").values) tools.append(tool)
+    val stop: array<string> = []
+    if (root.get("stop").isString()) stop.append(root.getString("stop"))
+    else if (root.get("stop").isArray()) for (s in root.get("stop").values) if (s.isString() && s.asString() != "") stop.append(s.asString())
+    var maxTokens = 0
+    if (root.get("max_completion_tokens").isNumber()) maxTokens = root.get("max_completion_tokens").asInt()
+    else if (root.get("max_tokens").isNumber()) maxTokens = root.get("max_tokens").asInt()
+    val effort = if (root.get("reasoning_effort").isString()) root.getString("reasoning_effort")
+        else if (root.get("reasoning_effort").isNumber()) jsonStringify(root.get("reasoning_effort")) else ""
+    val includeUsage = root.get("stream_options").isObject() && root.get("stream_options").get("include_usage").asBoolean()
+    ServeRequest(root.getString("model"), messages, tools, root.get("stream").asBoolean(), includeUsage, maxTokens, stop, effort,
+        root.get("tool_choice").isString() && root.getString("tool_choice") == "none")
+}
+
+fun serveErrorBody(message: string, kind: string, code: string): string = jsonStringify(jsonObject(["error"],
+    [jsonObject(["message", "type", "param", "code"], [jsonString(message), jsonString(kind), jsonNull(), if (code == "") jsonNull() else jsonString(code)])]))
+
+fun serveModelsBody(name: string, created: int): string = jsonStringify(jsonObject(["object", "data"],
+    [jsonString("list"), jsonArray([jsonObject(["id", "object", "created", "owned_by"], [jsonString(name), jsonString("model"), jsonInteger(created), jsonString("abla-grad")])])]))
+
+fun serveToolCallJson(index: int, id: string, name: string, arguments: string, withIndex: bool): Json {
+    val keys: array<string> = []
+    val values: array<Json> = []
+    if (withIndex) {
+        keys.append("index")
+        values.append(jsonInteger(index))
+    }
+    keys.append("id")
+    values.append(jsonString(id))
+    keys.append("type")
+    values.append(jsonString("function"))
+    keys.append("function")
+    values.append(jsonObject(["name", "arguments"], [jsonString(name), jsonString(arguments)]))
+    jsonObject(keys, values)
+}
+
+private fun usageJson(prompt: int, completion: int, cached: int): Json = jsonObject(["prompt_tokens", "completion_tokens", "total_tokens", "prompt_tokens_details"],
+    [jsonInteger(prompt), jsonInteger(completion), jsonInteger(prompt + completion), jsonObject(["cached_tokens"], [jsonInteger(cached)])])
+
+/** One streaming chunk: `delta` is the delta object, `finish` the finish reason ("" for none), usage only on the final usage chunk (prompt < 0: none). */
+fun serveChunk(id: string, created: int, model: string, delta: Json, finish: string, prompt: int, completion: int, cached: int, choices: bool): string {
+    val keys = ["id", "object", "created", "model"]
+    val values = [jsonString(id), jsonString("chat.completion.chunk"), jsonInteger(created), jsonString(model)]
+    if (choices) {
+        keys.append("choices")
+        values.append(jsonArray([jsonObject(["index", "delta", "finish_reason"], [jsonInteger(0), delta, if (finish == "") jsonNull() else jsonString(finish)])]))
+    } else {
+        keys.append("choices")
+        values.append(jsonArray([]))
+    }
+    if (prompt >= 0) {
+        keys.append("usage")
+        values.append(usageJson(prompt, completion, cached))
+    }
+    "data: ${jsonStringify(jsonObject(keys, values))}\n\n"
+}
+
+/** The non-streaming response body. */
+fun serveCompletionBody(id: string, created: int, model: string, content: string, reasoning: string, calls: array<Json>, finish: string, prompt: int, completion: int, cached: int): string {
+    val keys = ["role", "content"]
+    val values = [jsonString("assistant"), if (content == "" && calls.size > 0) jsonNull() else jsonString(content)]
+    if (reasoning != "") {
+        keys.append("reasoning_content")
+        values.append(jsonString(reasoning))
+    }
+    if (calls.size > 0) {
+        keys.append("tool_calls")
+        values.append(jsonArray(calls))
+    }
+    jsonStringify(jsonObject(["id", "object", "created", "model", "choices", "usage"],
+        [jsonString(id), jsonString("chat.completion"), jsonInteger(created), jsonString(model),
+         jsonArray([jsonObject(["index", "message", "finish_reason"], [jsonInteger(0), jsonObject(keys, values), jsonString(finish)])]),
+         usageJson(prompt, completion, cached)]))
+}
