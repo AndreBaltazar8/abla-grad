@@ -1,0 +1,116 @@
+// `abla-grad spec-check <target.gguf> <drafter.gguf> <ids-file> [--n N] [--ctx N]`: greedy speculative decoding (adaptive) against plain greedy decoding on the same
+// prompt. The streams must agree except at near-ties: at the first difference the target's logit margin between the plain and the speculative token is
+// measured (plain forward over the common prefix); a margin above MARGIN fails. Exit 0 when the first N tokens agree or the first difference is a near-tie.
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/integer"
+import "abla/float"
+import "abla/float/text"
+import "../backend/backend.ab"
+import "../backend/cuda.ab"
+import "../gguf/reader.ab"
+import "../model/inkling.ab"
+import "../model/inkling_config.ab"
+import "../model/speculate.ab"
+import "../ops.ab"
+
+private val MARGIN = 1.0
+
+fun cmdSpecCheck(args: array<string>): int {
+    var count = 128
+    val positional: array<string> = []
+    var index = 0
+    while (index < args.size) {
+        if (args[index] == "--n" && index + 1 < args.size) {
+            count = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else {
+            positional.append(args[index])
+            index = index + 1
+        }
+    }
+    if (positional.size != 3 || count <= 0) {
+        println("usage: abla-grad spec-check <target.gguf> <drafter.gguf> <ids-file> [--n N]")
+        return 2
+    }
+    val idsText = Path(positional[2]).readTextResult()
+    if (!idsText.succeeded) {
+        println("spec-check: cannot read ${positional[2]}")
+        return 2
+    }
+    val ids: array<int> = []
+    for (rawLine in idsText.text.split("\n")) {
+        val line = rawLine.trim()
+        if (line == "") continue
+        ids.append(line.parseInt() ?? return 2)
+    }
+    val file = ggufOpen(positional[0])
+    val draftFile = ggufOpen(positional[1])
+    if (file == null || draftFile == null) {
+        println("spec-check: ${ggufLastError()}")
+        return 2
+    }
+    val config = inklingConfigFrom(file) ?? return 2
+    var backend = cudaBackend() ?? return 2
+    val context = ids.size + count + SPEC_CONTEXT_SLACK
+    var model = inklingLoad(backend, file, config, context) ?? return 1
+    // plain greedy reference
+    if (!model.reset(backend)) return 1
+    val plain: array<int> = []
+    var token = ids[0]
+    for (position in 0 until ids.size + count - 1) {
+        if (!model.forward(backend, token, position)) {
+            println("spec-check: ${inklingLastError()}")
+            return 1
+        }
+        if (position >= ids.size - 1) {
+            val row = model.readLogits(backend) ?? return 1
+            var best = 0
+            for (i in 1 until row.size) if (row[i] > row[best]) best = i
+            plain.append(best)
+            token = best
+        } else {
+            token = ids[position + 1]
+        }
+    }
+    // speculative run on the same model (reset state; the KV is overwritten)
+    if (!model.reset(backend)) return 1
+    val spec: array<int> = []
+    var stats = SpecStats()
+    if (!speculativeGenerate(backend, model, draftFile, ids, count, [], true, stats, { t -> spec.append(t) })) {
+        println("spec-check: ${speculateLastError()}")
+        return 1
+    }
+    var first = -1
+    val n = if (spec.size < plain.size) spec.size else plain.size
+    for (i in 0 until n) {
+        if (spec[i] != plain[i]) {
+            first = i
+            break
+        }
+    }
+    println("spec-check: ${spec.size} speculative vs ${plain.size} plain tokens; ${stats.cycleTokens} tokens in ${stats.cycles} cycles, ${stats.plainTokens} plain, ${stats.switches} switches")
+    if (first < 0) {
+        println("spec-check: identical over $n tokens")
+        return 0
+    }
+    // the margin at the first difference: logits of the plain model after prompt + plain[0..first)
+    if (!model.reset(backend)) return 1
+    var prev = ids[0]
+    val prefix: array<int> = []
+    for (id in ids) prefix.append(id)
+    for (i in 0 until first) prefix.append(plain[i])
+    for (position in 0 until prefix.size) {
+        if (!model.forward(backend, prefix[position], position)) return 1
+    }
+    val row = model.readLogits(backend) ?? return 1
+    val margin = f32ToF64(row[plain[first]]) - f32ToF64(row[spec[first]])
+    println("spec-check: first difference at token $first: plain ${plain[first]} (logit ${row[plain[first]]}) vs speculative ${spec[first]} (logit ${row[spec[first]]}), margin $margin")
+    if (margin <= MARGIN) {
+        println("spec-check: near-tie (margin <= $MARGIN): accepted")
+        return 0
+    }
+    println("spec-check: FAILED: a difference with margin above $MARGIN")
+    1
+}
