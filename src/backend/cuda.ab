@@ -468,7 +468,7 @@ private val cudaVerifyIndexedArguments = [
 ]
 
 private fun cudaVerifyDenseShape(args: KernelArgs, problem: array<int>): bool =
-    cudaF32Shape(args, problem) && ((args.words[5] >= 1 && args.words[5] <= 3) || args.words[5] == 8)
+    cudaF32Shape(args, problem) && ((args.words[5] >= 1 && args.words[5] <= 5) || args.words[5] == 8)
 
 private fun cudaVerifyQ8Shape(args: KernelArgs, problem: array<int>): bool =
     cudaVerifyDenseShape(args, problem) && args.words[4] % 32 == 0

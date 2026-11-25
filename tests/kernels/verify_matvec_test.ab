@@ -87,7 +87,7 @@ private fun verifyDense(var backend: Backend, kind: string, rows: int, cols: int
         if (!backend.launch(name, args, [rows])) return false
         if (bench && v == 0 && !timeVerify(backend, name, args, [rows], "${name} ${rows}x${cols}", 1)) return false
     }
-    for (vectors in [1, 2, 3, 8]) {
+    for (vectors in [1, 2, 3, 4, 5, 8]) {
         val y = verifyOutput(backend, vectors * rows) ?? return false
         val args = kernelArgs().pointer(w, wOffset).pointer(x, xOffset).pointer(y)
             .u32(rows).u32(cols).u32(vectors)

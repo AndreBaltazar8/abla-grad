@@ -92,6 +92,8 @@ extern "C" __global__ void matvec_f32_rows(const unsigned char *w, const float *
     if (vectors == 1) verify_dense<1, float>(w, x, y, rows, cols);
     else if (vectors == 2) verify_dense<2, float>(w, x, y, rows, cols);
     else if (vectors == 3) verify_dense<3, float>(w, x, y, rows, cols);
+    else if (vectors == 4) verify_dense<4, float>(w, x, y, rows, cols);
+    else if (vectors == 5) verify_dense<5, float>(w, x, y, rows, cols);
     else if (vectors == 8) verify_dense<8, float>(w, x, y, rows, cols);
 }
 
@@ -100,6 +102,8 @@ extern "C" __global__ void matvec_bf16_rows(const unsigned char *w, const float 
     if (vectors == 1) verify_dense<1, unsigned short>(w, x, y, rows, cols);
     else if (vectors == 2) verify_dense<2, unsigned short>(w, x, y, rows, cols);
     else if (vectors == 3) verify_dense<3, unsigned short>(w, x, y, rows, cols);
+    else if (vectors == 4) verify_dense<4, unsigned short>(w, x, y, rows, cols);
+    else if (vectors == 5) verify_dense<5, unsigned short>(w, x, y, rows, cols);
     else if (vectors == 8) verify_dense<8, unsigned short>(w, x, y, rows, cols);
 }
 """
@@ -174,6 +178,8 @@ extern "C" __global__ void matvec_q8_0_rows(const unsigned char *w, const float 
     if (vectors == 1) verify_q8<1>(w, x, y, rows, cols);
     else if (vectors == 2) verify_q8<2>(w, x, y, rows, cols);
     else if (vectors == 3) verify_q8<3>(w, x, y, rows, cols);
+    else if (vectors == 4) verify_q8<4>(w, x, y, rows, cols);
+    else if (vectors == 5) verify_q8<5>(w, x, y, rows, cols);
     else if (vectors == 8) verify_q8<8>(w, x, y, rows, cols);
 }
 """
