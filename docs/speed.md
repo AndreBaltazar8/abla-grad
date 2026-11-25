@@ -524,3 +524,33 @@ With the Q8_0 DSpark drafter loaded, `serve --ctx 32768` processed a 16,787-toke
 Both long step-mode GRDLs (05 and 06, 5,924 positions) matched the full-cache files byte for byte. At the physical wrap, 20 windows each at verification widths three and five matched plain decode on all 160 row argmaxes. The scalar decode test also compared every output bit of two KV heads for zero through four accepted proposals. Locked runs, prompts and output files are under `~/archive/abla-grad-ring-1250/`.
 
 Two matched plain graph tg128 runs per depth used the original target, the same prompt IDs and opposite run order. At d15 the linear baseline measured 138.52/138.71 tok/s and the ring build 138.24/136.91. At d512 they measured 132.85/129.38 and 132.48/132.96. On the 1,624-token Alice prompt they measured 126.34/121.62 and 126.19/123.28. All six pairs produced identical generated IDs. These pairs establish the memory saving without a repeatable decode gain at these depths.
+
+## Prose proposal failures and verification depth
+
+The RTX 4090 runs used the original Q4_K_M target, Q8_0 drafter and the recorded four-candidates-per-warp shortlist at `3dc62e0`. Each completion has 512 greedy IDs, including the seed token. The ranked traces record the two best scored draft IDs and the two best target IDs after each row, with ties broken by token ID. Only proposals reached before or at the first rejection count. Diagnostic tracing and throughput measurements used separate executables.
+
+| Fixed nmax 4 | Zero / one / two / three / four proposals accepted per cycle | First proposal rejected | Target winner was draft runner-up at first rejection | Draft runner-up in target top two at first rejection |
+|---|---|---:|---:|---:|
+| Fog | 124 / 68 / 36 / 17 / 15 | 124/260 | 57/245 (23.3%) | 81/245 (33.1%) |
+| Museum | 63 / 64 / 44 / 16 / 25 | 63/212 | 48/187 (25.7%) | 63/187 (33.7%) |
+| Ferry | 82 / 49 / 40 / 19 / 27 | 82/217 | 50/190 (26.3%) | 76/190 (40.0%) |
+
+Fog's first-proposal rejection accounts for almost half its cycles. Museum loses nearly as many cycles at its second proposal as at its first. On the first proposal alone the runner-up recovers 33 of Fog's 124 misses and 21 of Museum's 63. Scaling every score by a positive inverse temperature preserves the greedy ranking. We varied the relative weight on the trained Markov correction and the shortlist size instead.
+
+| Markov projection or shortlist change | Fog cycles | Museum cycles | Ferry cycles |
+|---|---:|---:|---:|
+| Released | 260 | 212 | 217 |
+| Half Markov correction | 269 | 228 | 224 |
+| Double Markov correction | 279 | 232 | 230 |
+| Omit Markov correction | 293 | 277 | 270 |
+| Eight shortlist candidates per warp | 258 | 212 | 216 |
+
+The all-position trace commits only the verified anchor, so a replay can start a cycle at every position in the same greedy chain. It compares proposals with the true subsequent token IDs and accounts for changes to the next cycle start. At five verifier rows, replacing the fourth linear proposal with a runner-up at the smallest top-two gap among proposals one to three, when that gap is below one logit, took 251 cycles on Fog and 207 on Museum. Choosing this single sibling with knowledge of future tokens would take at least 234 and 198 cycles respectively. These are replayed cycle counts. Branch-dependent KV, convolution histories and any tree-verifier overhead are excluded.
+
+On the first proposal, the median draft gap between first and second was 0.82 logits on Fog misses and 3.66 on hits. Museum's corresponding medians were 0.49 and 2.21. The two ranked target IDs came from a separate reduction over all target logits. Exact runner-up statistics include ties after the rounded softcap.
+
+A second diagnostic saved the 256-element Markov state at each primary proposal, restored it for each runner-up, and ran DSpark's actual correction on the resulting descendants. The anchor-only trace still generated the same 512 target IDs. At every fixed-four cycle start on all three prompts, all four primary proposal IDs agreed with the original trace. This allows comparison of branching policies with the same target chain and R5 row budget. Under four proposals there are nine binary tree shapes when every chosen second child also has its first sibling. On Fog, the best static shape used the first three primary proposals and a sibling at the first proposal (249 cycles). On Museum the best static shape kept the four primary proposals (212). An oracle choosing among all nine shapes at each boundary took 227 cycles on Fog and 187 on Museum. Even with zero extra work for tree verification, these counts would require at most 11.26 and 13.66 ms per cycle to reach 200 tok/s. The measured linear R5 cycles were 14.54 and 14.59 ms respectively.
+
+Fog and Museum spent the entire measured 512-token chat continuations in the thinking channel. Ferry used a raw prose continuation. Applying 0.25 of the previous rejected verifier row’s logits to the next draft reduced fixed-four cycles on Fog from 260 to 250, but increased Museum from 212 to 223. Applying a 0.10 prior only to the next first proposal took 256 and 209 cycles. Each comparison used the same target chain.
+
+Verifying through the first of the initial three proposals whose margin fell below a cutoff, or all four if none did, gave 153.94 tok/s on Fog with a two-logit cutoff, and 174.77 on Museum with a one-logit cutoff. The corresponding fixed-two baselines on the same IDs were 149.88 and 170.89 tok/s. These are prompt-specific diagnostic settings. The production controller still uses the released adaptive policy. The per-run logs, exact IDs, trace replays and fork-policy calculations are in `~/archive/abla-grad-prose-1249/`.
