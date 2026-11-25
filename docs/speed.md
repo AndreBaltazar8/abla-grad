@@ -34,6 +34,38 @@ Raw benchmark samples are in
 `~/src/abla-grad-oracle/artifacts/bench-depth-33aeb17/` and
 `~/src/abla-grad-oracle/unsloth-b12649-mix-c7059d6/`.
 
+## Decode across cache depths
+
+Decode throughput in tokens/second on the RTX 4090, with the same
+Inkling UD-Q4_K_M GGUF and no drafter.
+
+| Cached depth | Generated tokens | abla-grad graph | llama.cpp 33aeb17 | Unsloth b12649-mix-c7059d6 |
+|---:|---:|---:|---:|---:|
+| 0 | 128 | 105.39 | 77.39 | 105.27 |
+| 0 | 1024 | 102.60 | 77.80 | 104.62 |
+| 512 | 128 | 102.27 | 77.97 | 105.53 |
+| 512 | 1024 | 100.29 | 76.58 | 103.74 |
+| 1024 | 128 | 99.63 | 76.90 | 104.13 |
+| 1024 | 1024 | 99.21 | 75.92 | 102.94 |
+| 2048 | 128 | n/a (accuracy pending 06) | 75.58 | 102.62 |
+| 2048 | 1024 | n/a (accuracy pending 06) | 75.58 | 102.56 |
+| 4096 | 128 | n/a (accuracy pending 06) | 74.92 | 100.74 |
+| 4096 | 1024 | n/a (accuracy pending 06) | 74.85 | 100.78 |
+
+Each llama.cpp result is the mean of three `llama-bench` repetitions
+with F16 KV, CUDA graphs and synthetic tokens. abla-grad `85b7bee`
+used one graph run per cell, F32 KV, and greedy continuation of a
+natural-text prefix (fixture 06). Its context was
+`depth + generation + 1` rounded up to 256. Depth counts cached
+tokens before the seed. All timings exclude prefill and use E-cores 24–27.
+
+The 1,624-position natural-text gate qualified the sliding-window path
+on fixture 05. Among its 1,624 rows, abla-grad exceeded KL 0.04 on 28,
+mainline CPU vs CUDA on 42, and mainline CUDA vs Unsloth CUDA on 36.
+The 4,300-position fixture 06 is the remaining accuracy check for
+the d2048 and d4096 rows. Raw samples and reproduction commands are in
+`~/src/abla-grad-oracle/long-depth/`.
+
 ## Decode profiles at d15 and d512
 
 On the same 4090, CUPTI recorded 128 decode steps per depth with zero
