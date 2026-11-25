@@ -17,6 +17,7 @@ Method: ours = `abla-grad decode-bench <gguf> <ids> --n 128 --mode graph` (greed
 | Unsloth b12649-mix-c7059d6 | 5,474.87 | 103.96 |
 | llama.cpp mainline 33aeb17 | 3,506.31 (prior run) | |
 | abla-grad c01d3f3 | ~3,550 ([prefill benchmark](prefill.md)) | |
+| abla-grad prefill 22b35db | 4,685 (`prefill-bench --tokens 512`, gate with `--prefill --chunk 256`: 0 argmax differences in 324, worst KL 0.0094) | |
 | abla-grad prefill ec2366d | 4,150 (`prefill-bench --tokens 512 --moe-tile 64`, gate `GATE_LOGITS_FLAGS="--prefill --chunk 256"`: 0 to 1 argmax differences in 324, worst KL 0.0094) | |
 
 The llama-bench results are means of three repetitions on E-cores 24–27.
