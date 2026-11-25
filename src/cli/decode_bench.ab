@@ -45,6 +45,7 @@ fun cmdDecodeBench(args: array<string>): int {
     var maxCtx = 0
     var logPath = ""
     var noSplit = false
+    var launches = false
     var splits = 16
     var noFuse = false
     val positional: array<string> = []
@@ -56,6 +57,9 @@ fun cmdDecodeBench(args: array<string>): int {
         } else if (args[index] == "--splits" && index + 1 < args.size) {
             splits = args[index + 1].parseInt() ?? 16
             index = index + 2
+        } else if (args[index] == "--launches") {
+            launches = true
+            index = index + 1
         } else if (args[index] == "--no-split") {
             noSplit = true
             index = index + 1
@@ -119,6 +123,15 @@ fun cmdDecodeBench(args: array<string>): int {
         if (recording == null) {
             println("decode-bench: ${inklingLastError()} (${cudaLastError()})")
             return 1
+        }
+        if (launches) {
+            var total = 0
+            for (name in cudaLaunchCounts.keys()) {
+                val c = cudaLaunchCounts.get(name) ?? 0
+                total = total + c
+                println("decode-bench: launches $name: $c")
+            }
+            println("decode-bench: launches per token: $total")
         }
         if (!model.reset(backend)) return 1
         for (position in 0 until ids.size - 1) if (!model.forward(backend, ids[position], position)) return 1

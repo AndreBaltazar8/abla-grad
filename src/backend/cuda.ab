@@ -56,6 +56,9 @@ private trusted noescape extern:"c" fun nvrtcDestroyProgram(program: i64*): i32
 
 private var cudaError = ""
 
+// Kernel name -> launches recorded so far (debug: decode-bench --launches prints it).
+val cudaLaunchCounts: Map<string, int> = Map()
+
 fun cudaLastError(): string = cudaError
 
 private fun cudaStatus(status: i32, call: string): bool {
@@ -911,7 +914,10 @@ class CudaBackend(
                 nativePointerFromAddress(if (this.currentBranch == 0) this.stream else this.sideStreams[this.currentBranch - 1]),
                 pointers.address, nativeNullPointer()), "cuLaunchKernel")
         }
-        if (ok && this.recording) this.recordedLaunches += 1
+        if (ok && this.recording) {
+            this.recordedLaunches += 1
+            cudaLaunchCounts.set(kernel, (cudaLaunchCounts.get(kernel) ?? 0) + 1)
+        }
         this.popContext()
         ok
     }
