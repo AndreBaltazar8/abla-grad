@@ -1,0 +1,72 @@
+import "abla/float"
+import "abla/io"
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "support.ab"
+
+private fun launch(var backend: Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, table: DeviceBuffer,
+    dest: DeviceBuffer, step: DeviceBuffer, splits: int, grouped: bool, suffix: string): bool {
+    val args = kernelArgs().pointer(q).pointer(k).pointer(v).pointer(table).pointer(dest).pointer(step)
+        .u32(6).u32(2).u32(128).u32(0).u32(64).u32(257).f32(0.125).u32(splits)
+    val name = if (grouped) "attention_rel_grouped_step" else "attention_rel_split_step"
+    backend.launch(name + suffix, args, [(if (grouped) 2 else 6) * splits])
+}
+
+private fun cache(var backend: Backend, count: int, seed: int, suffix: string): DeviceBuffer? {
+    if (suffix == "") return uploadFloats(backend, testSignal(count, seed))
+    val words: array<int> = []
+    if (suffix == "_f16") {
+        // Exactly represented FP16 values with different signs, exponents and mantissas.
+        val halves = [0, 0xbc00, 0x3900, 0xc240, 0x4180, 0x3500, 0xbe80]
+        for (i in 0 until count / 2) {
+            val j = i * 2 + seed
+            words.append(halves[j % halves.size] | (halves[(j + 1) % halves.size] << 16))
+        }
+    } else {
+        for (block in 0 until count / 32) {
+            words.append(int(f32ToBits(f32FromInt((block + seed) % 7 + 1) / 128.0)))
+            for (word in 0 until 8) {
+                var bits = 0
+                for (byte in 0 until 4) bits = bits | (((block + seed + word * 4 + byte) * 37 % 256) << (byte * 8))
+                words.append(bits)
+            }
+        }
+    }
+    uploadWords(backend, words)
+}
+
+// Compare intermediate softmax partials directly. Empty splits have -inf maxima.
+private fun check(var backend: Backend, pos: int, splits: int, suffix: string): bool {
+    val heads = 6
+    val kvHeads = 2
+    val dim = 128
+    val ctx = 257
+    val extent = 64
+    val q = uploadFloats(backend, testSignal(heads * dim, 7)) ?? return false
+    val k = cache(backend, kvHeads * dim * ctx, 13, suffix) ?? return false
+    val v = cache(backend, kvHeads * dim * ctx, 19, suffix) ?? return false
+    val table = uploadFloats(backend, testSignal(heads * (extent + 1), 23)) ?? return false
+    val step = uploadWords(backend, [0, pos, 0, 0]) ?? return false
+    val size = heads * splits * (dim + 2)
+    val ref = backend.allocate(size * 4) ?? return false
+    val got = backend.allocate(size * 4) ?? return false
+    if (!launch(backend, q, k, v, table, ref, step, splits, false, suffix)) return false
+    if (!launch(backend, q, k, v, table, got, step, splits, true, suffix)) return false
+    val expected = downloadWords(backend, ref, size) ?? return false
+    val actual = downloadWords(backend, got, size) ?? return false
+    for (i in 0 until size) if (expected[i] != actual[i]) {
+        eprintln("grouped attention$suffix mismatch at position $pos, split count $splits, output word $i")
+        return false
+    }
+    true
+}
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    for (suffix in ["", "_f16", "_q8"]) for (pos in [0, 127, 256]) for (splits in [1, 13, 64]) if (!check(backend, pos, splits, suffix)) {
+        eprintln(cudaLastError())
+        return 1
+    }
+    println("grouped attention produces identical FP32 partials")
+    0
+}

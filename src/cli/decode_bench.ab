@@ -1,4 +1,4 @@
-// `abla-grad decode-bench <model.gguf> <ids-file> [--n N] [--mode direct|graph] [--ctx N] [--batch-seed] [--f16-kv] [--global-kv 8|16|32] [--log file]`: greedy decode speed of an Inkling model, tg128-style.
+// `abla-grad decode-bench <model.gguf> <ids-file> [--n N] [--mode direct|graph] [--ctx N] [--batch-seed] [--f16-kv] [--global-kv 8|16|32] [--splits N] [--global-splits N] [--no-grouped-attention] [--log file]`: greedy decode speed of an Inkling model, tg128-style.
 // Seeding is untimed. By default it steps through the IDs. --batch-seed prefills the prefix in chunks of 512. The timed region generates N tokens:
 // `direct` launches every kernel from the host each token and reads the argmax back; `graph` replays one recorded token N times with the argmax,
 // the token log and the position all on the device. Prints tok/s and the generated ids (to --log if given).
@@ -59,7 +59,7 @@ fun cmdDecodeBench(args: array<string>): int {
     var globalSplits = 0
     var grouped = true
     var launches = false
-    var splits = 16
+    var splits = 0
     var noFuse = false
     var noFuseController = false
     val positional: array<string> = []
@@ -69,7 +69,8 @@ fun cmdDecodeBench(args: array<string>): int {
             count = args[index + 1].parseInt() ?? 0
             index = index + 2
         } else if (args[index] == "--splits" && index + 1 < args.size) {
-            splits = args[index + 1].parseInt() ?? 16
+            splits = args[index + 1].parseInt() ?? -1
+            if (splits < 1 || splits > ATTENTION_SPLITS_MAX) return 2
             index = index + 2
         } else if (args[index] == "--f16-kv") {
             halfKv = true
@@ -121,10 +122,9 @@ fun cmdDecodeBench(args: array<string>): int {
         }
     }
     if (positional.size != 2 || count <= 0 || (mode != "direct" && mode != "graph")) {
-        println("usage: abla-grad decode-bench <model.gguf> <ids-file> [--n N] [--mode direct|graph] [--ctx N] [--batch-seed] [--f16-kv] [--global-kv 8|16|32] [--log file]")
+        println("usage: abla-grad decode-bench <model.gguf> <ids-file> [--n N] [--mode direct|graph] [--ctx N] [--batch-seed] [--f16-kv] [--global-kv 8|16|32] [--splits N] [--global-splits N] [--no-grouped-attention] [--log file]")
         return 2
     }
-    if (splits < 1 || splits > ATTENTION_SPLITS_MAX) return 2
     val ids = readPromptIds(positional[1])
     if (ids == null || ids.size == 0) {
         println("decode-bench: ${positional[1]} is not a file of token ids")
@@ -150,12 +150,12 @@ fun cmdDecodeBench(args: array<string>): int {
     if (!model.reset(backend)) return 1
     model.useStep = true
     model.splitAttention = !noSplit
-    model.attentionSplits = splits
-    model.globalAttentionSplits = globalSplits
+    if (splits > 0) model.attentionSplits = splits
+    model.globalAttentionSplits = if (globalSplits > 0) globalSplits else splits
     model.groupedAttention = grouped
     model.fused = !noFuse
     model.fusedController = !noFuseController
-    // prefill all but the last prompt token (this also loads every kernel module, which must happen before recording)
+    // The final prompt token is the seed for timed generation.
     val prefix: array<int> = []
     if (batchSeed) for (i in 0 until ids.size - 1) prefix.append(ids[i])
     val ws = if (batchSeed && prefix.size > 0) prefillWorkspace(backend, config, 512, false) else null
@@ -164,7 +164,7 @@ fun cmdDecodeBench(args: array<string>): int {
     val last = ids.size - 1
     val generated: array<int> = []
     if (mode == "graph") {
-        // one direct pass of the last prompt token warms the kernels; its effects are undone by resetting and prefilling again
+        // Warm the decode kernels before capture, then reset once and seed the timed graph.
         if (!model.forward(backend, ids[0], 0)) return 1
         val recording = model.capture(backend)
         if (recording == null) {

@@ -152,3 +152,17 @@ node tools/context-quality.mjs score answer.txt
 
 The `text` mode loads the vocabulary only. It also decodes Abla's
 output IDs, using the same token pieces and end-of-generation rule.
+
+To compare global cache precision on the same teacher-forced prefix, run
+`context-logits` with `global32`, `global16` or `global8`.
+These modes preserve the sliding-cache precision selected for the context.
+`score-context` writes the greedy ID at each input position and reports
+perplexity on the following input IDs. For a prefix of N tokens it scores
+N−1 predictions, including the first prediction after BOS.
+
+```sh
+cc -O3 -fopenmp -fno-math-errno tools/oracle/score-context.c -lm -o build/score-context
+set -o pipefail
+tools/gpu-lock.sh -- build/context-logits "$model" "$ids" global16 256 |
+    OMP_NUM_THREADS=6 build/score-context "$ids" 32768 200058 global16.choices
+```

@@ -26,7 +26,7 @@ private trusted fun writeRow(address: int, bytes: int): bool {
 
 trusted fun main: int {
     if (processArgumentCount() != 4) {
-        eprintln("usage: context-logits <model.gguf> <ids> <auto|f16|q8> <chunk> > rows.f32")
+        eprintln("usage: context-logits <model.gguf> <ids> <auto|f16|q8|global32|global16|global8> <chunk> > rows.f32")
         return 2
     }
     val mode = processArgument(2)

@@ -180,7 +180,8 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
     val map = inklingScratch(c)
     val visits = inklingVisits(c)
     val scratch = backend.allocate(map.total)
-    val autoQuantize = quantizeKv || (!halfKv && maxCtx > INKLING_Q8_KV_CONTEXT)
+    val groupedShape = c.nHead == 3 * c.nHeadKv && c.headDim == 128
+    val autoQuantize = quantizeKv || (!halfKv && (maxCtx > INKLING_Q8_KV_CONTEXT || (groupedShape && maxCtx >= INKLING_GROUPED_CONTEXT)))
     val bits = if (globalKvBits != 0) globalKvBits else if (autoQuantize && c.headDim % 32 == 0) 8 else 16
     if ((bits != 8 && bits != 16 && bits != 32) || (bits == 8 && c.headDim % 32 != 0)) {
         inklingError = "unsupported global K/V precision for this head dimension"
