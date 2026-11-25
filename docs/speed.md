@@ -153,6 +153,7 @@ the final request. Request 5 hit the 512-token limit on `cf6578c` and
 | `b22b960` | 74917 | 56657 | 202 | 11.945 | 67.34 | 14.945 | 59.208 |
 | `cf6578c` | 74917 | 56656 | 202 | 10.838 | 101.22 | 12.834 | 55.565 |
 | `9aaccb1` | 74917 | 56656 | 202 | 9.602 | 101.44 | 11.593 | 47.226 |
+| `6ef2608` | 74917 | 56656 | 202 | 9.354 | 101.30 | 11.349 | 45.760 |
 
 ```sh
 capture="$HOME/archive/abla-grad-serve-replay/capture/requests.jsonl"
