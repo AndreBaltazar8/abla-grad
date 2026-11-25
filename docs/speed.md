@@ -89,6 +89,8 @@ Exact input IDs, commands, raw samples and any failures are in
 
 ## Decode and first-token latency through depth 131,072
 
+The historical capacity measurements below precede the [five-depth grouped-attention results](#grouped-attention-through-131072-cached-tokens).
+
 The RTX 4090 used the original Inkling UD-Q4_K_M GGUF for all four
 runs at each depth. Decode rates are in tokens/s for 128 timed tokens.
 
@@ -724,6 +726,8 @@ At a 131,072-token capacity, the HTTP checkpoint regression started with 21,765 
 
 A 6,040-token prompt took 4.019 s to first token cold. After generating 2,304 tokens, its repeat reused 6,039 prompt tokens and took 0.060 s to first token. A 6,026-token edit within the preceding prompt reused the saved 4,096-token boundary and took 3.025 s, compared with 3.748 s for a cold request with the identical edit. Both restored requests returned the same eight-token choices as their cold references, including reasoning. These are single-request first-token times. The test is reproducible with `tools/test-serve.sh <model.gguf> --long-checkpoint` under the GPU lock.
 
+On main `aa4b5f8`, a 15-request opencode session completed in 329 s at the same capacity. Two edited requests reused 19,269 of 26,052 and 26,051 of 27,808 input tokens. Their first output events arrived after 4.95 and 3.57 s. Two tool calls reused 35,244 of 35,279 and 37,128 of 37,159 input tokens. Their first output events arrived after 19.34 and 19.18 s. This build timestamped the first parsed event, and the parser buffers tool arguments until their closing marker. Generating those two replies took 18.70 and 18.53 s at the logged decode rates. Separate raw-token timestamps were unavailable. Decode throughput ranged from 147.76 tok/s on the 9,795-token request to 80.18 on the 43,503-token request. The requests generated different content, so these endpoints include both depth and speculation-acceptance effects.
+
 ## OpenAI session replay
 
 One RTX 4090 run with Inkling UD-Q4_K_M, the Q8_0 DSpark drafter, and a 131,072-token context. The original opencode logs did not include HTTP bodies, so this
@@ -783,3 +787,87 @@ The Inkling prefill gate passed 324 positions and the Llama gate passed
 266, with one argmax difference each and zero outside tolerance. A
 32-token NVFP4 int8 tile reduced 8k throughput to 4,174.27 tok/s, so the
 default remains 64.
+
+## What grows during plain decode
+
+Nsight Systems traced one recorded target step after untimed prefill of the Dickens
+prefix. The baseline used the original cache policy and 16 key partitions per head.
+The profiler started immediately before the graph launch. Each trace contains
+1,571 GPU kernels, including eight global and forty sliding split/merge pairs.
+The columns partition elapsed GPU time. Kernel overlaps are counted once and K/V
+stores are included in the other-kernels column.
+
+| Cached tokens | Global attention (ms) | Sliding attention (ms) | Other kernels (ms) | Idle (ms) | GPU span (ms) |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0.042 | 0.213 | 7.737 | 0.052 | 8.045 |
+| 32,768 | 3.176 | 0.704 | 7.589 | 0.049 | 11.518 |
+| 131,072 | 19.775 | 0.578 | 7.574 | 0.046 | 27.973 |
+
+At 32k the eight global F32 caches contain 2.147 GB of live K/V. Dividing
+unique bytes by the 3.154 ms spent in the split kernels gives 681 GB/s.
+At 128k the global block-Q8 caches contain 2.416 GB. Their 19.752 ms of
+split work gives 122 GB/s. These rates use the logical bytes once per KV
+head and exclude the merge. They do not count repeated L2 accesses by
+multiple query heads. Sliding attention reads at most 1,024 keys per
+query from each 1,536-slot ring.
+
+A separate teacher-forced comparison used the first 32,768 Dickens IDs
+in chunk-256 prefill, with F32 sliding K/V in all three arms. Greedy
+agreement was checked at all positions. Perplexity used the 32,767
+observed next tokens.
+
+| Global K/V | Greedy differences from F32 | Mean negative log likelihood | Perplexity |
+|---|---:|---:|---:|
+| F32 | 0 | 2.320695 | 10.182751 |
+| F16 | 608 | 2.320309 | 10.178819 |
+| Block Q8 | 643 | 2.320597 | 10.181753 |
+
+Traces, raw timings, token logs and benchmark binaries are in
+`~/archive/abla-grad-depth-1254/`. The scoring commands are in
+`tools/oracle/README.md`.
+
+### Grouped attention through 131,072 cached tokens
+
+Plain greedy graph decode on one RTX 4090, 128 tokens per timing. Each
+Abla run used the first depth-plus-one Dickens IDs, CPU cores 24–27 and
+a separate GPU hold. The graph was recorded before seeding. Chunk-512
+prefill, graph capture and loading the model were outside the timer.
+The timer includes graph replay and stream completion. The benchmark
+sets capacity to depth plus 169 rounded up to a multiple of 256.
+
+| Global attention policy | d0 | d8,192 | d32,768 | d65,536 | d131,072 |
+|---|---:|---:|---:|---:|---:|
+| F16 global, one query per block, 16 splits | 134.89 | 109.42 | 89.85 | 74.80 | 54.92 |
+| F16 grouped from 8k, Q8 above 98,304 | 127.05 | 111.37 | 101.01 | 86.84 | 84.87 |
+| **Q8 global, grouped/64 from 8k, CUDA C RMSNorm and depth mix** | **137.69** | **123.76** | **115.25** | **108.60** | **92.50** |
+
+The F16 precision-only build used the CUDA C norms and depth mix on
+`175171f`. The second row includes the Abla kernel ports. That diagnostic
+also switched sliding K/V to F16 at 8k and used F32 globals below 8k.
+At 131,072 cached tokens, the second row reproduced all 128 token IDs of
+the earlier 35.44 tok/s run.
+
+The bold row uses F16 globals below 8k, block Q8 from 8k and F16 sliding
+K/V from 65,536. At short capacity it keeps the original 16 partitions.
+At 32k it improves on the 92.71 tok/s capacity baseline by 24.3%. The
+32k goal of 120 tok/s still needs 0.343 ms/token. At 128k it improves
+on 35.44 tok/s by 2.61×. A registry-only repeat on the integrated
+build at 32k measured 115.99 tok/s with CUDA C RMSNorm and depth mix.
+Selecting the Abla ports gave 107.48 and 111.26 on the identical 128 IDs.
+
+An isolated replay over eight disjoint global caches includes the gated
+merge for each visit. At 32k the 64-partition grouped kernel took
+1.231 ms with F16 and 0.827 ms with Q8 (872 and 731 GB/s of unique
+live K/V respectively). With Q8 at 128k it took 3.047 ms (793 GB/s).
+Staging explicitly aligned 128-bit loads in shared memory took 1.018 ms
+at 32k with 256 partitions and 3.616 ms at 128k with 512. The grouped
+kernel loads each block's values into registers and uses them for all
+three query heads. These rates count the stored K/V data once, including
+Q8 scales. They are distinct from hardware DRAM-counter measurements.
+
+The 32,768-row external gate used the production combination of Q8 global
+and F32 sliding K/V, chunk 256 and the pinned mainline CUDA logits. It had
+118 rows over KL .04, 796 argmax differences, worst KL .708463 at position
+3,061, and max absolute logit difference 17.27565. It passed the calibrated
+limits, including the .726532 worst-KL ceiling from the matched Unsloth
+comparison on these same IDs.
