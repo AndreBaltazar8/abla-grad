@@ -7,6 +7,7 @@ import "cli/tokenize.ab"
 import "cli/compare_tensors.ab"
 import "cli/logits_prefill.ab"
 import "cli/generate.ab"
+import "cli/spec_accept.ab"
 import "cli/decode_bench.ab"
 
 // Commands: compare, info; tokenize and logits arrive with the tokenizer (ablac-90) and the model graph.
@@ -21,6 +22,7 @@ fun main: int {
     if (command == "prefill-bench") return cmdPrefillBench(args)
     if (command == "verify-check") return cmdVerifyCheck(args)
     if (command == "generate") return cmdGenerate(args)
+    if (command == "spec-accept") return cmdSpecAccept(args)
     if (command == "decode-bench") return cmdDecodeBench(args)
     if (command == "compare-tensors") return cmdCompareTensors(args)
     println("abla-grad: commands: compare <oracle.grdl> <ours.grdl> [--tolerances file]\n       abla-grad info <model.gguf>   (tokenize, logits, generate; see README.md)")

@@ -1,7 +1,7 @@
 # Long-prompt rule (tools/gate-inkling-long.sh): at most 50 of 1,624 rows over the .04 KL limit of tests/tolerances-inkling.txt, worst KL <= 1.1,
 # at most 3% argmax differences against llama.cpp 33aeb17 CUDA.
 # Where the numbers come from (prompt 05, natural text, 2026-11-25), rows over the .04 limit and worst KL:
-#   llama.cpp mainline CPU  vs mainline CUDA   41 of the first 1,478 rows, worst KL .324, 1,453 / 1,478 argmax matches
+#   llama.cpp mainline CPU  vs mainline CUDA   42 of 1,624 rows (33 before 1024), worst KL .324, 1,597 / 1,624 argmax matches
 #   Unsloth b12649 CUDA     vs mainline CUDA   36 of 1,624 rows,           worst KL 1.021, 1,594 / 1,624 argmax matches
 #   abla-grad (direct and step paths, 28 rows) 28 of 1,624 rows,           worst KL .806, 1,590 / 1,624 argmax matches
 # (the short prompts stay under .04 everywhere; natural text has many near-tied positions). The 50-row limit is above the noise between two

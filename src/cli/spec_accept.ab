@@ -1,0 +1,107 @@
+// `abla-grad spec-accept <target.gguf> <drafter.gguf> <ids-file> [--n N] [--ctx N]`: the acceptance the DSpark drafter would get along plain greedy decoding.
+// The target runs token by token in step mode (taps on); after every position the drafter proposes up to two ids from the committed prefix and the target's
+// own greedy next token as anchor; each proposal is compared with what the target then actually generated (greedy chain), only for positions inside the generated
+// part. Prints the first-proposal and second-proposal (given the first) acceptance and the tokens per verification cycle they imply.
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/integer"
+import "abla/float"
+import "abla/float/text"
+import "../backend/backend.ab"
+import "../backend/cuda.ab"
+import "../gguf/reader.ab"
+import "../model/inkling.ab"
+import "../model/inkling_config.ab"
+import "../model/dspark.ab"
+import "../ops.ab"
+
+fun cmdSpecAccept(args: array<string>): int {
+    var count = 128
+    var maxCtx = 0
+    val positional: array<string> = []
+    var index = 0
+    while (index < args.size) {
+        if (args[index] == "--n" && index + 1 < args.size) {
+            count = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else if (args[index] == "--ctx" && index + 1 < args.size) {
+            maxCtx = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else {
+            positional.append(args[index])
+            index = index + 1
+        }
+    }
+    if (positional.size != 3 || count <= 0) {
+        println("usage: abla-grad spec-accept <target.gguf> <drafter.gguf> <ids-file> [--n N] [--ctx N]")
+        return 2
+    }
+    val idsText = Path(positional[2]).readTextResult()
+    if (!idsText.succeeded) {
+        println("spec-accept: cannot read ${positional[2]}")
+        return 2
+    }
+    val ids: array<int> = []
+    for (rawLine in idsText.text.split("\n")) {
+        val line = rawLine.trim()
+        if (line == "") continue
+        ids.append(line.parseInt() ?? return 2)
+    }
+    val file = ggufOpen(positional[0])
+    val draftFile = ggufOpen(positional[1])
+    if (file == null || draftFile == null) {
+        println("spec-accept: ${ggufLastError()}")
+        return 2
+    }
+    val config = inklingConfigFrom(file) ?? return 2
+    var backend = cudaBackend() ?? return 2
+    val context = if (maxCtx > 0) maxCtx else ids.size + count + 8
+    var model = inklingLoad(backend, file, config, context) ?? return 1
+    if (!model.reset(backend)) return 1
+    model.useStep = true
+    if (!model.enableTaps(backend)) return 1
+    var drafter = dsparkLoad(backend, draftFile, context) ?? return 1
+    val total = ids.size + count
+    // nxt[p] = the target's greedy token after position p (the anchor for the prefix [0, p])
+    val nxt: array<int> = []
+    val first: array<int> = []
+    val second: array<int> = []
+    var token = ids[0]
+    for (position in 0 until total - 1) {
+        if (!model.forward(backend, token, position)) {
+            println("spec-accept: ${inklingLastError()} (${cudaLastError()})")
+            return 1
+        }
+        if (!opArgmax(backend, model.scratch, model.so("logits"), config.nVocab, model.step, 0)) return 1
+        val greedy = model.readStepWord(backend, 0) ?? return 1
+        nxt.append(greedy)
+        if (!drafter.pushTaps(backend, model.taps, position, 1)) {
+            println("spec-accept: ${dsparkLastError()}")
+            return 1
+        }
+        val proposals = drafter.propose(backend, model, position + 1, greedy)
+        if (dsparkLastError() != "") {
+            println("spec-accept: ${dsparkLastError()}")
+            return 1
+        }
+        first.append(if (proposals.size > 0) proposals[0] else -1)
+        second.append(if (proposals.size > 1) proposals[1] else -1)
+        token = if (position + 1 < ids.size) ids[position + 1] else greedy
+    }
+    // positions p >= ids.size - 1 have a greedy continuation: nxt[p+1] follows the anchor nxt[p]
+    var cycles = 0
+    var firstOk = 0
+    var secondOk = 0
+    for (p in ids.size - 1 until nxt.size - 2) {
+        cycles = cycles + 1
+        if (first[p] == nxt[p + 1]) {
+            firstOk = firstOk + 1
+            if (second[p] == nxt[p + 2]) secondOk = secondOk + 1
+        }
+    }
+    val a1 = f64FromInt(firstOk) / f64FromInt(cycles)
+    val a2 = if (firstOk > 0) f64FromInt(secondOk) / f64FromInt(firstOk) else 0.0
+    println("spec-accept: $cycles cycles; first proposal accepted ${a1 * 100.0}%, second (given the first) ${a2 * 100.0}%; tokens per verification cycle ${1.0 + a1 + a1 * a2}")
+    0
+}
