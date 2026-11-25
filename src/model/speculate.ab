@@ -278,14 +278,12 @@ fun SpecSession.turn(
         }
         if (saveStride && !this.saveCheckpoint(backend, model, p, true)) return false
         if (savePrompt && !this.saveCheckpoint(backend, model, p, false)) return false
-        if (!model.forward(backend, this.seq[p], p)) {
+        // Every prompt position has a known input. Replay the existing
+        // step graph with that token and keep its final argmax as the anchor.
+        if (!model.replayToken(backend, this.plain, this.seq[p], p)) {
             speculateError = inklingLastError()
             return false
         }
-    }
-    if (!opArgmax(backend, model.scratch, model.so("logits"), config.nVocab, model.step, 0) || !opStepAdvance(backend, model.step)) {
-        speculateError = "the first token could not be chosen"
-        return false
     }
     if (!this.drafter.pushTaps(backend, model.taps, injected, length - injected) || !this.drafter.prepareStep(backend) || !backend.synchronize()) {
         speculateError = dsparkLastError()

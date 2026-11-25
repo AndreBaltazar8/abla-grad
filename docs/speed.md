@@ -226,6 +226,38 @@ identical streamed outputs across the two builds. All 1,624
 forced-Q8 prompt 05 logit rows matched byte for byte. A paired
 640-token forced-Q8 check on the later int8 GEMM base also matched.
 
+## Cold server first-token latency
+
+The older 32k server used a 128-token prefill chunk under device
+memory pressure. On the exact prompt, standalone prefill on
+`b22b960` took 20.56 s with chunk 128 and 7.98 s with chunk 512.
+The later compact global KV layout let the server use chunk 512
+at all three lengths.
+
+On `cf6578c`, a 32k server phase probe took 15.91 s to feed the
+prompt. Batched target prefill took 8.29 s, DSpark preparation
+took 3.31 s and the 193-token exact tail took 4.31 s.
+Workspace selection took 1.1 ms and the
+checkpoint copies took 2.7 ms. Standalone
+prefill with the same IDs, build and chunk took 8.02 s.
+
+The exact tail now replays the existing target step graph with each
+known token. Its final argmax supplies the first completion token.
+
+| Prompt tokens | Baseline (s) | Graph exact tail (s) |
+|---:|---:|---:|
+| 8,192 | 7.32 | 4.24 |
+| 32,768 | 16.44 | 13.45 |
+| 131,072 | 58.11 | 55.93 |
+
+These are first streamed output times on the RTX 4090. Each run
+loaded the same Inkling model and Q8_0 DSpark, warmed up on a short
+request, then served the exact prompt with chunk 512 and zero reuse.
+Context capacity was 256 tokens above each prompt length. The
+16-token streamed completions matched at all three lengths.
+Raw first-token times, prompt IDs and phase logs are in
+`~/src/abla-grad-oracle/serve-ttft-1261/`.
+
 ## Decode and speculation across cache depths
 
 Throughput on the RTX 4090 in tokens/s on the pinned Inkling UD-Q4_K_M.
