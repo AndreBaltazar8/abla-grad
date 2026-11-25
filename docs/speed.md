@@ -297,3 +297,82 @@ scene, and seven of 215 on the ferry continuation. Fixture 03 repeats its
 greeting, which makes its larger gain a poor estimate for original prose.
 Exact prompt text and IDs, traces, replay scripts and baseline R5
 `spec-bench` logs are in `~/archive/abla-grad-retrieval-1244/`.
+
+## Small-row verification on the RTX 4090
+
+The table follows the five changes in commit order, from the same Q4_K_M
+target and Q8_0 DSpark drafter. Each row is a full fixed-four
+`spec-bench --n 256 --nmax 4` run. Cycle time includes drafting,
+verification and commit. Fixture 03 produced the same 256 IDs in 87
+cycles on every build.
+
+| Cumulative change | 03 tok/s | 03 ms/cycle | 05 tok/s | 05 ms/cycle | 05 cycles |
+|---|---:|---:|---:|---:|---:|
+| Starting point, `235db08` | 157.6 | 18.60 | 77.9 | 20.72 | 158 |
+| Small-row Q8 LM head, `b256489` | 160.1 | 18.31 | 84.1 | 19.20 | 158 |
+| Stable parallel expert map, `30cb1e7` | 170.2 | 17.22 | 87.3 | 18.48 | 158 |
+| Four-tap convolution with history snapshots, `ca9c8a5` | 173.6 | 16.88 | 88.9 | 18.16 | 158 |
+| One block per BF16 projection output, `ffeda30` | 177.2 | 16.54 | 147.0 | 17.34 | 100 |
+| Fixed-shape scaled NVFP4 union, `8db7496` | 184.2 | 15.91 | 150.4 | 16.95 | 100 |
+
+The first three changes also preserved the 05 ID stream. The BF16
+projection multiplies BF16 weights by FP32 activations with FP32 FMA
+and reduces each dot product in one block. The previous split-K tile
+rounded inputs to FP16 and combined partial sums. On 05 the two builds
+first differ at generated token 20 (one-based). The jump in tok/s
+includes the resulting change in draft acceptance. The specialized
+NVFP4 union preserved the BF16 build’s fixed-four output IDs on 03,
+05, museum and fog.
+
+On 512 generated tokens, museum went from 120.4 to 153.0 tok/s
+(228 to 212 cycles, 18.61 to 15.76 ms/cycle). Fog went from 106.9
+to 125.4 tok/s (258 cycles on both builds, 18.53 to 15.79 ms/cycle).
+At the observed yield these two runs would need about 12.1 and
+9.9 ms/cycle respectively to sustain 200 tok/s.
+
+The five-row graph on the museum prompt at position 46 took 17.11 ms
+before the changes. With all five, three separate 150-replay runs
+took 13.82, 13.85 and 14.03 ms (median 13.85). In a separate diagnostic recording we froze the
+expert map at each visit, retained the graph's forks, and omitted one
+family at a time. The mean of two frozen-map controls was 15.94 ms.
+Omitting the 88 NVFP4 expert kernels removed 6.39 ms. The small-row
+F32 matvecs cost 1.69 ms, the original LM head 1.66 ms, the dense Q8
+row matvecs 1.56 ms, and the Q5_K/Q8 expert tail 0.78 ms. These
+differences measure time removed from the graph and overlap across
+branches. The 13.58 ms verifier microbenchmark includes additional
+experimental controller changes. It excludes drafting and commit.
+
+### Adaptive generation
+
+Each cell is tok/s for one 512-token run on the same GPU and prompt
+IDs, pinned to cores 24–27. The plain rows use graph `decode-bench`.
+Speculation uses `spec-bench --adaptive --n 512 --nmax 2|4` with the
+product default of two proposals in the first adaptive column.
+The controller times its arms and can make different choices across runs.
+
+| Prompt | Plain, before → after | Adaptive 2, before → after | Adaptive 4, before → after |
+|---|---:|---:|---:|
+| 03, multilingual greeting | 131.4 → 131.5 | 167.8 → 200.3 | 162.8 → 192.0 |
+| 05, Alice | 122.6 → 123.0 | 121.0 → 148.8 | 138.4 → 147.8 |
+| Museum, chat with thinking | 131.3 → 131.4 | 138.4 → 158.5 | 130.5 → 159.2 |
+| Fog, chat with thinking | 130.4 → 130.3 | 128.7 → 142.3 | 128.5 → 134.1 |
+
+All four plain runs preserved every generated ID. At nmax 2 the optimized
+verification graph took 244 speculative cycles and 16 plain steps on
+museum, and 275 speculative cycles and 16 plain steps on fog. On fog,
+nmax 4 switched to plain for 224 steps. Prompt 03 is the only case in
+this matrix to reach 200 tok/s.
+
+All GPU runs used `tools/gpu-lock.sh`. Bench logs, token IDs and the
+frozen diagnostic profiles are in `~/archive/abla-grad-r5-ed/`.
+The museum and fog IDs are `story.bos.ids` and `explain.bos.ids` in
+`~/archive/abla-grad-retrieval-1244/`.
+
+The five-change build passed the step gate (324 positions, zero argmax
+differences), chunk-256 prefill (324 positions, one argmax difference),
+and the speculation gate on 01–05 at maxima two and four. The long
+step gate counted 28 rows outside the short-prompt limits on 05, with
+34 argmax differences, and 25 rows on 06, with 97 differences.
+`verify-check` covered each accepted length from zero through four.
+At prompt 05, forty windows starting at position 200 produced zero
+argmax differences from plain decode at both three and five rows.
