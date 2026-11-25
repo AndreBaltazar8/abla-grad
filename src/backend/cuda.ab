@@ -719,7 +719,12 @@ private val cudaArgsDenseQ8I8X5 = [
     prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU
 ]
 
+private fun cudaPrefillGroupedQ5I8Shape(args: KernelArgs, problem: array<int>): bool =
+    cudaPrefillGroupedQ5Shape(args, problem) && args.words[1] % 16 == 0 && args.words[10] % 4 == 0
+
 private val cudaPrefillKernels = [
+    CudaKernelSpec("matmul_q5_k_grouped_i8", kernelPrefillQ5GroupedI8, 128, 256,
+        cudaArgsGroupedI8, cudaPrefillGroupedQ5I8Shape, 2, 4),
     CudaKernelSpec("matmul_q8_0_i8_x5", kernelPrefillQ8I8X5, 128, 256,
         cudaArgsDenseQ8I8X5, cudaPrefillDenseQ8I8X5Shape, 2),
     CudaKernelSpec("matmul_q8_0_i8", kernelPrefillQ8I8, 128, 256,

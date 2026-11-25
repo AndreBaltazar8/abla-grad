@@ -154,6 +154,7 @@ fun verify(backend: Backend): bool {
     if (!testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, false, false, 3, true) ||
         !testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, true, false, 2, true)) return false
     if (!testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, 64, false, false, 4, true)) return false
+    if (!testGrouped(backend, "q5_k", 256, 176, oracleQ5K, 64, false, false, 1, true)) return false
     for (tile in [64, 32]) {
         if (!testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, tile, false) || !testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, tile, true)) return false
         if (!testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, tile, false) || !testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, tile, true)) return false

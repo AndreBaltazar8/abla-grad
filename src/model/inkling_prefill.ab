@@ -688,7 +688,7 @@ private fun InklingModel.convRows(var backend: Backend, ws: PrefillWorkspace, in
 
 private fun InklingModel.grouped(var backend: Backend, ws: PrefillWorkspace, kind: string, wOffset: int, x: int, xmap: int, y: int, useScales: bool, scalesOffset: int,
     plan: int, rows: int, cols: int, nExpert: int, stride: int, maxTiles: int, xRows: int = 0, quantName: string = "A"): bool {
-    if ((kind == "nvfp4" || (kind == "q8_0" && prefillVerifyRows == 0)) && prefillInt8Experts && prefillMoeTile == 64 && xRows > 0 && cols % 64 == 0) {
+    if ((kind == "nvfp4" || ((kind == "q8_0" || kind == "q5_k") && prefillVerifyRows == 0)) && prefillInt8Experts && prefillMoeTile == 64 && xRows > 0 && cols % 64 == 0) {
         // int8: quantize the f32 rows once (the kernel gathers rows through xmap), then the s8 grouped matmul
         val qx = ws.o("qx" + quantName)
         val sx = ws.o("sx" + quantName)
@@ -701,8 +701,8 @@ private fun InklingModel.grouped(var backend: Backend, ws: PrefillWorkspace, kin
         iargs.u32(nExpert)
         iargs.u64(stride)
         iargs.pointer(ws.buffer, sx)
-        val kernel = if (kind == "q8_0") "matmul_q8_0_grouped_i8"
-            else "matmul_nvfp4_grouped_i8"
+        val kernel = if (kind == "nvfp4") "matmul_nvfp4_grouped_i8"
+            else "matmul_${kind}_grouped_i8"
         return backend.launch(kernel, iargs, [rows, maxTiles])
     }
     var args = kernelArgs().pointer(this.arena, wOffset).pointer(ws.buffer, x).pointer(ws.buffer, xmap).pointer(ws.buffer, y)

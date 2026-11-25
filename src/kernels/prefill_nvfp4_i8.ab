@@ -30,6 +30,9 @@ extern "C" __global__ void quantize_rows_i8(const float *x, unsigned *qx, float 
 """
 
 private val prefillNvfp4I8Body = """
+#ifndef I8_Q5
+#define I8_Q5 0
+#endif
 #ifndef I8_Q8
 #define I8_Q8 0
 #endif
@@ -121,13 +124,18 @@ extern "C" __global__ void __launch_bounds__(256) I8_KERNEL(
     const float scale = expertScales ? expertScales[expert] : 1.0f;
 #endif
     const unsigned n0 = rowTile * I8_ROWS;
-    const unsigned long long rowBytes = I8_Q8 ? static_cast<unsigned long long>(cols / 32) * 34 :
+    const unsigned long long rowBytes = I8_Q5 ? static_cast<unsigned long long>(cols / 256) * 176 :
+        I8_Q8 ? static_cast<unsigned long long>(cols / 32) * 34 :
         static_cast<unsigned long long>(cols / 64) * 36;
 
     __shared__ __align__(16) unsigned wa[I8_ROWS][I8_PITCH];
     __shared__ __align__(16) unsigned xb[I8_TOKENS][I8_PITCH];
     __shared__ float saw[I8_ROWS][I8_K / 16];
     __shared__ float sbx[I8_TOKENS][I8_K / 32];
+#if I8_Q5
+    __shared__ float sawMin[I8_ROWS][I8_K / 16];
+    __shared__ int sbSum[I8_TOKENS][I8_K / 16];
+#endif
 
     const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
     const unsigned g = lane >> 2, t = lane & 3u;
@@ -142,9 +150,43 @@ extern "C" __global__ void __launch_bounds__(256) I8_KERNEL(
             const unsigned sub = job % (I8_K / 16);
             uint4 packed = make_uint4(0, 0, 0, 0);
             float scale = 0.0f;
+#if I8_Q5
+            float weightMin = 0.0f;
+#endif
             if (n0 + r < rows && k + 16 * sub < cols) {
                 const unsigned char *row = w + static_cast<unsigned long long>(n0 + r) * rowBytes;
-#if I8_Q8
+#if I8_Q5
+                const unsigned column = k + 16 * sub;
+                const unsigned group = (column / 32) & 7u;
+                const unsigned char *block = row + (column / 256) * 176;
+                const unsigned short *head = reinterpret_cast<const unsigned short *>(block);
+                const unsigned short dBits = head[0], minBits = head[1];
+                float d, dm;
+                asm("cvt.f32.f16 %0, %1;" : "=f"(d) : "h"(dBits));
+                asm("cvt.f32.f16 %0, %1;" : "=f"(dm) : "h"(minBits));
+                unsigned qs, qm;
+                if (group < 4) {
+                    qs = block[4 + group] & 63u;
+                    qm = block[8 + group] & 63u;
+                } else {
+                    const unsigned both = block[8 + group];
+                    qs = (both & 15u) | ((block[group] >> 6) << 4);
+                    qm = (both >> 4) | ((block[4 + group] >> 6) << 4);
+                }
+                scale = d * float(qs);
+                weightMin = -dm * float(qm);
+                const unsigned inner = column & 16u;
+                const uint4 low = *reinterpret_cast<const uint4 *>(block + 48 + (group / 2) * 32 + inner);
+                const uint4 high = *reinterpret_cast<const uint4 *>(block + 16 + inner);
+                const unsigned l[4] = {low.x, low.y, low.z, low.w};
+                const unsigned h[4] = {high.x, high.y, high.z, high.w};
+                unsigned q[4];
+                #pragma unroll
+                for (int idx = 0; idx < 4; ++idx)
+                    q[idx] = ((l[idx] >> ((group & 1u) * 4)) & 0x0f0f0f0fu) | (((h[idx] >> group) & 0x01010101u) << 4);
+                packed = make_uint4(__byte_perm(q[0], q[2], 0x5140), __byte_perm(q[0], q[2], 0x7362),
+                    __byte_perm(q[1], q[3], 0x5140), __byte_perm(q[1], q[3], 0x7362));
+#elif I8_Q8
                 const unsigned short *block = reinterpret_cast<const unsigned short *>(row + ((k + 16 * sub) / 32) * 34);
                 const unsigned short bits = block[0];
                 asm("cvt.f32.f16 %0, %1;" : "=f"(scale) : "h"(bits));
@@ -165,6 +207,9 @@ extern "C" __global__ void __launch_bounds__(256) I8_KERNEL(
             }
             *reinterpret_cast<uint4 *>(&wa[r][4 * sub]) = packed;
             saw[r][sub] = scale;
+#if I8_Q5
+            sawMin[r][sub] = weightMin;
+#endif
         }
 
         for (unsigned job = tid; job < I8_TOKENS * (I8_K / 16); job += blockDim.x) {
@@ -181,6 +226,12 @@ extern "C" __global__ void __launch_bounds__(256) I8_KERNEL(
             }
             *reinterpret_cast<uint4 *>(&xb[token][4 * part]) = packed;
             if ((part & 1u) == 0) sbx[token][part / 2] = scale;
+#if I8_Q5
+            int sum = __dp4a(int(packed.x), 0x01010101, 0);
+            sum = __dp4a(int(packed.y), 0x01010101, sum);
+            sum = __dp4a(int(packed.z), 0x01010101, sum);
+            sbSum[token][part] = __dp4a(int(packed.w), 0x01010101, sum);
+#endif
         }
         __syncthreads();
 
@@ -189,6 +240,9 @@ extern "C" __global__ void __launch_bounds__(256) I8_KERNEL(
         for (unsigned pair = 0; pair < I8_K / 32; ++pair) {
             unsigned a[2][2][2];
             float sw[2][2][2];
+#if I8_Q5
+            float minimum[2][2];
+#endif
             #pragma unroll
             for (unsigned i = 0; i < 2; ++i) {
                 const unsigned r = mr + 16 * i;
@@ -198,6 +252,12 @@ extern "C" __global__ void __launch_bounds__(256) I8_KERNEL(
                     i8_load_a(a[i][j], &wa[r + (lane & 15u)][4 * sub]);
                     sw[i][0][j] = saw[r + g][sub];
                     sw[i][1][j] = saw[r + g + 8][sub];
+#if I8_Q5
+                    if (j == 0) {
+                        minimum[i][0] = sawMin[r + g][sub];
+                        minimum[i][1] = sawMin[r + g + 8][sub];
+                    }
+#endif
                 }
             }
             #pragma unroll
@@ -208,15 +268,30 @@ extern "C" __global__ void __launch_bounds__(256) I8_KERNEL(
                 const unsigned b1 = xb[col + g][8 * pair + 4 + t];
                 const float sx0 = sbx[col + 2 * t][pair];
                 const float sx1 = sbx[col + 2 * t + 1][pair];
+#if I8_Q5
+                const float sum0 = float(sbSum[col + 2 * t][2 * pair] + sbSum[col + 2 * t][2 * pair + 1]);
+                const float sum1 = float(sbSum[col + 2 * t + 1][2 * pair] + sbSum[col + 2 * t + 1][2 * pair + 1]);
+#endif
                 #pragma unroll
                 for (unsigned i = 0; i < 2; ++i) {
                     int d0[4], d1[4];
                     i8_mma(d0, a[i][0], b0);
                     i8_mma(d1, a[i][1], b1);
+#if I8_Q5
+                    const float d00 = float(d0[0] + d1[0]) * sw[i][0][0];
+                    const float d01 = float(d0[1] + d1[1]) * sw[i][0][0];
+                    const float d10 = float(d0[2] + d1[2]) * sw[i][1][0];
+                    const float d11 = float(d0[3] + d1[3]) * sw[i][1][0];
+                    acc[i][n][0] = fmaf(sx0, fmaf(minimum[i][0], sum0, d00), acc[i][n][0]);
+                    acc[i][n][1] = fmaf(sx1, fmaf(minimum[i][0], sum1, d01), acc[i][n][1]);
+                    acc[i][n][2] = fmaf(sx0, fmaf(minimum[i][1], sum0, d10), acc[i][n][2]);
+                    acc[i][n][3] = fmaf(sx1, fmaf(minimum[i][1], sum1, d11), acc[i][n][3]);
+#else
                     acc[i][n][0] = fmaf(sx0, fmaf(float(d1[0]), sw[i][0][1], float(d0[0]) * sw[i][0][0]), acc[i][n][0]);
                     acc[i][n][1] = fmaf(sx1, fmaf(float(d1[1]), sw[i][0][1], float(d0[1]) * sw[i][0][0]), acc[i][n][1]);
                     acc[i][n][2] = fmaf(sx0, fmaf(float(d1[2]), sw[i][1][1], float(d0[2]) * sw[i][1][0]), acc[i][n][2]);
                     acc[i][n][3] = fmaf(sx1, fmaf(float(d1[3]), sw[i][1][1], float(d0[3]) * sw[i][1][0]), acc[i][n][3]);
+#endif
                 }
             }
         }
@@ -244,3 +319,5 @@ val kernelPrefillQ8I8 = "#define I8_Q8 1\n#define I8_DENSE 1\n#define I8_KERNEL 
 val kernelPrefillQ8GroupedI8 = "#define I8_Q8 1\n#define I8_KERNEL matmul_q8_0_grouped_i8\n" + prefillNvfp4I8Body
 
 val kernelPrefillQ8I8X5 = "#define I8_Q8 1\n#define I8_X5 1\n#define I8_KERNEL matmul_q8_0_i8_x5\n" + prefillNvfp4I8Body
+
+val kernelPrefillQ5GroupedI8 = "#define I8_Q5 1\n#define I8_KERNEL matmul_q5_k_grouped_i8\n" + prefillNvfp4I8Body
