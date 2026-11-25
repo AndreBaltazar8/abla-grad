@@ -57,6 +57,36 @@ with CPU affinity 24–27.
 
 Raw samples and commands are in `~/src/abla-grad-oracle/prefill-length/`.
 
+## Plain graph decode through depth 16,384
+
+tg128 in tokens/s on the RTX 4090 with the same Inkling UD-Q4_K_M GGUF.
+
+| Cached depth | abla-grad `2029657` | llama.cpp `33aeb17` | Unsloth `b12649-mix-c7059d6` |
+|---:|---:|---:|---:|
+| 0 | 133.80 | 77.90 | 102.85 |
+| 512 | 129.29 | 75.78 | 103.91 |
+| 1,024 | 125.33 | 74.00 | 100.76 |
+| 2,048 | 119.77 | 75.77 | 99.22 |
+| 4,096 | 119.47 | 75.29 | 97.56 |
+| 8,192 | 117.31 | 74.03 | 95.03 |
+| 16,384 | n/a (device memory for F32 context) | 71.34 | 94.81 |
+
+abla-grad ran `decode-bench --mode graph --n 128` once per depth with
+F32 KV. Input was the first depth-plus-one IDs of the pinned natural
+text fixture, including one seed. Context capacity was
+`depth + 129` rounded up to 256. The two reference builds averaged
+three `llama-bench -d N -n 128` repetitions with synthetic tokens,
+F16 KV, batch and microbatch 512, CUDA graphs, and full GPU offload.
+The timers exclude prefix ingestion. Each invocation held the GPU
+lock separately with CPU affinity 24–27.
+
+The stock build exited before timing at d16384. At a
+context of 16,513, its model-load probe reported insufficient
+device memory with 22,076 MiB free.
+
+Exact input IDs, commands, raw samples and any failures are in
+`~/src/abla-grad-oracle/tg128-current-main/`.
+
 ## Decode and speculation across cache depths
 
 Throughput on the RTX 4090 in tokens/s on the pinned Inkling UD-Q4_K_M.
