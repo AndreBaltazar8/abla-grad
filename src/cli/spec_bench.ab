@@ -1,0 +1,128 @@
+// `abla-grad spec-bench <target.gguf> <drafter.gguf> <ids-file> [--n N] [--batch B] [--log file]`: greedy speculative decoding with the DSpark drafter, one
+// recorded cycle per replay (docs/spec-cycle.md): spec_begin, drafter taps + proposals, 3-row verification, greedy acceptance, history commit. The prompt is
+// prefilled token by token in step mode (taps on); then cycles are replayed, B at a time, until N tokens are generated. Prints tok/s of the timed loop,
+// tokens per cycle and the generated ids (in --log, comparable with decode-bench's log of the same prompt).
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/integer"
+import "abla/float"
+import "abla/float/text"
+import "abla/process/time"
+import "../backend/backend.ab"
+import "../backend/cuda.ab"
+import "../gguf/reader.ab"
+import "../model/inkling.ab"
+import "../model/inkling_config.ab"
+import "../model/inkling_prefill.ab"
+import "../model/dspark.ab"
+import "../ops.ab"
+
+fun cmdSpecBench(args: array<string>): int {
+    var count = 128
+    var batch = 4
+    var logPath = ""
+    val positional: array<string> = []
+    var index = 0
+    while (index < args.size) {
+        if (args[index] == "--n" && index + 1 < args.size) {
+            count = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else if (args[index] == "--batch" && index + 1 < args.size) {
+            batch = args[index + 1].parseInt() ?? 0
+            index = index + 2
+        } else if (args[index] == "--log" && index + 1 < args.size) {
+            logPath = args[index + 1]
+            index = index + 2
+        } else {
+            positional.append(args[index])
+            index = index + 1
+        }
+    }
+    if (positional.size != 3 || count <= 0 || batch <= 0) {
+        println("usage: abla-grad spec-bench <target.gguf> <drafter.gguf> <ids-file> [--n N] [--batch B] [--log file]")
+        return 2
+    }
+    val idsText = Path(positional[2]).readTextResult()
+    if (!idsText.succeeded) {
+        println("spec-bench: cannot read ${positional[2]}")
+        return 2
+    }
+    val ids: array<int> = []
+    for (rawLine in idsText.text.split("\n")) {
+        val line = rawLine.trim()
+        if (line == "") continue
+        ids.append(line.parseInt() ?? return 2)
+    }
+    val file = ggufOpen(positional[0])
+    val draftFile = ggufOpen(positional[1])
+    if (file == null || draftFile == null) {
+        println("spec-bench: ${ggufLastError()}")
+        return 2
+    }
+    val config = inklingConfigFrom(file) ?? return 2
+    var backend = cudaBackend() ?? return 2
+    val length = ids.size
+    val context = length + count + batch * 3 + 16
+    var model = inklingLoad(backend, file, config, context) ?? return 1
+    if (!model.reset(backend)) return 1
+    model.useStep = true
+    if (!model.enableTaps(backend)) return 1
+    var drafter = dsparkLoad(backend, draftFile, context) ?? return 1
+    val ws = prefillWorkspace(backend, config, 3, true, 3) ?? return 1
+    val spec = backend.allocate(64) ?? return 1
+    // prefill the prompt (taps for every position); the anchor is the greedy token after the last prompt token, at position `length`
+    for (position in 0 until length) {
+        if (!model.forward(backend, ids[position], position)) {
+            println("spec-bench: ${inklingLastError()} (${cudaLastError()})")
+            return 1
+        }
+    }
+    if (!opArgmax(backend, model.scratch, model.so("logits"), config.nVocab, model.step, 0)) return 1
+    if (!opStepAdvance(backend, model.step)) return 1
+    if (!drafter.pushTaps(backend, model.taps, 0, length) || !drafter.prepareStep(backend)) {
+        println("spec-bench: ${dsparkLastError()}")
+        return 1
+    }
+    if (!backend.synchronize()) return 1
+    if (!backend.beginRecording()) return 1
+    var ok = opSpecBegin(backend, model.step, spec)
+    ok = ok && drafter.pushTapsStep(backend, model.taps, model.step)
+    ok = ok && drafter.proposeStep(backend, model, model.step, spec)
+    ok = ok && model.verifyStep(backend, ws, spec, model.step)
+    ok = ok && opSpecAccept(backend, model.step, spec, context)
+    ok = ok && model.commitStep(backend, ws, model.step)
+    val recording = backend.endRecording()
+    if (!ok || recording == null) {
+        println("spec-bench: recording the cycle failed: ${dsparkLastError()} ${inklingLastError()} (${cudaLastError()})")
+        return 1
+    }
+    var cycles = 0
+    val start = monotonicNanoseconds()
+    var position = length
+    while (position < length + count) {
+        for (b in 0 until batch) {
+            if (!backend.replay(recording)) {
+                println("spec-bench: replay failed (${cudaLastError()})")
+                return 1
+            }
+        }
+        cycles = cycles + batch
+        if (!backend.synchronize()) {
+            println("spec-bench: the device failed (${cudaLastError()})")
+            return 1
+        }
+        position = model.readStepWord(backend, 1) ?? return 1
+    }
+    val elapsed = monotonicNanoseconds() - start
+    val generated = position - length
+    val seconds = f64FromInt(elapsed) / 1000000000.0
+    println("spec-bench: $generated tokens in $cycles cycles, ${seconds} s = ${f64FromInt(generated) / seconds} tok/s, ${f64FromInt(generated) / f64FromInt(cycles)} tokens per cycle")
+    if (logPath != "") {
+        val log = model.readLog(backend, length, position - length) ?? return 1
+        var text = ""
+        for (t in log) text = text + "$t\n"
+        Path(logPath).writeText(text)
+    }
+    0
+}
