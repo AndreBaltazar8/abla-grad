@@ -512,7 +512,7 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     // KV store, attention
     val cache = this.cacheOffsets[visit]
     val ring = this.ringVisit(visit)
-    val suffix = kvKernelSuffix(ring, this.kvElementBytes == 2, this.quantizedGlobalKv && !isSwa)
+    val suffix = kvKernelSuffix(ring, this.halfCache(isSwa), this.globalKvBits == 8 && !isSwa)
     val scale = f64ToF32(1.0 / sqrt(f64FromInt(c.headDim)))
     val att = ws.o("att")
     // Store one segment before computing its attention. Other operations still

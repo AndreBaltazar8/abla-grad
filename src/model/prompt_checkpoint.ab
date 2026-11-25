@@ -13,7 +13,7 @@ fun promptCheckpointBytes(model: InklingModel): int {
     val c = model.config
     var bytes = model.history.bytes
     for (visit in 0 until model.visits) if (model.ringVisit(visit)) {
-        bytes = bytes + 2 * c.nSwa * c.nHeadKv * c.headDim * model.kvElementBytes
+        bytes = bytes + 2 * c.nSwa * c.nHeadKv * c.headDim * model.slidingKvElementBytes
     }
     if (model.rollingTaps) {
         val rows = DSPARK_WINDOW - 1
@@ -39,7 +39,7 @@ fun transferPromptCheckpoint(var backend: Backend, model: InklingModel, drafter:
     if (!ok || !windows) return ok
     val c = model.config
     var at = offset + history
-    val rowBytes = c.headDim * model.kvElementBytes
+    val rowBytes = c.headDim * model.slidingKvElementBytes
     val targetBytes = c.nSwa * c.nHeadKv * rowBytes
     for (visit in 0 until model.visits) if (model.ringVisit(visit)) {
         val cache = model.cacheOffsets[visit]

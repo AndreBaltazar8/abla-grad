@@ -112,8 +112,8 @@ resource class InklingModel(
     val plan: ArenaPlan,
     val scratchMap: ScratchMap,
     val maxCtx: int,
-    val kvElementBytes: int,
-    val quantizedGlobalKv: bool,
+    val slidingKvElementBytes: int,
+    val globalKvBits: int,
     val ringVisits: array<bool>,
     val hasSlidingRing: bool,
     val visits: int,
@@ -160,8 +160,10 @@ fun InklingModel.canRestoreKv(pos: int, writtenEnd: int): bool {
 
 private fun historyBytesPerVisit(c: InklingConfig): int = (c.nConv - 1) * (2 * c.nHeadKv * c.headDim + 2 * c.nEmbd) * 4
 
+fun InklingModel.halfCache(sliding: bool): bool = if (sliding) this.slidingKvElementBytes == 2 else this.globalKvBits == 16
+
 // A caller that verifies unusually wide speculative batches can reserve linear caches for rollback.
-fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: int, maxVerifyRows: int = 5, halfKv: bool = false, quantizeKv: bool = false): InklingModel? {
+fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: int, maxVerifyRows: int = 5, halfKv: bool = false, quantizeKv: bool = false, globalKvBits: int = 0): InklingModel? {
     inklingError = ""
     val plan = planWeights(file, inklingNames(file, c))
     if (plan == null) {
@@ -176,10 +178,15 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
     val map = inklingScratch(c)
     val visits = inklingVisits(c)
     val scratch = backend.allocate(map.total)
-    val quantized = (quantizeKv || (!halfKv && maxCtx > INKLING_Q8_KV_CONTEXT)) && c.headDim % 32 == 0
+    val autoQuantize = quantizeKv || (!halfKv && maxCtx > INKLING_Q8_KV_CONTEXT)
+    val bits = if (globalKvBits != 0) globalKvBits else if (autoQuantize && c.headDim % 32 == 0) 8 else 16
+    if ((bits != 8 && bits != 16 && bits != 32) || (bits == 8 && c.headDim % 32 != 0)) {
+        inklingError = "unsupported global K/V precision for this head dimension"
+        return null
+    }
     val ringVisits: array<bool> = []
     var hasSlidingRing = false
-    val kvElementBytes = if (quantized || halfKv || maxCtx >= INKLING_HALF_KV_CONTEXT) 2 else 4
+    val kvElementBytes = if (quantizeKv || halfKv || maxCtx >= INKLING_HALF_KV_CONTEXT) 2 else 4
     val cacheOffsets = [0]
     val core = c.loopEnd - c.loopStart
     for (visit in 0 until visits) {
@@ -192,7 +199,7 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
         ringVisits.append(slots < maxCtx)
         if (slots < maxCtx) hasSlidingRing = true
         val elements = slots * c.nHeadKv * c.headDim
-        val bytes = if (quantized && !sliding) elements / 32 * 36 else elements * kvElementBytes
+        val bytes = if (sliding) elements * kvElementBytes else if (bits == 8) elements / 32 * 36 else elements * (bits / 8)
         cacheOffsets.append(cacheOffsets[visit] + bytes)
     }
     val kvBytes = cacheOffsets[visits]
@@ -207,7 +214,7 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
         inklingError = "device memory for the activations, KV caches and convolution histories is not available"
         return null
     }
-    InklingModel(c, plan, map, maxCtx, kvElementBytes, quantized, ringVisits, hasSlidingRing, visits, cacheOffsets, move(arena), move(scratch), move(kCache), move(vCache), move(history), move(blocks), move(bank), move(step), move(taps))
+    InklingModel(c, plan, map, maxCtx, kvElementBytes, bits, ringVisits, hasSlidingRing, visits, cacheOffsets, move(arena), move(scratch), move(kCache), move(vCache), move(history), move(blocks), move(bank), move(step), move(taps))
 }
 
 // Zeroes the convolution histories (a fresh sequence).
@@ -425,22 +432,22 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     val att = this.so("att")
     if (this.useStep) {
         ok = ok && opKvStoreStep(backend, this.scratch, k, this.scratch, v, this.kCache, cache, this.vCache, cache,
-            this.step, c.nHeadKv, c.headDim, this.maxCtx, ring, this.kvElementBytes == 2, this.quantizedGlobalKv && !isSwa)
+            this.step, c.nHeadKv, c.headDim, this.maxCtx, ring, this.halfCache(isSwa), this.globalKvBits == 8 && !isSwa)
         val window = if (isSwa) c.nSwa else 0
         if (this.splitAttention) {
             ok = ok && opAttentionRelSplitStep(backend, this.scratch, q, this.kCache, cache, this.vCache, cache,
                 this.scratch, table, this.scratch, this.so("attPart"), this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent,
-                this.maxCtx, scale, this.attentionSplits, this.scratch, this.so("gate"), true, ring, this.kvElementBytes == 2, this.quantizedGlobalKv && !isSwa)
+                this.maxCtx, scale, this.attentionSplits, this.scratch, this.so("gate"), true, ring, this.halfCache(isSwa), this.globalKvBits == 8 && !isSwa)
         } else {
             ok = ok && opAttentionDecodeRelStep(backend, this.scratch, q, this.kCache, cache, this.vCache, cache,
-                this.scratch, table, this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent, this.maxCtx, scale, ring, this.kvElementBytes == 2, this.quantizedGlobalKv && !isSwa)
+                this.scratch, table, this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent, this.maxCtx, scale, ring, this.halfCache(isSwa), this.globalKvBits == 8 && !isSwa)
         }
     } else {
         ok = ok && opKvStore(backend, this.scratch, k, this.scratch, v, this.kCache, cache, this.vCache, cache,
-            pos, c.nHeadKv, c.headDim, this.maxCtx, ring, this.kvElementBytes == 2, this.quantizedGlobalKv && !isSwa)
+            pos, c.nHeadKv, c.headDim, this.maxCtx, ring, this.halfCache(isSwa), this.globalKvBits == 8 && !isSwa)
         val first = if (isSwa && pos - c.nSwa + 1 > 0) pos - c.nSwa + 1 else 0
         ok = ok && opAttentionDecodeRel(backend, this.scratch, q, this.kCache, cache, this.vCache, cache,
-            this.scratch, table, this.scratch, att, c.nHead, c.nHeadKv, c.headDim, first, pos, pos, extent, this.maxCtx, scale, ring, this.kvElementBytes == 2, this.quantizedGlobalKv && !isSwa)
+            this.scratch, table, this.scratch, att, c.nHead, c.nHeadKv, c.headDim, first, pos, pos, extent, this.maxCtx, scale, ring, this.halfCache(isSwa), this.globalKvBits == 8 && !isSwa)
     }
     // the split attention already applied the output gate (sigmoid_mul fused into its merge)
     if (!(this.useStep && this.splitAttention)) ok = ok && opSigmoidMul(backend, this.scratch, att, this.scratch, this.so("gate"), this.scratch, att, qDim)

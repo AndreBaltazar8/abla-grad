@@ -1,5 +1,5 @@
-// `abla-grad decode-bench <model.gguf> <ids-file> [--n N] [--mode direct|graph] [--ctx N] [--log file]`: greedy decode speed of an Inkling model, tg128-style.
-// The prompt (one token id per line) is prefilled token by token (not timed); then N tokens are generated and timed with nothing else in the loop:
+// `abla-grad decode-bench <model.gguf> <ids-file> [--n N] [--mode direct|graph] [--ctx N] [--batch-seed] [--f16-kv] [--global-kv 8|16|32] [--log file]`: greedy decode speed of an Inkling model, tg128-style.
+// Seeding is untimed. By default it steps through the IDs. --batch-seed prefills the prefix in chunks of 512. The timed region generates N tokens:
 // `direct` launches every kernel from the host each token and reads the argmax back; `graph` replays one recorded token N times with the argmax,
 // the token log and the position all on the device. Prints tok/s and the generated ids (to --log if given).
 import "abla/io"
@@ -14,6 +14,7 @@ import "../backend/cuda.ab"
 import "../gguf/reader.ab"
 import "../model/inkling.ab"
 import "../model/inkling_config.ab"
+import "../model/inkling_prefill.ab"
 import "../model/weights.ab"
 import "../ops.ab"
 
@@ -40,12 +41,21 @@ private fun benchReport(mode: string, count: int, nanoseconds: int, tokens: arra
     0
 }
 
+private fun decodeBenchSeed(var backend: Backend, model: InklingModel, ids: array<int>, prefix: array<int>, ws: PrefillWorkspace?): bool {
+    if (ws != null) return model.prefill(backend, ws, prefix, 0)
+    for (position in 0 until ids.size - 1) if (!model.forward(backend, ids[position], position)) return false
+    true
+}
+
 fun cmdDecodeBench(args: array<string>): int {
     var count = 128
     var mode = "graph"
     var maxCtx = 0
     var logPath = ""
     var noSplit = false
+    var halfKv = false
+    var batchSeed = false
+    var globalBits = 0
     var launches = false
     var splits = 16
     var noFuse = false
@@ -58,6 +68,16 @@ fun cmdDecodeBench(args: array<string>): int {
             index = index + 2
         } else if (args[index] == "--splits" && index + 1 < args.size) {
             splits = args[index + 1].parseInt() ?? 16
+            index = index + 2
+        } else if (args[index] == "--f16-kv") {
+            halfKv = true
+            index = index + 1
+        } else if (args[index] == "--batch-seed") {
+            batchSeed = true
+            index = index + 1
+        } else if (args[index] == "--global-kv" && index + 1 < args.size) {
+            globalBits = args[index + 1].parseInt() ?? 0
+            if (globalBits != 8 && globalBits != 16 && globalBits != 32) return 2
             index = index + 2
         } else if (args[index] == "--skip" && index + 1 < args.size) {
             for (name in args[index + 1].split(",")) cudaSkipKernels.append(name)
@@ -92,12 +112,17 @@ fun cmdDecodeBench(args: array<string>): int {
         }
     }
     if (positional.size != 2 || count <= 0 || (mode != "direct" && mode != "graph")) {
-        println("usage: abla-grad decode-bench <model.gguf> <ids-file> [--n N] [--mode direct|graph] [--ctx N] [--log file]")
+        println("usage: abla-grad decode-bench <model.gguf> <ids-file> [--n N] [--mode direct|graph] [--ctx N] [--batch-seed] [--f16-kv] [--global-kv 8|16|32] [--log file]")
         return 2
     }
+    if (splits < 1 || splits > ATTENTION_SPLITS_MAX) return 2
     val ids = readPromptIds(positional[1])
     if (ids == null || ids.size == 0) {
         println("decode-bench: ${positional[1]} is not a file of token ids")
+        return 2
+    }
+    if (maxCtx > 0 && (ids.size > maxCtx || count > maxCtx - ids.size + 1)) {
+        println("decode-bench: the context must fit the prompt and generated positions")
         return 2
     }
     val file = ggufOpen(positional[0])
@@ -112,7 +137,7 @@ fun cmdDecodeBench(args: array<string>): int {
     }
     var backend = cudaBackend() ?? return 2
     val context = if (maxCtx > 0) maxCtx else ids.size + count + 8
-    var model = inklingLoad(backend, file, config, context) ?? return 1
+    var model = inklingLoad(backend, file, config, context, 5, halfKv, false, globalBits) ?? return 1
     if (!model.reset(backend)) return 1
     model.useStep = true
     model.splitAttention = !noSplit
@@ -120,17 +145,16 @@ fun cmdDecodeBench(args: array<string>): int {
     model.fused = !noFuse
     model.fusedController = !noFuseController
     // prefill all but the last prompt token (this also loads every kernel module, which must happen before recording)
-    for (position in 0 until ids.size - 1) {
-        if (!model.forward(backend, ids[position], position)) {
-            println("decode-bench: ${inklingLastError()} (${cudaLastError()})")
-            return 1
-        }
-    }
+    val prefix: array<int> = []
+    if (batchSeed) for (i in 0 until ids.size - 1) prefix.append(ids[i])
+    val ws = if (batchSeed && prefix.size > 0) prefillWorkspace(backend, config, 512, false) else null
+    if (batchSeed && prefix.size > 0 && ws == null) return 1
+    if (mode != "graph" && !decodeBenchSeed(backend, model, ids, prefix, ws)) return 1
     val last = ids.size - 1
     val generated: array<int> = []
     if (mode == "graph") {
         // one direct pass of the last prompt token warms the kernels; its effects are undone by resetting and prefilling again
-        if (!model.forward(backend, ids[last], last)) return 1
+        if (!model.forward(backend, ids[0], 0)) return 1
         val recording = model.capture(backend)
         if (recording == null) {
             println("decode-bench: ${inklingLastError()} (${cudaLastError()})")
@@ -146,7 +170,7 @@ fun cmdDecodeBench(args: array<string>): int {
             println("decode-bench: launches per token: $total")
         }
         if (!model.reset(backend)) return 1
-        for (position in 0 until ids.size - 1) if (!model.forward(backend, ids[position], position)) return 1
+        if (!decodeBenchSeed(backend, model, ids, prefix, ws)) return 1
         if (!model.seed(backend, ids[last], last)) return 1
         if (!backend.synchronize()) return 1
         val start = monotonicNanoseconds()
