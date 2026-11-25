@@ -22,6 +22,7 @@ fun cmdSpecBench(args: array<string>): int {
     var count = 128
     var batch = 4
     var logPath = ""
+    var prefill = false
     val positional: array<string> = []
     var index = 0
     while (index < args.size) {
@@ -31,6 +32,9 @@ fun cmdSpecBench(args: array<string>): int {
         } else if (args[index] == "--batch" && index + 1 < args.size) {
             batch = args[index + 1].parseInt() ?? 0
             index = index + 2
+        } else if (args[index] == "--prefill") {
+            prefill = true
+            index = index + 1
         } else if (args[index] == "--log" && index + 1 < args.size) {
             logPath = args[index + 1]
             index = index + 2
@@ -40,7 +44,7 @@ fun cmdSpecBench(args: array<string>): int {
         }
     }
     if (positional.size != 3 || count <= 0 || batch <= 0) {
-        println("usage: abla-grad spec-bench <target.gguf> <drafter.gguf> <ids-file> [--n N] [--batch B] [--log file]")
+        println("usage: abla-grad spec-bench <target.gguf> <drafter.gguf> <ids-file> [--n N] [--batch B] [--log file] [--prefill]")
         return 2
     }
     val idsText = Path(positional[2]).readTextResult()
@@ -72,7 +76,19 @@ fun cmdSpecBench(args: array<string>): int {
     val ws = prefillWorkspace(backend, config, 3, true, 3) ?? return 1
     val spec = backend.allocate(64) ?? return 1
     // prefill the prompt (taps for every position); the anchor is the greedy token after the last prompt token, at position `length`
-    for (position in 0 until length) {
+    var seeded = 0
+    if (prefill) {
+        // the prompt except its last token through the batched prefill (state, KV and taps); the last token runs in step mode below (it sets the anchor)
+        val seed = prefillWorkspace(backend, config, 512, false) ?? return 1
+        val head: array<int> = []
+        for (i in 0 until length - 1) head.append(ids[i])
+        if (!model.prefill(backend, seed, head, 0)) {
+            println("spec-bench: prefill: ${inklingPrefillLastError()} (${cudaLastError()})")
+            return 1
+        }
+        seeded = head.size
+    }
+    for (position in seeded until length) {
         if (!model.forward(backend, ids[position], position)) {
             println("spec-bench: ${inklingLastError()} (${cudaLastError()})")
             return 1
