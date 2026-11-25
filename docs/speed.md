@@ -133,6 +133,47 @@ transport are outside the timer.
 Raw commands, exact IDs, traces and the untimed seed patch are in
 `~/src/abla-grad-oracle/tg128-128k/`.
 
+## Long-context prefill on identical prompts
+
+Prompt tokens/s on RTX 4090 using the original Inkling UD-Q4_K_M and
+the same fixed token IDs for all three engines. The 8,192-token prompt
+is a Dickens prefix. The 32,768- and 131,072-token prompts are the
+rendered chat requests used for the TTFT measurements above.
+
+| Prompt tokens | abla-grad `56d0e48` | llama.cpp `33aeb17` | Unsloth `b12649-mix-c7059d6` |
+|---:|---:|---:|---:|
+| 8,192 | 4620.34 | 2017.35 | 3673.16 |
+| 32,768 | 4036.87 | 1213.45 | 3192.81 |
+| 131,072 | 2252.38 | 340.86 | 2602.87 |
+
+The timers include prefill and the last token's logits. Each engine
+warms up on one chunk and clears the sequence before the measured
+runs. The table reports the median of three runs through 32k and the
+midpoint of two at 128k. Chunk size is 512 except mainline at 128k,
+which uses batch and microbatch 32 to fit its prefill workspace. Both
+llama.cpp builds use F16 KV. abla-grad uses F32 at 8k and 32k and
+F16 sliding KV with Q8 global KV at 128k.
+
+Nsight Systems traced one abla-grad 128k prefill with 512-token chunks.
+The profiled prefill took 58.90 s wall time.
+
+| GPU work | Launches | Kernel seconds | Share of kernel time |
+|---|---:|---:|---:|
+| Global attention (Q8) | 2,048 | 30.12 | 51.62% |
+| Matrix products | 151,553 | 20.67 | 35.43% |
+| Other kernels | 456,707 | 5.36 | 9.19% |
+| Sliding attention (F16 ring) | 10,240 | 2.15 | 3.69% |
+| KV writes | 12,288 | 0.04 | 0.07% |
+
+From the first measured embedding launch through the final kernel,
+58.35 of 58.90 s were GPU-active. The GPU timeline had
+0.55 s of gaps, including 0.01 s immediately before
+embedding launches at chunk boundaries after staging copies. CUDA
+copies accounted for 0.00 s.
+
+Raw samples, token IDs, reference driver and Nsight artifacts are in
+`~/src/abla-grad-oracle/prefill-1256/`.
+
 ## Decode and speculation across cache depths
 
 Throughput on the RTX 4090 in tokens/s on the pinned Inkling UD-Q4_K_M.
