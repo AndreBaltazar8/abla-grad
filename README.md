@@ -74,7 +74,7 @@ tool at `http://127.0.0.1:8080/v1`; any API key works.
 - `GET /v1/models`, `GET /health`, `POST /v1/chat/completions` (JSON, or `"stream": true` as server-sent events with `stream_options.include_usage`).
 - Tools: `tools` / `tool_choice` go in, `tool_calls` come out (`finish_reason: "tool_calls"`), `role: "tool"` messages go back. The prompt is rendered the way
   Inkling's own chat template does it. The model's thinking arrives as `reasoning_content`, the answer as `content`.
-- `max_tokens`, `stop` and `reasoning_effort` are honoured. Decoding is greedy: `temperature` and `top_p` are accepted and ignored.
+- `max_tokens` (default: all the context the prompt leaves), `stop` and `reasoning_effort` are honoured. Decoding is greedy: `temperature` and `top_p` are accepted and ignored.
 - One request at a time (the rest wait in the listen queue). The KV cache and speculation state stay between requests: a request whose prompt starts with
   the previous conversation only processes the tokens after it (`usage.prompt_tokens_details.cached_tokens` tells how many were reused). Each request is
   logged on stderr with prompt, reused and generated tokens, time to first token and tok/s.

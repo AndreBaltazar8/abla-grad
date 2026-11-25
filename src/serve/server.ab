@@ -34,7 +34,8 @@ private val SERVE_LONG_FIXED_BYTES = 20700000000
 
 private val SERVE_BYTES_PER_POSITION = 80000
 private val SERVE_FIXED_BYTES = 20300000000
-private val SERVE_DEFAULT_MAX_TOKENS = 4096
+// Without max_tokens (and --max-tokens) a reply may use everything the context has left after the prompt.
+private val SERVE_DEFAULT_MAX_TOKENS = 1073741824
 
 private fun serveDrafterPath(model: string): string {
     val slash = model.lastIndexOf("/")
