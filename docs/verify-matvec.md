@@ -7,13 +7,13 @@ launch dimensions stay fixed when the kernels are recorded in a graph.
 | Kernel | Parameters in launch order | Problem |
 | --- | --- | --- |
 | `matvec_f32_rows`, `matvec_q8_0_rows` | `w, x, y, u32 rows, u32 cols, u32 vectors` | `[rows]` |
-| `matvec_nvfp4_indexed_rows` | `w, x, y, u32 rows, u32 cols, u32 vectors, map, u32 capacity, u64 expertStrideBytes, u32 slotsPerVector, u32 xVectorStride, u32 xSlotStride, expertScales` | `[rows, capacity]` |
+| `matvec_nvfp4_indexed_rows`, `matvec_q5_k_indexed_rows`, `matvec_q8_0_indexed_rows` | `w, x, y, u32 rows, u32 cols, u32 vectors, map, u32 capacity, u64 expertStrideBytes, u32 slotsPerVector, u32 xVectorStride, u32 xSlotStride, expertScales` | `[rows, capacity]` |
 
 Dense inputs and outputs are contiguous FP32 arrays of shape `[vectors][cols]`
 and `[vectors][rows]`, respectively. Weight packing is the same as for
 the single-vector kernels.
 
-For indexed NVFP4, each map entry is four u32s `{expertId, slot0, slot1, slot2}`.
+For indexed matvecs, each map entry is four u32s `{expertId, slot0, slot1, slot2}`.
 Use one entry per distinct expert and write `0xffffffff` for absent slots.
 Entries with no valid slots are skipped, including padding up to the graph's
 fixed capacity. The producer must supply in-range expert IDs for active

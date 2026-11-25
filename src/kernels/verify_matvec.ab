@@ -1,5 +1,6 @@
 import "matvec_q8_0.ab"
 import "matvec_nvfp4.ab"
+import "matvec_k.ab"
 
 private val verifyWarpReduction = """
 template <unsigned R>
@@ -7,6 +8,57 @@ static __device__ __forceinline__ void verify_reduce(float (&sums)[R]) {
     for (unsigned width = 16; width; width /= 2) {
         #pragma unroll
         for (unsigned v = 0; v < R; ++v) sums[v] += __shfl_down_sync(0xffffffffu, sums[v], width);
+    }
+}
+"""
+
+private val verifyExpertUnion = """
+template <typename Format>
+static __device__ __forceinline__ void verify_indexed(const unsigned char *w, const float *x,
+    float *y, unsigned rows, unsigned cols, unsigned vectors, const unsigned *map,
+    unsigned capacity, unsigned long long expertStrideBytes, unsigned slotsPerVector,
+    unsigned xVectorStride, unsigned xSlotStride, const float *expertScales) {
+    const unsigned lane = threadIdx.x & 31;
+    const unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const unsigned entry = blockIdx.y;
+    if (row >= rows || entry >= capacity) return;
+    const unsigned *record = map + static_cast<unsigned long long>(entry) * 4;
+    const unsigned slots[3] = {record[1], record[2], record[3]};
+    const bool has0 = slots[0] < slotsPerVector;
+    const bool has1 = vectors >= 2 && slots[1] < slotsPerVector;
+    const bool has2 = vectors >= 3 && slots[2] < slotsPerVector;
+    const unsigned used = unsigned(has0) + unsigned(has1) + unsigned(has2);
+    if (used == 0) return;
+    // Compact participating vectors without dynamically indexing the pointer arrays.
+    const unsigned indices[3] = {has0 ? 0u : has1 ? 1u : 2u, has0 && has1 ? 1u : 2u, 2u};
+    const unsigned picked[3] = {has0 ? slots[0] : has1 ? slots[1] : slots[2],
+        has0 && has1 ? slots[1] : slots[2], slots[2]};
+    const float *inputs[3] = {};
+    float *outputs[3] = {};
+    unsigned long long addresses = 0;
+    #pragma unroll
+    for (unsigned i = 0; i < 3; ++i) {
+        if (i >= used) break;
+        const unsigned v = indices[i];
+        const unsigned slot = picked[i];
+        inputs[i] = x + static_cast<unsigned long long>(v) * xVectorStride +
+            static_cast<unsigned long long>(slot) * xSlotStride;
+        outputs[i] = y + (static_cast<unsigned long long>(v) * slotsPerVector + slot) * rows + row;
+        addresses |= reinterpret_cast<unsigned long long>(inputs[i]);
+    }
+    const unsigned expert = record[0];
+    const unsigned char *weights = w + expert * expertStrideBytes +
+        static_cast<unsigned long long>(row) * Format::row_bytes(cols);
+    const float scale = expertScales ? expertScales[expert] : 1.0f;
+    if (used == 1) {
+        const float sum = Format::single(weights, inputs[0], cols);
+        if (lane == 0) *outputs[0] = expertScales ? sum * scale : sum;
+    } else if (used == 2) {
+        if (addresses & 15) Format::template batch<2, false>(weights, inputs, outputs, cols, scale, expertScales != nullptr);
+        else Format::template batch<2, true>(weights, inputs, outputs, cols, scale, expertScales != nullptr);
+    } else {
+        if (addresses & 15) Format::template batch<3, false>(weights, inputs, outputs, cols, scale, expertScales != nullptr);
+        else Format::template batch<3, true>(weights, inputs, outputs, cols, scale, expertScales != nullptr);
     }
 }
 """
@@ -113,7 +165,7 @@ extern "C" __global__ void matvec_q8_0_rows(const unsigned char *w, const float 
 }
 """
 
-val kernelVerifyNvfp4 = kernelNvfp4DotSource + "\n" + verifyWarpReduction + "\n" + """
+private val verifyNvfp4Format = kernelNvfp4DotSource + "\n" + verifyWarpReduction + "\n" + """
 template <unsigned R, bool VectorLoads>
 static __device__ __forceinline__ void verify_nvfp4(const unsigned char *weights,
     const float *const *x, float *const *y, unsigned cols, float expertScale, bool scaled) {
@@ -159,51 +211,115 @@ static __device__ __forceinline__ void verify_nvfp4(const unsigned char *weights
     }
 }
 
-extern "C" __global__ void matvec_nvfp4_indexed_rows(const unsigned char *w, const float *x,
+struct VerifyNvfp4 {
+    static __device__ unsigned long long row_bytes(unsigned cols) { return cols / 64 * 36ull; }
+    static __device__ float single(const unsigned char *w, const float *x, unsigned cols) {
+        return nvfp4_dot(w, x, cols);
+    }
+    template <unsigned R, bool Aligned>
+    static __device__ void batch(const unsigned char *w, const float *const *x, float *const *y,
+        unsigned cols, float scale, bool scaled) {
+        verify_nvfp4<R, Aligned>(w, x, y, cols, scale, scaled);
+    }
+};
+"""
+
+private val verifyQ8Format = """
+struct VerifyQ8 {
+    static __device__ unsigned long long row_bytes(unsigned cols) { return cols / 32 * 34ull; }
+    static __device__ float single(const unsigned char *w, const float *x, unsigned cols) {
+        return q8_dot(w, x, cols);
+    }
+    template <unsigned R, bool Aligned>
+    static __device__ void batch(const unsigned char *w, const float *const *x, float *const *y,
+        unsigned cols, float scale, bool scaled) {
+        const unsigned lane = threadIdx.x & 31;
+        float sums[R] = {};
+        if (reinterpret_cast<unsigned long long>(w) & 1u) {
+            for (unsigned b = 0; b < cols / 32; ++b) {
+                const unsigned char *packed = w + static_cast<unsigned long long>(b) * 34;
+                const float weight = q8_scale(packed) * float(static_cast<signed char>(packed[2 + lane]));
+                #pragma unroll
+                for (unsigned v = 0; v < R; ++v) sums[v] = fmaf(weight, x[v][b * 32 + lane], sums[v]);
+            }
+        } else {
+            const unsigned short *row = reinterpret_cast<const unsigned short *>(w);
+            const unsigned part = (lane & 7) * 4;
+            for (unsigned b = lane >> 3; b < cols / 32; b += 4) {
+                const unsigned short *packed = row + static_cast<unsigned long long>(b) * 17;
+                const unsigned short bits = packed[0];
+                float d;
+                asm("cvt.f32.f16 %0, %1;" : "=f"(d) : "h"(bits));
+                const unsigned a = packed[1 + part / 2];
+                const unsigned bq = packed[2 + part / 2];
+                const float q0 = d * float(static_cast<signed char>(a));
+                const float q1 = d * float(static_cast<signed char>(a >> 8));
+                const float q2 = d * float(static_cast<signed char>(bq));
+                const float q3 = d * float(static_cast<signed char>(bq >> 8));
+                #pragma unroll
+                for (unsigned v = 0; v < R; ++v) {
+                    const float *input = x[v] + b * 32 + part;
+                    const float4 values = Aligned ? *reinterpret_cast<const float4 *>(input) :
+                        make_float4(input[0], input[1], input[2], input[3]);
+                    float sum = fmaf(q0, values.x, sums[v]);
+                    sum = fmaf(q1, values.y, sum);
+                    sum = fmaf(q2, values.z, sum);
+                    sums[v] = fmaf(q3, values.w, sum);
+                }
+            }
+        }
+        verify_reduce(sums);
+        if (lane == 0) {
+            #pragma unroll
+            for (unsigned v = 0; v < R; ++v) *y[v] = scaled ? sums[v] * scale : sums[v];
+        }
+    }
+};
+"""
+
+private val verifyQ5Format = """
+struct VerifyQ5 {
+    static __device__ unsigned long long row_bytes(unsigned cols) { return cols / 256 * 176ull; }
+    static __device__ float single(const unsigned char *w, const float *x, unsigned cols) {
+        return k_dot<5>(w, x, cols);
+    }
+    template <unsigned R, bool Aligned>
+    static __device__ void batch(const unsigned char *w, const float *const *x, float *const *y,
+        unsigned cols, float scale, bool scaled) {
+        const unsigned lane = threadIdx.x & 31;
+        float sums[R] = {};
+        for (unsigned b = 0; b < cols / 256; ++b) {
+            const unsigned char *packed = w + static_cast<unsigned long long>(b) * 176;
+            #pragma unroll
+            for (unsigned group = 0; group < 8; ++group) {
+                const unsigned col = b * 256 + group * 32 + lane;
+                const float weight = k_weight<5>(packed, group, lane);
+                #pragma unroll
+                for (unsigned v = 0; v < R; ++v) sums[v] = fmaf(weight, x[v][col], sums[v]);
+            }
+        }
+        verify_reduce(sums);
+        if (lane == 0) {
+            #pragma unroll
+            for (unsigned v = 0; v < R; ++v) *y[v] = scaled ? sums[v] * scale : sums[v];
+        }
+    }
+};
+"""
+
+private fun verifyIndexedSource(format: string, kind: string, name: string): string =
+    format + "\n" + verifyExpertUnion + "\n#define VERIFY_KERNEL " + name + "\n#define VERIFY_FORMAT " + kind + "\n" + """
+extern "C" __global__ void VERIFY_KERNEL(const unsigned char *w, const float *x,
     float *y, unsigned rows, unsigned cols, unsigned vectors, const unsigned *map,
     unsigned capacity, unsigned long long expertStrideBytes, unsigned slotsPerVector,
     unsigned xVectorStride, unsigned xSlotStride, const float *expertScales) {
-    const unsigned lane = threadIdx.x & 31;
-    const unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-    const unsigned entry = blockIdx.y;
-    if (row >= rows || entry >= capacity) return;
-    const unsigned *record = map + static_cast<unsigned long long>(entry) * 4;
-    const unsigned slots[3] = {record[1], record[2], record[3]};
-    const bool has0 = slots[0] < slotsPerVector;
-    const bool has1 = vectors >= 2 && slots[1] < slotsPerVector;
-    const bool has2 = vectors >= 3 && slots[2] < slotsPerVector;
-    const unsigned used = unsigned(has0) + unsigned(has1) + unsigned(has2);
-    if (used == 0) return;
-    // Compact participating vectors without dynamically indexing the pointer arrays.
-    const unsigned indices[3] = {has0 ? 0u : has1 ? 1u : 2u, has0 && has1 ? 1u : 2u, 2u};
-    const unsigned picked[3] = {has0 ? slots[0] : has1 ? slots[1] : slots[2],
-        has0 && has1 ? slots[1] : slots[2], slots[2]};
-    const float *inputs[3] = {};
-    float *outputs[3] = {};
-    unsigned long long addresses = 0;
-    #pragma unroll
-    for (unsigned i = 0; i < 3; ++i) {
-        if (i >= used) break;
-        const unsigned v = indices[i];
-        const unsigned slot = picked[i];
-        inputs[i] = x + static_cast<unsigned long long>(v) * xVectorStride +
-            static_cast<unsigned long long>(slot) * xSlotStride;
-        outputs[i] = y + (static_cast<unsigned long long>(v) * slotsPerVector + slot) * rows + row;
-        addresses |= reinterpret_cast<unsigned long long>(inputs[i]);
-    }
-    const unsigned expert = record[0];
-    const unsigned char *weights = w + expert * expertStrideBytes +
-        static_cast<unsigned long long>(row) * (cols / 64) * 36;
-    const float scale = expertScales ? expertScales[expert] : 1.0f;
-    if (used == 1) {
-        const float sum = nvfp4_dot(weights, inputs[0], cols);
-        if (lane == 0) *outputs[0] = expertScales ? sum * scale : sum;
-    } else if (used == 2) {
-        if (addresses & 15) verify_nvfp4<2, false>(weights, inputs, outputs, cols, scale, expertScales != nullptr);
-        else verify_nvfp4<2, true>(weights, inputs, outputs, cols, scale, expertScales != nullptr);
-    } else {
-        if (addresses & 15) verify_nvfp4<3, false>(weights, inputs, outputs, cols, scale, expertScales != nullptr);
-        else verify_nvfp4<3, true>(weights, inputs, outputs, cols, scale, expertScales != nullptr);
-    }
+    verify_indexed<VERIFY_FORMAT>(w, x, y, rows, cols, vectors, map, capacity, expertStrideBytes,
+        slotsPerVector, xVectorStride, xSlotStride, expertScales);
 }
 """
+
+val kernelVerifyNvfp4 = verifyIndexedSource(verifyNvfp4Format, "VerifyNvfp4", "matvec_nvfp4_indexed_rows")
+val kernelVerifyQ8Indexed = verifyIndexedSource(kernelMatvecQ8_0 + "\n" + verifyWarpReduction + "\n" + verifyQ8Format,
+    "VerifyQ8", "matvec_q8_0_indexed_rows")
+val kernelVerifyQ5Indexed = verifyIndexedSource(kernelMatvecK + "\n" + verifyWarpReduction + "\n" + verifyQ5Format,
+    "VerifyQ5", "matvec_q5_k_indexed_rows")

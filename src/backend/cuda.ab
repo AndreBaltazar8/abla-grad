@@ -451,7 +451,7 @@ private val cudaVerifyMatvecArguments = [
     KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
     KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32
 ]
-private val cudaVerifyNvfp4Arguments = [
+private val cudaVerifyIndexedArguments = [
     KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
     KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32,
     KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U64,
@@ -464,25 +464,38 @@ private fun cudaVerifyF32Shape(args: KernelArgs, problem: array<int>): bool =
 private fun cudaVerifyQ8Shape(args: KernelArgs, problem: array<int>): bool =
     cudaVerifyF32Shape(args, problem) && args.words[4] % 32 == 0
 
-private fun cudaVerifyNvfp4Shape(args: KernelArgs, problem: array<int>): bool {
-    if (!cudaVerifyF32Shape(args, problem) || args.words[4] % 64 != 0 ||
+private fun cudaVerifyIndexedShape(args: KernelArgs, problem: array<int>, blockElements: int, blockBytes: int): bool {
+    if (!cudaVerifyF32Shape(args, problem) || args.words[4] % blockElements != 0 ||
         args.words[7] != problem[1]) return false
     val cols = args.words[4]
-    val rowBytes = cols / 64 * 36
+    val rowBytes = cols / blockElements * blockBytes
     val expertStride = args.words[8]
     val slots = args.words[9]
     val vectorStride = args.words[10]
     val slotStride = args.words[11]
-    expertStride > 0 && expertStride % 4 == 0 && args.words[0] % 4 == 0 &&
+    expertStride > 0 &&
         args.words[6] % 4 == 0 && problem[0] <= expertStride / rowBytes && slots > 0 &&
         (args.words[5] == 1 || vectorStride >= cols) && (slotStride == 0 || slotStride >= cols)
 }
+
+private fun cudaVerifyNvfp4Shape(args: KernelArgs, problem: array<int>): bool =
+    args.words[0] % 4 == 0 && args.words[8] % 4 == 0 && cudaVerifyIndexedShape(args, problem, 64, 36)
+
+private fun cudaVerifyQ8IndexedShape(args: KernelArgs, problem: array<int>): bool =
+    cudaVerifyIndexedShape(args, problem, 32, 34)
+
+private fun cudaVerifyQ5IndexedShape(args: KernelArgs, problem: array<int>): bool =
+    cudaVerifyIndexedShape(args, problem, 256, 176)
 
 private val cudaKernels = [
     CudaKernelSpec("matvec_f32_rows", kernelVerifyF32, 4, 128, cudaVerifyMatvecArguments, cudaVerifyF32Shape),
     CudaKernelSpec("matvec_q8_0_rows", kernelVerifyQ8_0, 4, 128, cudaVerifyMatvecArguments, cudaVerifyQ8Shape),
     CudaKernelSpec("matvec_nvfp4_indexed_rows", kernelVerifyNvfp4, 4, 128,
-        cudaVerifyNvfp4Arguments, cudaVerifyNvfp4Shape, 2, 12),
+        cudaVerifyIndexedArguments, cudaVerifyNvfp4Shape, 2, 12),
+    CudaKernelSpec("matvec_q8_0_indexed_rows", kernelVerifyQ8Indexed, 4, 128,
+        cudaVerifyIndexedArguments, cudaVerifyQ8IndexedShape, 2, 12),
+    CudaKernelSpec("matvec_q5_k_indexed_rows", kernelVerifyQ5Indexed, 4, 128,
+        cudaVerifyIndexedArguments, cudaVerifyQ5IndexedShape, 2, 12),
     CudaKernelSpec("matvec_f32", kernelMatvecF32, 4, 128, cudaMatvecArguments, cudaF32Shape),
     CudaKernelSpec("matvec_q4_k", kernelMatvecK, 4, 128, cudaMatvecArguments, cudaKQuantShape),
     CudaKernelSpec("matvec_q5_k", kernelMatvecK, 4, 128, cudaMatvecArguments, cudaKQuantShape),

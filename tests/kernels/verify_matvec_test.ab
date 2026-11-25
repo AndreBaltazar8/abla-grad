@@ -7,7 +7,7 @@ import "abla/process/time"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 
-private trusted fun verifyWeights(backend: Backend, kind: string, bytes: int, offset: int): DeviceBuffer? {
+private trusted fun verifyWeights(backend: Backend, kind: string, bytes: int, offset: int, expertStride: int = 0, expertPadding: int = 0): DeviceBuffer? {
     val host = nativeByteBuffer(bytes)
     val address = nativePointerAddress(host.address)
     val words = bytes / 4
@@ -17,10 +17,19 @@ private trusted fun verifyWeights(backend: Backend, kind: string, bytes: int, of
             if (kind == "f32") (bits & 0x807fffff) | 0x3f000000 else bits)
     }
     for (i in words * 4 until bytes) host.store(i, i & 255)
-    if (kind == "q8") {
-        for (i in 0 until bytes / 34) {
-            host.store(i * 34, (i * 31) & 255)
-            host.store(i * 34 + 1, 0x30 + (i & 3))
+    if (kind == "q5_k") {
+        for (i in 0 until bytes / 176) {
+            host.store(i * 176 + 1, 0x30 + (i & 3))
+            host.store(i * 176 + 3, 0x28 + (i & 3))
+        }
+    }
+    if (kind == "q8" || kind == "q8_0") {
+        val stride = if (expertStride > 0) expertStride else bytes
+        for (e in 0 until bytes / stride) {
+            for (i in 0 until (stride - expertPadding) / 34) {
+                host.store(e * stride + i * 34, (i * 31) & 255)
+                host.store(e * stride + i * 34 + 1, 0x30 + (i & 3))
+            }
         }
     }
     val buffer = backend.allocate(bytes + offset) ?? return null
@@ -88,13 +97,18 @@ private fun verifyDense(var backend: Backend, kind: string, rows: int, cols: int
 }
 
 private fun verifyIndexed(var backend: Backend, rows: int, cols: int, slots: int, pattern: string,
-    slotStride: int, vectorPadding: int, withScales: bool, bench: bool = false): bool {
+    slotStride: int, vectorPadding: int, withScales: bool, bench: bool = false, kind: string = "nvfp4",
+    expertPadding: int = 0): bool {
     val vectorStride = (slots - 1) * slotStride + cols + vectorPadding
-    val expertStride = rows * (cols / 64 * 36) + 16
+    val name = "matvec_${kind}_indexed"
+    val rowBytes = if (kind == "q5_k") cols / 256 * 176
+        else if (kind == "q8_0") cols / 32 * 34
+        else cols / 64 * 36
+    val expertStride = rows * rowBytes + expertPadding
     val experts = if (pattern == "overlap") slots
         else if (pattern == "mixed") 2 * slots + 1
         else 3 * slots
-    val w = verifyWeights(backend, "nvfp4", experts * expertStride, 0) ?? return false
+    val w = verifyWeights(backend, kind, experts * expertStride, 0, expertStride, expertPadding) ?? return false
     val x = uploadFloats(backend, testSignal(3 * vectorStride, 8)) ?? return false
     val scales = uploadFloats(backend, testSignal(experts, 6)) ?? return false
     val count = slots * rows
@@ -115,9 +129,9 @@ private fun verifyIndexed(var backend: Backend, rows: int, cols: int, slots: int
             .u32(rows).u32(cols).pointer(dIds).u32(slots).u64(expertStride).u32(slotStride)
         if (withScales) args.pointer(scales)
         else args.u64(0)
-        if (!backend.launch("matvec_nvfp4_indexed", args, [rows, slots]) || !backend.synchronize()) return false
-        if (bench && v == 0 && !timeVerify(backend, "matvec_nvfp4_indexed", args, [rows, slots],
-            "nvfp4_single ${rows}x${cols} slots=${slots} ${pattern}", 1)) return false
+        if (!backend.launch(name, args, [rows, slots]) || !backend.synchronize()) return false
+        if (bench && v == 0 && !timeVerify(backend, name, args, [rows, slots],
+            "${kind}_single ${rows}x${cols} slots=${slots} ${pattern}", 1)) return false
     }
     val absent = 0xffffffff
     for (vectors in 1..3) {
@@ -142,12 +156,12 @@ private fun verifyIndexed(var backend: Backend, rows: int, cols: int, slots: int
             .pointer(map).u32(capacity).u64(expertStride).u32(slots).u32(vectorStride).u32(slotStride)
         if (withScales) args.pointer(scales)
         else args.u64(0)
-        val name = "matvec_nvfp4_indexed_rows"
+        val rowKernel = name + "_rows"
         val shape = [rows, capacity]
-        if (!backend.launch(name, args, shape) || !backend.synchronize() ||
-            !verifyEqual(backend, name, vectors, y, ref, vectors * count)) return false
-        if (bench && !timeVerify(backend, name, args, shape,
-            "nvfp4_rows ${rows}x${cols} slots=${slots} ${pattern}", vectors)) return false
+        if (!backend.launch(rowKernel, args, shape) || !backend.synchronize() ||
+            !verifyEqual(backend, rowKernel, vectors, y, ref, vectors * count)) return false
+        if (bench && !timeVerify(backend, rowKernel, args, shape,
+            "${kind}_rows ${rows}x${cols} slots=${slots} ${pattern}", vectors)) return false
     }
     true
 }
@@ -160,7 +174,9 @@ private fun verifyAll(var backend: Backend): bool {
             verifyDense(backend, "f32", 16384, 2048, bench = true) &&
             verifyIndexed(backend, 2304, 1152, 8, "overlap", 0, 0, true, bench = true) &&
             verifyIndexed(backend, 2304, 1152, 8, "mixed", 0, 0, true, bench = true) &&
-            verifyIndexed(backend, 2304, 1152, 8, "disjoint", 0, 0, true, bench = true)
+            verifyIndexed(backend, 2304, 1152, 8, "disjoint", 0, 0, true, bench = true) &&
+            verifyIndexed(backend, 2304, 2304, 8, "mixed", 0, 0, false, bench = true, kind = "q5_k") &&
+            verifyIndexed(backend, 2304, 1152, 8, "mixed", 1152, 0, false, bench = true, kind = "q8_0")
     }
     verifyDense(backend, "f32", 7, 93) &&
         verifyDense(backend, "q8", 7, 160) &&
@@ -168,7 +184,10 @@ private fun verifyAll(var backend: Backend): bool {
         verifyDense(backend, "q8", 11, 96, wOffset = 1) &&
         verifyIndexed(backend, 7, 320, 3, "overlap", 0, 0, false) &&
         verifyIndexed(backend, 11, 1152, 4, "mixed", 1161, 1, true) &&
-        verifyIndexed(backend, 11, 128, 2, "disjoint", 128, 0, true)
+        verifyIndexed(backend, 11, 128, 2, "disjoint", 128, 0, true, expertPadding = 16) &&
+        verifyIndexed(backend, 11, 256, 4, "mixed", 0, 1, true, kind = "q5_k") &&
+        verifyIndexed(backend, 11, 96, 4, "mixed", 97, 1, true, kind = "q8_0") &&
+        verifyIndexed(backend, 11, 96, 4, "mixed", 96, 0, false, kind = "q8_0", expertPadding = 1)
 }
 
 private fun noVerifyCuda(): int {
