@@ -8,6 +8,7 @@ import "../kernels/matvec_k.ab"
 import "../kernels/matvec_nvfp4.ab"
 import "../kernels/fused_gate_up_situ.ab"
 import "../kernels/matvec_q8_0.ab"
+import "../kernels/verify_matvec.ab"
 import "../kernels/matvec_bf16.ab"
 import "abla/crypto"
 import "abla/bytes"
@@ -438,7 +439,42 @@ private fun cudaAttentionMergeShape(args: KernelArgs, problem: array<int>): bool
 private fun cudaInklingGateUpSituShape(args: KernelArgs, problem: array<int>): bool =
     problem[0] == inklingGateUpSitu.geometry.problem[0] && problem[1] == inklingGateUpSitu.geometry.problem[1]
 
+private val cudaVerifyMatvecArguments = [
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
+    KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32
+]
+private val cudaVerifyNvfp4Arguments = [
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
+    KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32,
+    KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_U64,
+    KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_POINTER
+]
+
+private fun cudaVerifyF32Shape(args: KernelArgs, problem: array<int>): bool =
+    cudaF32Shape(args, problem) && args.words[5] >= 1 && args.words[5] <= 3
+
+private fun cudaVerifyQ8Shape(args: KernelArgs, problem: array<int>): bool =
+    cudaVerifyF32Shape(args, problem) && args.words[4] % 32 == 0
+
+private fun cudaVerifyNvfp4Shape(args: KernelArgs, problem: array<int>): bool {
+    if (!cudaVerifyF32Shape(args, problem) || args.words[4] % 64 != 0 ||
+        args.words[7] != problem[1]) return false
+    val cols = args.words[4]
+    val rowBytes = cols / 64 * 36
+    val expertStride = args.words[8]
+    val slots = args.words[9]
+    val vectorStride = args.words[10]
+    val slotStride = args.words[11]
+    expertStride > 0 && expertStride % 4 == 0 && args.words[0] % 4 == 0 &&
+        args.words[6] % 4 == 0 && problem[0] <= expertStride / rowBytes && slots > 0 &&
+        (args.words[5] == 1 || vectorStride >= cols) && (slotStride == 0 || slotStride >= cols)
+}
+
 private val cudaKernels = [
+    CudaKernelSpec("matvec_f32_rows", kernelVerifyF32, 4, 128, cudaVerifyMatvecArguments, cudaVerifyF32Shape),
+    CudaKernelSpec("matvec_q8_0_rows", kernelVerifyQ8_0, 4, 128, cudaVerifyMatvecArguments, cudaVerifyQ8Shape),
+    CudaKernelSpec("matvec_nvfp4_indexed_rows", kernelVerifyNvfp4, 4, 128,
+        cudaVerifyNvfp4Arguments, cudaVerifyNvfp4Shape, 2, 12),
     CudaKernelSpec("matvec_f32", kernelMatvecF32, 4, 128, cudaMatvecArguments, cudaF32Shape),
     CudaKernelSpec("matvec_q4_k", kernelMatvecK, 4, 128, cudaMatvecArguments, cudaKQuantShape),
     CudaKernelSpec("matvec_q5_k", kernelMatvecK, 4, 128, cudaMatvecArguments, cudaKQuantShape),
