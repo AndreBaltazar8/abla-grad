@@ -43,3 +43,16 @@ are **not** changed: `conv_history_rows` writes the history after row 1, 2, 3 in
 bank and the loop's control state live inside one token's forward, so nothing else is stateful. `abla-grad verify-check <gguf> <ids>` checks the whole chain: prefill 100
 tokens, verify 3, commit 2 or 0, one decode step, against a plain prefill (argmax identical, the decode step after the commit equals the verified row to 1e-3).
 The rows use the f16 tensor-core matmuls, so a logit differs from the decode kernels' by their rounding (KL below 0.005 on the gate prompts); an argmax at a near tie can differ.
+
+## Graph-static verification (`verifyStep`, `commitStep`; docs/spec-cycle.md)
+`model.verifyStep(backend, ws, spec, step)` is the recordable form: it only launches kernels and reads everything that changes from cycle to cycle from device memory:
+the three row token ids from `spec[0..2]`, the position P of row 0 from `step[1]`; it writes the argmax of the rows to `spec[4..6]`, the KV rows and drafter taps of
+positions P..P+2 (taps via `tap_rows`, position from `step[1]`), and the per-row conv-history snapshots. `model.commitStep(backend, ws, step)` sets history := snapshot
+`min(step[3], 2)` (`commit_select`; step[3] = accepted proposals a, so a + 1 rows are committed). The positional kernels (`kv_store_batch`, `scale_tau_rows`,
+`attention_prefill_tc`, `tap_rows`) take a device pointer to P; the host prefill uploads a small control word per chunk. `abla-grad verify-check` runs both forms.
+
+## Drafter taps
+With `model.enableTaps` on, prefill and verify rows write the same position-major records as the step-mode decode: slots 0..2 = the layer inputs of visits 5, 23, 41,
+slot 3 = the final-norm output (copied from the same vector the lm head reads). Measured against step-mode taps over 103 positions of prompt 04 (relative L2 error): slot 0
+3e-4, slot 1 up to 0.07, slot 2 up to 0.37, slot 3 up to 0.38 — while the logits of the same positions agree to KL 1e-5. A final-norm tap that disagrees by 38% cannot
+produce the same logits, so the deeper step-mode taps need a look (the prefill taps are copies of the vectors the prefill's own lm head used).

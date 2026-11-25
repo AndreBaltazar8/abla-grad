@@ -47,7 +47,8 @@ enum { AT_KEYS = 32, AT_DIM = 128, AT_PITCH = 136, AT_WARPS = 2 };
 
 extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc(
     const float *q, const float *kCache, const float *vCache, const float *table, float *out, unsigned nHead, unsigned nKvHead,
-    unsigned window, unsigned firstPos, unsigned extent, unsigned maxCtx, float scale, unsigned tokens) {
+    unsigned window, const unsigned *posPtr, unsigned extent, unsigned maxCtx, float scale, unsigned tokens) {
+    const unsigned firstPos = *posPtr;
     __shared__ __align__(16) unsigned short ks[AT_KEYS * AT_PITCH];
     __shared__ __align__(16) unsigned short kl[AT_KEYS * AT_PITCH];
     __shared__ __align__(16) unsigned short vs[AT_KEYS * AT_PITCH];

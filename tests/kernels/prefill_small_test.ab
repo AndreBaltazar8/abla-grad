@@ -11,6 +11,15 @@ trusted fun fill(address: int, count: int, seed: int, scale: f32): void {
     for (i in 0 until count) testStoreFloat(address, i, f32FromInt((i * 37 + seed * 11 + i / 13 * 5 + i / 101 * seed) % 61 - 30) * scale)
 }
 
+// A device buffer holding one u32.
+trusted fun deviceWord(backend: Backend, value: int): DeviceBuffer? {
+    val host = nativeByteBuffer(16)
+    ablaUnsafeStoreU32(nativePointerFromAddress(nativePointerAddress(host.address)), value)
+    val device = backend.allocate(16)
+    if (device == null || !backend.upload(device, 0, nativePointerAddress(host.address), 4)) return null
+    device
+}
+
 // Uploads `count` floats filled by `fill`; returns the device buffer.
 trusted fun deviceFloats(backend: Backend, count: int, seed: int, scale: f32): DeviceBuffer? {
     val host = nativeByteBuffer(count * 4 + 8)
@@ -139,8 +148,9 @@ fun testAttention(backend: Backend): bool {
                 .u32(extent).u32(maxCtx).f32(scale), [nHead])
         }
         val outC = deviceFloats(backend, tokens * nHead * dim, 0, 0.0) ?? return false
+        val posBuf = deviceWord(backend, firstPos) ?? return false
         ok = ok && backend.launch("attention_prefill_tc", kernelArgs().pointer(q).pointer(k).pointer(v).pointer(table).pointer(outC).u32(nHead).u32(nKvHead)
-            .u32(window).u32(firstPos).u32(extent).u32(maxCtx).f32(scale).u32(tokens), [nHead, (tokens + 31) / 32])
+            .u32(window).pointer(posBuf).u32(extent).u32(maxCtx).f32(scale).u32(tokens), [nHead, (tokens + 31) / 32])
         if (!ok) return false
         // f16 inputs and probabilities: about 2^-11 per term
         if (!same("attention_prefill_tc window $window", downloadFloats(backend, outC, 0, tokens * nHead * dim) ?? return false,

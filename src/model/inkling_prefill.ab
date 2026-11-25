@@ -71,6 +71,7 @@ fun prefillWorkspace(var backend: Backend, c: InklingConfig, chunk: int, allLogi
     val maxTiles = pairs / 32 + c.nExpert
     var at = 0
     at = wsAdd(offsets, "tokenIds", chunk, at)
+    at = wsAdd(offsets, "ctl", 4, at)
     at = wsAdd(offsets, "x", chunk * n, at)
     at = wsAdd(offsets, "inpSA", chunk * n, at)
     at = wsAdd(offsets, "inputs", 3 * chunk * n, at)
@@ -270,8 +271,8 @@ private fun InklingModel.controlRows(var backend: Backend, ws: PrefillWorkspace,
 }
 
 // One layer visit for the whole chunk; returns the new block count or -1.
-private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, ip: int, visit: int, loopPass: int, nBank: int, firstPos: int, tokens: int,
-    nBlocks: int): int {
+private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, ip: int, visit: int, loopPass: int, nBank: int, firstPos: int, posBuf: DeviceBuffer,
+    posOff: int, tokens: int, nBlocks: int): int {
     val c = this.config
     val n = c.nEmbd
     val nb = n * 4
@@ -289,7 +290,7 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     var ok = true
     if (this.tapsOn && (visit == 5 || visit == 23 || visit == 41)) {
         // the drafter's tap: the layer input of this visit, position-major [position][4][n]
-        ok = this.copyRows(backend, ws.buffer, x, n, this.taps, (firstPos * 4 + (if (visit == 5) 0 else if (visit == 23) 1 else 2)) * nb, 4 * n, n, tokens)
+        ok = backend.launch("tap_rows", kernelArgs().pointer(ws.buffer, x).pointer(this.taps).pointer(posBuf, posOff).u32(n).u32(if (visit == 5) 0 else if (visit == 23) 1 else 2).u32(4).u32(tokens), [n, tokens])
     }
     ok = ok && opCopy(backend, ws.buffer, x, ws.buffer, inpSA, tokens * n)
 
@@ -373,8 +374,8 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     ok = ok && backend.launch("l2clip_rows", kernelArgs().pointer(ws.buffer, r).pointer(this.arena, relClip.offset).pointer(ws.buffer, r)
         .u32(tokens * c.nHead).u32(c.nRel).f32(c.relClip).u32(c.nHead), [tokens * c.nHead])
     if (!isSwa) {
-        ok = ok && backend.launch("scale_tau_rows", kernelArgs().pointer(ws.buffer, q).u32(qDim).u32(firstPos).u32(c.logFloor).f32(c.logAlpha).u32(tokens), [qDim, tokens])
-        ok = ok && backend.launch("scale_tau_rows", kernelArgs().pointer(ws.buffer, r).u32(c.nRel * c.nHead).u32(firstPos).u32(c.logFloor).f32(c.logAlpha).u32(tokens),
+        ok = ok && backend.launch("scale_tau_rows", kernelArgs().pointer(ws.buffer, q).u32(qDim).pointer(posBuf, posOff).u32(c.logFloor).f32(c.logAlpha).u32(tokens), [qDim, tokens])
+        ok = ok && backend.launch("scale_tau_rows", kernelArgs().pointer(ws.buffer, r).u32(c.nRel * c.nHead).pointer(posBuf, posOff).u32(c.logFloor).f32(c.logAlpha).u32(tokens),
             [c.nRel * c.nHead, tokens])
     }
     if (!ok) return -1
@@ -388,7 +389,7 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
         .pointer(ws.buffer, table).u32(c.nRel).u32(extent).u32(tokens * c.nHead), [extent + 1, tokens * c.nHead])
     val layerCacheBytes = c.nHeadKv * this.maxCtx * c.headDim * 4
     ok = ok && backend.launch("kv_store_batch", kernelArgs().pointer(ws.buffer, k).pointer(ws.buffer, v).pointer(this.kCache, visit * layerCacheBytes)
-        .pointer(this.vCache, visit * layerCacheBytes).u32(firstPos).u32(c.nHeadKv).u32(c.headDim).u32(this.maxCtx).u32(tokens), [kvDim, tokens])
+        .pointer(this.vCache, visit * layerCacheBytes).pointer(posBuf, posOff).u32(c.nHeadKv).u32(c.headDim).u32(this.maxCtx).u32(tokens), [kvDim, tokens])
     val scale = f64ToF32(1.0 / sqrt(f64FromInt(c.headDim)))
     val att = ws.o("att")
     if (!prefillTensorAttention) {
@@ -398,7 +399,7 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     } else {
     ok = ok && backend.launch("attention_prefill_tc", kernelArgs().pointer(ws.buffer, q).pointer(this.kCache, visit * layerCacheBytes)
         .pointer(this.vCache, visit * layerCacheBytes).pointer(ws.buffer, table).pointer(ws.buffer, att).u32(c.nHead).u32(c.nHeadKv)
-        .u32(if (isSwa) c.nSwa else 0).u32(firstPos).u32(extent).u32(this.maxCtx).f32(scale).u32(tokens), [c.nHead, (tokens + 31) / 32])
+        .u32(if (isSwa) c.nSwa else 0).pointer(posBuf, posOff).u32(extent).u32(this.maxCtx).f32(scale).u32(tokens), [c.nHead, (tokens + 31) / 32])
     }
     ok = ok && opSigmoidMul(backend, ws.buffer, att, ws.buffer, ws.o("gate"), ws.buffer, att, tokens * qDim)
     val oproj = ws.o("oproj")
@@ -508,26 +509,36 @@ fun InklingModel.prefill(var backend: Backend, ws: PrefillWorkspace, tokenIds: a
     var done = 0
     while (done < tokenIds.size) {
         val count = if (tokenIds.size - done < ws.chunk) tokenIds.size - done else ws.chunk
-        if (!this.prefillChunk(backend, ws, tokenIds, done, count, startPos + done, done + count == tokenIds.size)) return false
+        if (!this.uploadChunk(backend, ws, tokenIds, done, count, startPos + done)) {
+            prefillError = "uploading the token ids failed"
+            return false
+        }
+        if (!this.prefillChunk(backend, ws, count, startPos + done, done + count == tokenIds.size, ws.buffer, ws.o("tokenIds"), ws.buffer, ws.o("ctl"))) return false
         done = done + count
     }
     true
 }
 
-private trusted fun InklingModel.uploadIds(var backend: Backend, ws: PrefillWorkspace, tokenIds: array<int>, from: int, count: int): bool {
+// Uploads the ids of `count` tokens and the position of the first one (the kernels read both from device memory, so a recording can replace them).
+private trusted fun InklingModel.uploadChunk(var backend: Backend, ws: PrefillWorkspace, tokenIds: array<int>, from: int, count: int, firstPos: int): bool {
     val host = nativeByteBuffer(count * 4 + 8)
     val address = nativePointerAddress(host.address)
     for (i in 0 until count) ablaUnsafeStoreU32(nativePointerFromAddress(address + 4 * i), tokenIds[from + i])
-    val ok = backend.upload(ws.buffer, ws.o("tokenIds"), address, count * 4)
+    var ok = backend.upload(ws.buffer, ws.o("tokenIds"), address, count * 4)
+    ablaUnsafeStoreU32(nativePointerFromAddress(address), firstPos)
+    ok = ok && backend.upload(ws.buffer, ws.o("ctl"), address, 4)
     host.close()
     ok
 }
 
-private fun InklingModel.prefillChunk(var backend: Backend, ws: PrefillWorkspace, tokenIds: array<int>, from: int, tokens: int, firstPos: int, last: bool): bool {
+// `firstPos` is the host's knowledge of the first position (-1 when only the device knows it: recorded cycles); the kernels read it from posBuf at posOff,
+// the token ids from idsBuf at idsOff.
+private fun InklingModel.prefillChunk(var backend: Backend, ws: PrefillWorkspace, tokens: int, firstPos: int, last: bool, idsBuf: DeviceBuffer, idsOff: int,
+    posBuf: DeviceBuffer, posOff: int): bool {
     val c = this.config
     val n = c.nEmbd
     val nb = n * 4
-    if (firstPos < 0 || firstPos + tokens > this.maxCtx) {
+    if (firstPos >= 0 && firstPos + tokens > this.maxCtx) {
         prefillError = "positions $firstPos .. ${firstPos + tokens - 1} are outside the cache of ${this.maxCtx}"
         return false
     }
@@ -537,11 +548,7 @@ private fun InklingModel.prefillChunk(var backend: Backend, ws: PrefillWorkspace
         return false
     }
     val x = ws.o("x")
-    if (!this.uploadIds(backend, ws, tokenIds, from, tokens)) {
-        prefillError = "uploading the token ids failed"
-        return false
-    }
-    var ok = backend.launch("gather_rows_q8_0", kernelArgs().pointer(this.arena, embd.offset).pointer(ws.buffer, ws.o("tokenIds")).pointer(ws.buffer, x)
+    var ok = backend.launch("gather_rows_q8_0", kernelArgs().pointer(this.arena, embd.offset).pointer(idsBuf, idsOff).pointer(ws.buffer, x)
         .u32(n).u32(tokens), [n, tokens])
     ok = ok && this.normRows(backend, ws, "token_embd_norm.weight", x, x, tokens)
     if (!ok) {
@@ -553,7 +560,7 @@ private fun InklingModel.prefillChunk(var backend: Backend, ws: PrefillWorkspace
     val loopStart = if (c.looped) c.loopStart else c.nLayer
     val loopEnd = if (c.looped) c.loopEnd else c.nLayer
     for (ip in 0 until loopStart) {
-        blocks = this.layerRows(backend, ws, ip, visit, 0, 0, firstPos, tokens, blocks)
+        blocks = this.layerRows(backend, ws, ip, visit, 0, 0, firstPos, posBuf, posOff, tokens, blocks)
         visit = visit + 1
         if (blocks < 0) return false
     }
@@ -577,14 +584,14 @@ private fun InklingModel.prefillChunk(var backend: Backend, ws: PrefillWorkspace
                         return false
                     }
                 }
-                blocks = this.layerRows(backend, ws, ip, visit, pass, nBank, firstPos, tokens, blocks)
+                blocks = this.layerRows(backend, ws, ip, visit, pass, nBank, firstPos, posBuf, posOff, tokens, blocks)
                 visit = visit + 1
                 if (blocks < 0) return false
             }
         }
     }
     for (ip in loopEnd until c.nLayer) {
-        blocks = this.layerRows(backend, ws, ip, visit, 0, 0, firstPos, tokens, blocks)
+        blocks = this.layerRows(backend, ws, ip, visit, 0, 0, firstPos, posBuf, posOff, tokens, blocks)
         visit = visit + 1
         if (blocks < 0) return false
     }
@@ -593,7 +600,7 @@ private fun InklingModel.prefillChunk(var backend: Backend, ws: PrefillWorkspace
     if (!withLogits && !this.tapsOn) return true
     ok = this.mixRows(backend, ws, ws.blocks, blocks, x, "output_res_query.weight", 1, x, n, tokens)
     ok = ok && this.normRows(backend, ws, "output_norm.weight", x, x, tokens)
-    if (this.tapsOn) ok = ok && this.copyRows(backend, ws.buffer, x, n, this.taps, (firstPos * 4 + 3) * nb, 4 * n, n, tokens)
+    if (this.tapsOn) ok = ok && backend.launch("tap_rows", kernelArgs().pointer(ws.buffer, x).pointer(this.taps).pointer(posBuf, posOff).u32(n).u32(3).u32(4).u32(tokens), [n, tokens])
     if (!withLogits) return ok
     val output = this.wr("output.weight")
     val outputKind = weightKind(output.type)
@@ -638,7 +645,12 @@ fun InklingModel.verify(var backend: Backend, ws: PrefillWorkspace, ids: array<i
         return false
     }
     prefillVerifyRows = ids.size
-    val ok = this.prefillChunk(backend, ws, ids, 0, ids.size, startPos, true)
+    if (!this.uploadChunk(backend, ws, ids, 0, ids.size, startPos)) {
+        prefillError = "uploading the verification rows failed"
+        prefillVerifyRows = 0
+        return false
+    }
+    val ok = this.prefillChunk(backend, ws, ids.size, startPos, true, ws.buffer, ws.o("tokenIds"), ws.buffer, ws.o("ctl"))
     prefillVerifyRows = 0
     ok
 }
@@ -678,4 +690,30 @@ trusted fun InklingModel.verifyArgmax(var backend: Backend, ws: PrefillWorkspace
     for (row in 0 until rows) result.append(ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * row)))
     host.close()
     result
+}
+
+// ---- the graph-static forms for the speculative cycle (docs/spec-cycle.md): nothing is read from kernel parameters that changes from cycle to cycle ----
+// `spec` words: [0..2] the rows' token ids (anchor, proposal 1, proposal 2), [3] padding, [4..6] the argmax of rows 0..2 (written here); `step` words: [1] = P, the position
+// of row 0 (rows are P, P+1, P+2), [3] = the accepted proposals of the cycle, read by `commitStep`. Always 3 rows (padding rows run and are ignored). Only launches: it
+// can be recorded.
+fun InklingModel.verifyStep(var backend: Backend, ws: PrefillWorkspace, spec: DeviceBuffer, step: DeviceBuffer): bool {
+    prefillError = ""
+    if (ws.verifyRows < 3 || ws.chunk < 3 || !ws.allLogits) {
+        prefillError = "verifyStep needs a workspace with allLogits, chunk >= 3 and verifyRows >= 3"
+        return false
+    }
+    prefillVerifyRows = 3
+    var ok = this.prefillChunk(backend, ws, 3, -1, true, spec, 0, step, 4)
+    prefillVerifyRows = 0
+    for (row in 0 until 3) {
+        ok = ok && backend.launch("argmax", kernelArgs().pointer(ws.buffer, ws.o("logits") + row * this.config.nVocabPadded * 4).u32(this.config.nVocab)
+            .pointer(spec, (4 + row) * 4), [1])
+    }
+    ok
+}
+
+// history := the snapshot after row step[3] (0-based: the last committed row, i.e. a + 1 rows committed when a proposals were accepted).
+fun InklingModel.commitStep(var backend: Backend, ws: PrefillWorkspace, step: DeviceBuffer): bool {
+    val floats = ws.historyBytes / 4
+    backend.launch("commit_select", kernelArgs().pointer(ws.snapshots).pointer(this.history).pointer(step, 12).u32(floats).u32(ws.verifyRows - 1), [floats])
 }

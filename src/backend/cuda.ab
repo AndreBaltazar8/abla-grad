@@ -330,7 +330,7 @@ private val cudaArgsRelTableRows = [prefillArgP, prefillArgP, prefillArgP, prefi
 private fun cudaPrefillRelTableRowsShape(args: KernelArgs, problem: array<int>): bool =
     args.words[5] + 1 == problem[0] && args.words[6] == problem[1] && args.words[4] > 0 && args.words[4] % 4 == 0 && args.words[4] <= 32 &&
         args.words[0] % 16 == 0 && args.words[1] % 16 == 0
-private val cudaArgsAttentionTc = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgF, prefillArgU]
+private val cudaArgsAttentionTc = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgP, prefillArgU, prefillArgU, prefillArgF, prefillArgU]
 private fun cudaPrefillAttentionTcShape(args: KernelArgs, problem: array<int>): bool =
     args.words[5] == problem[0] && args.words[6] > 0 && args.words[5] % args.words[6] == 0 && args.words[12] > 0 && problem[1] == (args.words[12] + 31) / 32 &&
         args.words[0] % 16 == 0 && args.words[1] % 16 == 0 && args.words[2] % 16 == 0
@@ -359,14 +359,19 @@ private fun cudaPrefillX5Shape(args: KernelArgs, problem: array<int>): bool {
 private val cudaArgsConvHistoryRows = [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgU]
 private fun cudaPrefillConvHistoryRowsShape(args: KernelArgs, problem: array<int>): bool =
     args.words[3] == problem[0] && args.words[4] >= 2 && args.words[4] <= 64 && args.words[5] > 0
+private val cudaArgsTapRows = [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgU]
+private val cudaArgsCommitSelect = [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU]
+private fun cudaPrefillTapRowsShape(args: KernelArgs, problem: array<int>): bool =
+    args.words[3] == problem[0] && args.words[6] == problem[1] && args.words[4] < args.words[5]
+private fun cudaPrefillCommitSelectShape(args: KernelArgs, problem: array<int>): bool = args.words[3] == problem[0]
 private val cudaArgsGatherRows = [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU]
 private val cudaArgsCopyRows = [prefillArgP, prefillArgU, prefillArgP, prefillArgU, prefillArgU, prefillArgU]
 private val cudaArgsDepthMixBatch = [prefillArgP, prefillArgU, prefillArgU, prefillArgP, prefillArgU, prefillArgP, prefillArgU, prefillArgP, prefillArgU, prefillArgU, prefillArgF, prefillArgU]
 private val cudaArgsConvSeq = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgF, prefillArgU]
 private val cudaArgsConvHistory = [prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU]
 private val cudaArgsL2ClipRows = [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgF, prefillArgU]
-private val cudaArgsScaleTauRows = [prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgF, prefillArgU]
-private val cudaArgsKvStoreBatch = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgU]
+private val cudaArgsScaleTauRows = [prefillArgP, prefillArgU, prefillArgP, prefillArgU, prefillArgF, prefillArgU]
+private val cudaArgsKvStoreBatch = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgU]
 private val cudaArgsMoeRouteBatch = [prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgP, prefillArgP, prefillArgF, prefillArgF, prefillArgU]
 private val cudaArgsMoeSort = [prefillArgP, prefillArgU, prefillArgU, prefillArgU, prefillArgU, prefillArgP, prefillArgP, prefillArgP]
 private val cudaArgsMoeCombineBatch = [prefillArgP, prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU, prefillArgU]
@@ -514,6 +519,8 @@ private val cudaPrefillKernels = [
     CudaKernelSpec("matmul_q8_0_x5", kernelPrefillMatmul, 128, 256, cudaArgsMatmulX5, cudaPrefillX5Shape, 2),
     CudaKernelSpec("conv_history_rows", kernelPrefillConvHistoryRows, 256, 256, cudaArgsConvHistoryRows, cudaPrefillConvHistoryRowsShape),
     CudaKernelSpec("matmul_nvfp4_grouped_rd", kernelPrefillMatmul, 128, 128, cudaArgsGrouped, cudaPrefillGroupedNvfp4Shape, 2, 4),
+    CudaKernelSpec("tap_rows", kernelPrefillTapRows, 256, 256, cudaArgsTapRows, cudaPrefillTapRowsShape, 2),
+    CudaKernelSpec("commit_select", kernelPrefillCommitSelect, 256, 256, cudaArgsCommitSelect, cudaPrefillCommitSelectShape),
     CudaKernelSpec("matmul_f32_exact_split", kernelPrefillMatmulF32ExactSplit, 16, 256, cudaArgsMatmulSplit, cudaPrefillExactSplitShape, 2),
     CudaKernelSpec("matmul_f32_exact", kernelPrefillMatmulF32Exact, 16, 256, cudaArgsPrefillMatmul, cudaPrefillMatmulExactShape, 2),
     CudaKernelSpec("gather_rows_q8_0", kernelPrefillGatherQ8_0, 256, 256, cudaArgsGatherRows, cudaPrefillGatherShape, 2),
