@@ -1,0 +1,7 @@
+import "abla/text"
+
+// These matrices enter Inkling's F32 matvecs. Existing BF16 sink and convolution
+// projections have their own execution kernels.
+fun inklingPackableMatrix(name: string): bool =
+    name.endsWith(".ffn_gate_inp.weight") || name.endsWith("_ctrl_down.weight") ||
+    name.endsWith("_ctrl_gain.weight") || name.endsWith("_ctrl_forget.weight")

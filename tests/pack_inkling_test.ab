@@ -1,0 +1,67 @@
+import "abla/bytes"
+import "abla/fs"
+import "abla/io"
+import "abla/process/command"
+import "abla/process/arguments"
+
+private fun ByteBuffer.le(value: int, width: int): void {
+    for (i in 0 until width) this.appendByteValue((value >> (8 * i)) & 255)
+}
+
+private fun ByteBuffer.textField(value: string): void {
+    this.le(value.size, 8)
+    this.appendText(value)
+}
+
+private fun ByteBuffer.pad32(): void {
+    while (this.size() % 32 != 0) this.le(0, 1)
+}
+
+// The first matrix shrinks from two aligned blocks to one. The second
+// is an unrelated F32 matrix with an inexact value. The final tensor is a norm.
+private fun fixture(packed: bool, inexact: bool = false): string {
+    val b = bytes("GGUF")
+    b.le(3, 4)
+    b.le(3, 8)
+    b.le(1, 8)
+    b.textField("general.architecture")
+    b.le(8, 4)
+    b.textField("inkling2_loop")
+    val names = ["blk.0.ffn_gate_inp.weight", "blk.1.attn_q.weight", "output_norm.weight"]
+    var offset = 0
+    for (i in 0 until 3) {
+        b.textField(names[i])
+        b.le(2, 4)
+        b.le(16, 8)
+        b.le(1, 8)
+        b.le(if (packed && i == 0) 30 else 0, 4)
+        b.le(offset, 8)
+        offset = offset + (if (packed && i == 0) 32 else 64)
+    }
+    b.pad32()
+    for (i in 0 until 3) for (j in 0 until 16) {
+        val high = if (j == 0) 0x8000 else 0x3f00 + j
+        if (packed && i == 0) b.le(high, 2)
+        else b.le((high << 16) + (if ((i == 1 || (inexact && i == 0)) && j == 15) 1 else 0), 4)
+    }
+    b.toText()
+}
+
+fun main: int {
+    if (processArgumentCount() != 2) return 2
+    val binary = processArgument(0)
+    val dir = processArgument(1)
+    val source = dir + "/input.gguf"
+    val dest = dir + "/output.gguf"
+    if (!Path(source).writeText(fixture(false))) return 1
+    if (command(binary).argument(source).argument(dest).run() != 0) return 1
+    if (Path(dest).readText() != fixture(true)) return 1
+    if (command(binary).argument(source).argument(dest).run() == 0 || Path(dest).readText() != fixture(true)) return 1
+    if (Path(source).readText() != fixture(false)) return 1
+    val rejected = dir + "/rejected.gguf"
+    if (!Path(source).writeText(fixture(false, true))) return 1
+    if (command(binary).argument(source).argument(rejected).run() == 0) return 1
+    if (Path(rejected).linkInfo().exists() || Path(rejected + ".partial").linkInfo().exists()) return 1
+    println("lossless Inkling packing preserves values, offsets and an existing destination")
+    0
+}

@@ -65,9 +65,23 @@ on prose, 150-250 tok/s on predictable text such as lists and code. The first tu
 - After every turn a line on stderr reports the tokens processed, the tokens generated and the decode speed.
 - Piped input works (`printf 'Hi\n/quit\n' | abla-grad chat ...`): one line per turn.
 
+## Lossless packing for the Inkling target
+
+The packer checks every FP32 word in each router and loop-controller matrix. It requires every selected word to have zero low 16 bits. An inexact word produces an error identifying its tensor and element before the converter publishes the output. For the pinned UD-Q4_K_M model this saves 70,778,880 bytes across 168 matrices. Abla expands those weights at upload to preserve the original kernels and logits. The conversion reduces disk usage.
+
+From the project’s Nix shell, choose a new output path.
+
+```sh
+ablac build tools/pack-inkling.ab --fast -o build/pack-inkling
+dir="$HOME/models/inkling-2-mini"
+build/pack-inkling "$dir/Inkling-2-Mini-UD-Q4_K_M.gguf" "$dir/Inkling-2-Mini-UD-Q4_K_M-lossless-BF16.gguf"
+```
+
+The packed file for the pinned original has SHA-256 `d081fc3aafe0e2868a016ef3c9d0a891a01ba7b5f7ad36751357a0a6b4625267`. llama.cpp can load this file and selects its own kernels based on the stored types.
+
 ## Rules
 
 - GPU is the primary target; a CPU path comes later from the same kernels. No separate CPU engine first.
-- Weights stay in their stored quantization on the GPU (dequantized inside the matvec kernels); activations are f32.
+- Quantized weights stay packed on the GPU and matvec kernels dequantize them. Activations are f32. The lossless disk packer’s router and controller matrices expand to f32 during upload.
 - Every kernel has a test with a CPU reference **in the test only**, and a tolerance written down.
 - A change to a contract in `docs/interfaces.md` is announced to the owners of both sides first.

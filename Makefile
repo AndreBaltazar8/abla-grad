@@ -13,6 +13,9 @@ test-host:
 	$(COMPILER) build tests/compare_test.ab -o $(BUILD)/compare_test --fast --no-cache && $(BUILD)/compare_test
 	tests/compare_cli_test.sh $(COMPILER)
 	$(COMPILER) build tests/gguf_reader_test.ab -o $(BUILD)/gguf_reader_test --fast --no-cache && $(BUILD)/gguf_reader_test $(BUILD)/gguf-fixture.gguf
+	$(COMPILER) build tools/pack-inkling.ab -o $(BUILD)/pack-inkling --fast --no-cache
+	$(COMPILER) build tests/pack_inkling_test.ab -o $(BUILD)/pack_inkling_test --fast --no-cache
+	@dir=$$(mktemp -d) && trap 'rm -f -- "$$dir/input.gguf" "$$dir/output.gguf"; rmdir -- "$$dir"' EXIT && $(BUILD)/pack_inkling_test $(BUILD)/pack-inkling "$$dir"
 	$(COMPILER) build tests/generate_host_test.ab -o $(BUILD)/generate_host_test --fast --no-cache && $(BUILD)/generate_host_test
 	tools/test-fuse.sh $(COMPILER)
 

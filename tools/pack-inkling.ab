@@ -1,0 +1,132 @@
+import "../src/gguf/reader.ab"
+import "../src/gguf/inkling_packing.ab"
+import "../src/gguf/quant.ab"
+import "abla/io"
+import "abla/fs"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+private trusted fun firstInexactWord(address: int, bytes: int): int {
+    for (i in 0 until bytes / 4) {
+        if ((ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * i)) & 65535) != 0) return i
+    }
+    -1
+}
+
+private trusted fun writeRange(fd: int, address: int, bytes: int): bool {
+    var written = 0
+    while (written < bytes) {
+        val left = bytes - written
+        val count = linuxSyscall3(1, fd, address + written, if (left > 8388608) 8388608 else left)
+        if (count == -4) continue
+        if (count <= 0) return false
+        written = written + count
+    }
+    true
+}
+
+private trusted fun writePacked(fd: int, src: int, bytes: int): bool {
+    val buffer = nativeByteBuffer(1048576)
+    val dest = nativePointerAddress(buffer.address)
+    var index = 0
+    while (index < bytes / 4) {
+        val left = bytes / 4 - index
+        val count = if (left > 524288) 524288 else left
+        for (j in 0 until count) {
+            val word = ablaUnsafeLoadU32(nativePointerFromAddress(src + 4 * (index + j)))
+            ablaUnsafeStoreU16(nativePointerFromAddress(dest + 2 * j), word >> 16)
+        }
+        if (!writeRange(fd, dest, count * 2)) {
+            buffer.close()
+            return false
+        }
+        index = index + count
+    }
+    buffer.close()
+    true
+}
+
+private fun padding(bytes: int, alignment: int): int = (alignment - bytes % alignment) % alignment
+
+private trusted fun writeModel(file: GgufFile, fd: int): bool {
+    val first = file.tensorAt(0)
+    val base = file.tensorAddress(first)
+    if (base == 0 || first.offset != 0) return false
+    val header = nativeByteBuffer(file.ggufDataStart)
+    val address = nativePointerAddress(header.address)
+    ablaUnsafeCopyMemory(address, base - file.ggufDataStart, file.ggufDataStart)
+    val align = file.getInt("general.alignment") ?? 32
+    val packed: array<bool> = []
+    var end = 0
+    var converted = 0
+    var saved = 0
+    for (i in 0 until file.tensorCount()) {
+        val tensor = file.tensorAt(i)
+        val use = tensor.dims.size == 2 && tensor.type == GGML_TYPE_F32 && inklingPackableMatrix(tensor.name)
+        packed.append(use)
+        val bytes = if (use) tensor.bytes / 2 else tensor.bytes
+        if (use) {
+            val index = firstInexactWord(file.tensorAddress(tensor), tensor.bytes)
+            if (index >= 0) {
+                eprintln("Cannot pack ${tensor.name}: FP32 word $index has nonzero low 16 bits")
+                header.close()
+                return false
+            }
+            ablaUnsafeStoreU32(nativePointerFromAddress(address + tensor.typeFieldOffset), GGML_TYPE_BF16)
+            converted = converted + 1
+            saved = saved + bytes
+        }
+        header.storeI64(tensor.typeFieldOffset + 4, end)
+        end = end + bytes + padding(bytes, align)
+    }
+    var ok = writeRange(fd, address, file.ggufDataStart)
+    header.close()
+    val zeros = nativeByteBuffer(align)
+    for (i in 0 until align) zeros.store(i, 0)
+    for (i in 0 until file.tensorCount()) {
+        if (!ok) break
+        val tensor = file.tensorAt(i)
+        val src = file.tensorAddress(tensor)
+        val bytes = if (packed[i]) tensor.bytes / 2 else tensor.bytes
+        ok = if (packed[i]) writePacked(fd, src, tensor.bytes) else writeRange(fd, src, bytes)
+        ok = ok && writeRange(fd, nativePointerAddress(zeros.address), padding(bytes, align))
+    }
+    zeros.close()
+    if (ok) println("Packed $converted tensors, saving $saved payload bytes")
+    ok
+}
+
+private trusted fun convert(source: string, destination: string): bool {
+    for (i in 0 until destination.size) if (destination[i] == 0) return false
+    if (Path(destination).linkInfo().exists()) {
+        eprintln("Output already exists: $destination")
+        return false
+    }
+    val file = ggufOpen(source) ?? return false
+    if (file.getString("general.architecture") != "inkling2_loop" || file.tensorCount() == 0) return false
+    val partial = destination + ".partial"
+    // O_CREAT | O_EXCL refuses an existing partial. linkat publishes without replacing an existing destination.
+    val fd = linuxSyscall4(257, -100, nativeCStringAddress(partial), 524481, 0o600)
+    if (fd < 0) return false
+    var ok = writeModel(file, fd)
+    ok = ok && linuxSyscall1(74, fd) == 0
+    val closed = linuxSyscall1(3, fd)
+    ok = ok && closed == 0 && linuxSyscall5(265, -100, nativeCStringAddress(partial), -100, nativeCStringAddress(destination), 0) == 0
+    linuxSyscall3(263, -100, nativeCStringAddress(partial), 0)
+    file.close()
+    ok
+}
+
+fun main: int {
+    if (processArgumentCount() != 2) {
+        eprintln("usage: pack-inkling INPUT.gguf NEW-OUTPUT.gguf")
+        return 2
+    }
+    if (!convert(processArgument(0), processArgument(1))) {
+        eprintln("Packing failed. Check the input model, available space and destination path. " + ggufLastError())
+        return 1
+    }
+    0
+}

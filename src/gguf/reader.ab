@@ -17,7 +17,7 @@ fun ggufLastError(): string = ggufError
 // The offset is relative to the tensor data section. The first dimension is
 // the number of elements per row. The byte count excludes alignment padding.
 class GgufTensorInfo(
-    val name: string, val type: int, val dims: array<int>, val offset: int, val bytes: int
+    val name: string, val type: int, val dims: array<int>, val offset: int, val bytes: int, val typeFieldOffset: int = -1
 )
 
 private class GgufMetadata(val kind: int, val itemKind: int, val count: int, val offset: int)
@@ -125,6 +125,7 @@ private fun ggufReadTensor(var cursor: GgufCursor, alignment: int): GgufTensorIn
 
     val dims: array<int> = []
     for (i in 0 until rank) dims.append(cursor.bits(8))
+    val typeFieldOffset = cursor.offset
     val type = cursor.bits(4)
     val offset = cursor.bits(8)
     if (cursor.error != "") return null
@@ -146,7 +147,7 @@ private fun ggufReadTensor(var cursor: GgufCursor, alignment: int): GgufTensorIn
         }
         bytes *= dimension
     }
-    GgufTensorInfo(name, type, dims, offset, bytes)
+    GgufTensorInfo(name, type, dims, offset, bytes, typeFieldOffset)
 }
 
 private fun ggufPadding(offset: int, alignment: int): int =
