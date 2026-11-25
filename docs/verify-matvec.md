@@ -32,3 +32,28 @@ For a focused run, build `tests/kernels/verify_matvec_test.ab` with `ablac` in
 the Nix shell and run the executable through `tools/gpu-lock.sh`. Pass
 `--bench` for the larger parity cases and five batches of 64 timed launches
 per shape. Those batch timings include host submission and one stream sync.
+
+## RTX 4090 microbenchmarks
+
+CUPTI kernel durations in microseconds, median of five batches of 64 launches.
+Weights and activations were already on the device. The inputs were synthetic
+and used decode-sized dimensions plus two dense matrices larger than L2.
+All timed shapes also passed the bit-for-bit comparison. A second run
+reproduced each R=3 ratio within 0.02×.
+
+| Kernel and shape | Existing single | R=1 | R=2 | R=3 | R=3 / R=1 | R=3 / existing single |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Q8_0, 3072 × 2304 | 4.49 | 4.56 | 5.56 | 6.15 | 1.35× | 1.37× |
+| Q8_0, 51200 × 2304 | 135.32 | 135.40 | 137.12 | 140.24 | 1.04× | 1.04× |
+| F32, 2304 × 2304 | 6.71 | 6.76 | 7.24 | 7.96 | 1.18× | 1.19× |
+| F32, 16384 × 2048 | 142.65 | 142.72 | 143.31 | 143.92 | 1.01× | 1.01× |
+| NVFP4, 2304 × 1152, shared experts | 11.96 | 15.95 | 17.44 | 20.66 | 1.30× | 1.73× |
+| NVFP4, 2304 × 1152, partial overlap | 12.00 | 15.99 | 22.07 | 27.23 | 1.70× | 2.27× |
+| NVFP4, 2304 × 1152, disjoint experts | 12.00 | 16.00 | 24.89 | 34.61 | 2.16× | 2.89× |
+
+NVFP4 activates eight experts per vector. The shared, partial and disjoint
+R=3 cases read 8, 17 and 24 distinct experts, respectively. The new kernel's
+graph-compatible grid has capacity 24 at every R, so it issues some empty
+blocks when the union is smaller. The existing single kernel launches a
+grid of eight experts. A 64/128/256/512-thread sweep kept 128 threads as the
+best overall geometry across the overlap patterns.
