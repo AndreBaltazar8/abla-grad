@@ -652,7 +652,7 @@ private val cudaPrefillKernels = [
     CudaKernelSpec("matmul_nvfp4_grouped_rd", kernelPrefillMatmul, 128, 128, cudaArgsGrouped, cudaPrefillGroupedNvfp4Shape, 2, 4),
     CudaKernelSpec("tap_rows", kernelPrefillTapRows, 256, 256, cudaArgsTapRows, cudaPrefillTapRowsShape, 2),
     CudaKernelSpec("commit_select", kernelPrefillCommitSelect, 256, 256, cudaArgsCommitSelect, cudaPrefillCommitSelectShape),
-    CudaKernelSpec("moe_map_rows", kernelPrefillMoeMapRows, 1, 1, cudaArgsMoeMapRows, cudaPrefillMoeMapRowsShape),
+    CudaKernelSpec("moe_map_rows", kernelPrefillMoeMapRows, 1, 64, cudaArgsMoeMapRows, cudaPrefillMoeMapRowsShape),
     CudaKernelSpec("attention_prefill_tc_split", kernelPrefillAttentionTc, 1, 64, cudaArgsPrefillAttSplit, cudaPrefillAttentionSplitShape, 2),
     CudaKernelSpec("attention_prefill_merge", kernelPrefillAttentionTc, 1, 128, cudaArgsPrefillAttMerge, cudaPrefillAttentionMergeShape, 2),
     CudaKernelSpec("matmul_f32_exact_split", kernelPrefillMatmulF32ExactSplit, 16, 256, cudaArgsMatmulSplit, cudaPrefillExactSplitShape, 2),

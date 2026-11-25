@@ -1,0 +1,48 @@
+// Compare every expert and slot word with a first-occurrence host map.
+import "../../src/backend/backend.ab"
+import "device_test_support.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+trusted fun checkMap(backend: Backend, rows: int, step: int): bool {
+    val k = 8
+    val capacity = rows * k
+    val width = if (rows <= 3) 4 else 6
+    val bytes = width * capacity * 4
+    val host = nativeByteBuffer(bytes)
+    val address = nativePointerAddress(host.address)
+    val input = backend.allocate(capacity * 4) ?? return false
+    val output = backend.allocate(bytes) ?? return false
+    val experts: array<int> = []
+    val expected: array<int> = []
+    for (entry in 0 until capacity) {
+        expected.append(0)
+        for (word in 1 until width) expected.append(4294967295)
+    }
+    for (r in 0 until rows) for (slot in 0 until k) {
+        val expert = r * step + slot
+        ablaUnsafeStoreU32(nativePointerFromAddress(address + (r * k + slot) * 4), expert)
+        var entry = 0
+        while (entry < experts.size && experts[entry] != expert) entry = entry + 1
+        if (entry == experts.size) experts.append(expert)
+        expected[entry * width] = expert
+        expected[entry * width + 1 + r] = slot
+    }
+    if (!backend.upload(input, 0, address, capacity * 4)) return false
+    for (i in 0 until width * capacity) ablaUnsafeStoreU32(nativePointerFromAddress(address + i * 4), 12345)
+    if (!backend.upload(output, 0, address, bytes) ||
+        !backend.launch("moe_map_rows", kernelArgs().pointer(input).u32(rows).u32(k).pointer(output).u32(capacity), [1]) ||
+        !backend.download(output, 0, address, bytes)) return false
+    for (i in 0 until expected.size) {
+        if (ablaUnsafeLoadU32(nativePointerFromAddress(address + i * 4)) != expected[i]) return false
+    }
+    host.close()
+    true
+}
+
+fun verify(backend: Backend): bool {
+    for (rows in 1 until 6) for (step in [0, 3, 8]) if (!checkMap(backend, rows, step)) return false
+    true
+}
+
+fun main: int = runCudaKernelTest("ordered R-row expert map", verify)
