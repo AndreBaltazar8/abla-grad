@@ -615,7 +615,7 @@ private val cudaKernels = [
     CudaKernelSpec("gather_row_f32", kernelMatvecF32, 128, 128, cudaGatherArguments, cudaGatherShape),
     CudaKernelSpec("gather_row_q4_k", kernelMatvecK, 128, 128, cudaGatherArguments, cudaKGatherShape),
     CudaKernelSpec("gather_row_q6_k", kernelMatvecK, 128, 128, cudaGatherArguments, cudaKGatherShape),
-    CudaKernelSpec(ablaRmsnormKernel, kernelRmsnorm, 1, 128, cudaRmsnormArguments, cudaRmsnormShape, nullablePointer = 1),
+    CudaKernelSpec(ablaRmsnormKernel, kernelRmsnorm, 1, 128, cudaRmsnormArguments, cudaRmsnormShape, nullablePointer = 1, abla = true),
     CudaKernelSpec("rmsnorm_three", kernelRmsnorm, 1, 128, cudaRmsnormThreeArguments, cudaRmsnormThreeShape),
     CudaKernelSpec("rope", kernelRope, 128, 128, cudaRopeArguments, cudaRopeShape, nullablePointer = 1),
     CudaKernelSpec("attention_decode", kernelAttentionDecode, 1, 256, cudaAttentionArguments, cudaAttentionShape),

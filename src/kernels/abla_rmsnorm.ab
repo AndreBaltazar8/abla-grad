@@ -4,38 +4,126 @@ import "abla/kernel"
 // rmsnorm as an Abla `@kernel` (ablac #1233), launched by the "rmsnorm" spec in src/backend/cuda.ab in place of the CUDA C
 // one in rmsnorm.ab. One group of 128 threads per row of `n` values at `x` and `y` (row r at r * n); `w` may be empty
 // (a null pointer), then the row is only scaled. It computes the same bits as rmsnorm.ab's rmsnorm_row, so the CUDA C
-// rmsnorm_three still matches it: each thread sums its strided squares with fma, the halving tree adds the 128 sums in
-// the order of rmsnorm_factor's (s[l] + s[l+64]) + (s[l+32] + s[l+96]) and shuffle-down steps, and the factor is
-// rsqrt.approx (rsqrtf).
+// rmsnorm_three still matches it: each thread sums its strided squares with fma; the 128 sums are combined as
+// rmsnorm_factor does, (s[l] + s[l+64]) + (s[l+32] + s[l+96]) in the first subgroup and then its shuffle steps (a
+// subgroup sum gives lane 0 the same bits); and the factor is rsqrt.approx (rsqrtf).
 // The launch name of this kernel: the CudaKernelSpec that runs it, and its PTX entry (the function's own name).
 val ablaRmsnormKernel = "rmsnorm"
 
+// Element `index` of `buffer`, unchecked when `inside` (its caller has shown index < size()), else checked.
+private trusted fun rmsnormLoad(buffer: KernelF32Buffer, index: int, inside: bool): f32 =
+    if (inside) buffer.loadUnchecked(index) else buffer.load(index)
+
+// y = x * factor (times w when weighted) at elements at, at + 128, ..., at + 640 of the row at `base`: the six x loads
+// (and w loads) first, then the six stores. Its caller has shown the row inside x and w.
+private trusted fun rmsnormScale6(x: KernelF32Buffer, w: KernelF32Buffer, y: KernelF32Buffer, base: int, at: int, factor: f32,
+    weighted: bool) {
+    val a = x.loadUnchecked(base + at)
+    val b = x.loadUnchecked(base + at + 128)
+    val c = x.loadUnchecked(base + at + 256)
+    val d = x.loadUnchecked(base + at + 384)
+    val e = x.loadUnchecked(base + at + 512)
+    val f = x.loadUnchecked(base + at + 640)
+    if (weighted) {
+        val wa = w.loadUnchecked(at)
+        val wb = w.loadUnchecked(at + 128)
+        val wc = w.loadUnchecked(at + 256)
+        val wd = w.loadUnchecked(at + 384)
+        val we = w.loadUnchecked(at + 512)
+        val wf = w.loadUnchecked(at + 640)
+        y.store(base + at, (a * factor) * wa)
+        y.store(base + at + 128, (b * factor) * wb)
+        y.store(base + at + 256, (c * factor) * wc)
+        y.store(base + at + 384, (d * factor) * wd)
+        y.store(base + at + 512, (e * factor) * we)
+        y.store(base + at + 640, (f * factor) * wf)
+    } else {
+        y.store(base + at, a * factor)
+        y.store(base + at + 128, b * factor)
+        y.store(base + at + 256, c * factor)
+        y.store(base + at + 384, d * factor)
+        y.store(base + at + 512, e * factor)
+        y.store(base + at + 640, f * factor)
+    }
+}
+
+// The row's loads are on the unchecked fast path (#143) when the whole row is inside `x` and `w` covers the row (or is
+// empty): checked once here, so the loop's loads can be issued together instead of one branch each.
 @kernel
 fun rmsnorm(x: KernelF32Buffer, w: KernelF32Buffer, y: KernelF32Buffer, n: int, eps: f32) {
     val sums = kernelSharedF32(128)
     val lane = kernelLocalId()
     val size = kernelGroupSize()
     val base = kernelGroupId() * n
+    val inside = n >= 0 && base >= 0 && base + n <= x.size()
+    val weighted = w.size() > 0
+    val weightsInside = !weighted || n <= w.size()
     var sum = f32(0.0)
     var i = lane
+    // Inkling's rows (rmsnorm.ab's rmsnorm_2304): a constant 18 elements per thread, so the loop unrolls and the 18 loads
+    // are in flight together.
+    val row2304 = inside && n == 2304 && size == 128
+    if (row2304) {
+        var k = 0
+        while (k < 18) {
+            val value = rmsnormLoad(x, base + lane + k * 128, true)
+            sum = kernelFma(value, value, sum)
+            k = k + 1
+        }
+        i = n
+    }
+    if (inside) {
+        // Four loads in flight before their fmas (the same fmas in the same order).
+        while (i + 3 * size < n) {
+            val a = rmsnormLoad(x, base + i, true)
+            val b = rmsnormLoad(x, base + i + size, true)
+            val c = rmsnormLoad(x, base + i + 2 * size, true)
+            val d = rmsnormLoad(x, base + i + 3 * size, true)
+            sum = kernelFma(a, a, sum)
+            sum = kernelFma(b, b, sum)
+            sum = kernelFma(c, c, sum)
+            sum = kernelFma(d, d, sum)
+            i = i + 4 * size
+        }
+    }
     while (i < n) {
-        val value = x.load(base + i)
+        val value = rmsnormLoad(x, base + i, inside)
         sum = kernelFma(value, value, sum)
         i = i + size
     }
     sums.store(lane, sum)
     kernelBarrier()
-    var width = size / 2
-    while (width > 0) {
-        if (lane < width) sums.store(lane, sums.load(lane) + sums.load(lane + width))
-        kernelBarrier()
-        width = width / 2
+    if (size == 128 && kernelSubgroupSize() == 32) {
+        // CUDA's rmsnorm_factor: one barrier, then the first subgroup finishes the sum.
+        if (lane < 32) {
+            val combined = kernelSubgroupSum((sums.load(lane) + sums.load(lane + 64)) + (sums.load(lane + 32) + sums.load(lane + 96)))
+            if (lane == 0) sums.store(0, kernelRsqrt(combined / f32FromInt(n) + eps))
+        }
+    } else {
+        // Any other group (the CPU backend's groups of one): a halving tree in the same order.
+        var width = size / 2
+        while (width > 0) {
+            if (lane < width) sums.store(lane, sums.load(lane) + sums.load(lane + width))
+            kernelBarrier()
+            width = width / 2
+        }
+        if (lane == 0) sums.store(0, kernelRsqrt(sums.load(0) / f32FromInt(n) + eps))
     }
-    val factor = kernelRsqrt(sums.load(0) / f32FromInt(n) + eps)
+    kernelBarrier()
+    val factor = sums.load(0)
     i = lane
+    if (row2304 && weightsInside) {
+        // Six elements' loads in flight, then their stores (y may be x: each thread rewrites only what it read).
+        var k = 0
+        while (k < 18) {
+            rmsnormScale6(x, w, y, base, lane + k * 128, factor, weighted)
+            k = k + 6
+        }
+        i = n
+    }
     while (i < n) {
-        val value = x.load(base + i) * factor
-        y.store(base + i, if (w.size() > 0) value * w.load(i) else value)
+        val value = rmsnormLoad(x, base + i, inside) * factor
+        y.store(base + i, if (weighted) value * rmsnormLoad(w, i, weightsInside) else value)
         i = i + size
     }
 }
