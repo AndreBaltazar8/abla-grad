@@ -36,6 +36,27 @@ Raw benchmark samples are in
 `~/src/abla-grad-oracle/artifacts/bench-depth-33aeb17/` and
 `~/src/abla-grad-oracle/unsloth-b12649-mix-c7059d6/`.
 
+## Prefill by prompt length
+
+Prompt processing in tokens/s on the RTX 4090 with Inkling UD-Q4_K_M.
+
+| Engine or expert path | pp512 | pp2048 | pp4096 |
+|---|---:|---:|---:|
+| llama.cpp mainline `33aeb17` | 3506.31 | 2625.59 | 2349.93 |
+| Unsloth `b12649-mix-c7059d6` | 5474.87 | 4545.45 | 4068.31 |
+| abla-grad `515ce8f`, f16 experts | 4941.15 | 4838.67 | 4766.66 |
+| abla-grad `515ce8f`, default int8 experts | 5547.60 | 5377.98 | 5259.57 |
+
+The llama.cpp rows are three-run means from `llama-bench -p N -n 0`
+with batch and microbatch 512 and F16 KV. Their pp512 values come from
+the earlier reference runs. Both abla-grad rows use F32 KV and report
+the second timed sample from `prefill-bench --tokens N --chunk 512 --reps 2`.
+The f16 expert row adds `--no-int8-experts`. Each benchmark generates
+its own synthetic input IDs. New runs held the GPU lock separately
+with CPU affinity 24–27.
+
+Raw samples and commands are in `~/src/abla-grad-oracle/prefill-length/`.
+
 ## Decode and speculation across cache depths
 
 Throughput on the RTX 4090 in tokens/s on the pinned Inkling UD-Q4_K_M.
