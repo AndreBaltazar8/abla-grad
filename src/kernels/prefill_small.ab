@@ -196,30 +196,51 @@ extern "C" __global__ void kv_store_batch(const float *k, const float *v, float 
 val kernelPrefillMoeRoute = """
 extern "C" __global__ void moe_route_batch(const float *logits, const float *bias, unsigned nExpert, unsigned k, unsigned *ids, float *weights,
                                            float normEps, float weightScale, unsigned tokens) {
-    unsigned t = blockIdx.x * blockDim.x + threadIdx.x;
+    // one warp per token, four tokens per block
+    __shared__ float prob[4][256];
+    __shared__ float sel[4][256];
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned slot = threadIdx.x >> 5;
+    const unsigned t = blockIdx.x * 4 + slot;
     if (t >= tokens || nExpert > 256 || k > 64) return;
     const float *row = logits + static_cast<unsigned long long>(t) * nExpert;
-    float prob[256];
-    float sel[256];
-    bool used[256];
-    for (unsigned i = 0; i < nExpert; ++i) {
-        prob[i] = 1.0f / (1.0f + expf(-row[i]));
-        sel[i] = prob[i] + (bias ? bias[i] : 0.0f);
-        used[i] = false;
+    for (unsigned i = lane; i < nExpert; i += 32) {
+        float p = 1.0f / (1.0f + expf(-row[i]));
+        prob[slot][i] = p;
+        sel[slot][i] = p + (bias ? bias[i] : 0.0f);
     }
-    float chosen[64];
+    __syncwarp();
     float sum = 0.0f;
+    float chosen[64];
     for (unsigned s = 0; s < k; ++s) {
-        int best = -1;
-        for (unsigned i = 0; i < nExpert; ++i) {
-            if (!used[i] && (best < 0 || sel[i] > sel[best])) best = int(i);
+        // best unused expert of this lane's: highest sel, lowest index on ties; then across the warp
+        float best = -3.0e38f;
+        int bestIndex = 0x7fffffff;
+        for (unsigned i = lane; i < nExpert; i += 32) {
+            float v = sel[slot][i];
+            if (v > best || (v == best && int(i) < bestIndex)) {
+                best = v;
+                bestIndex = int(i);
+            }
         }
-        used[best] = true;
-        ids[static_cast<unsigned long long>(t) * k + s] = unsigned(best);
-        chosen[s] = prob[best];
-        sum += prob[best];
+        #pragma unroll
+        for (int width = 16; width; width >>= 1) {
+            float otherBest = __shfl_xor_sync(0xffffffffu, best, width);
+            int otherIndex = __shfl_xor_sync(0xffffffffu, bestIndex, width);
+            if (otherBest > best || (otherBest == best && otherIndex < bestIndex)) {
+                best = otherBest;
+                bestIndex = otherIndex;
+            }
+        }
+        if (lane == 0) sel[slot][bestIndex] = -3.4e38f;   // used (a real sel is never below this)
+        __syncwarp();
+        chosen[s] = prob[slot][bestIndex];
+        sum += chosen[s];
+        if (lane == 0) ids[static_cast<unsigned long long>(t) * k + s] = unsigned(bestIndex);
     }
-    for (unsigned s = 0; s < k; ++s) weights[static_cast<unsigned long long>(t) * k + s] = chosen[s] / (sum + normEps) * weightScale;
+    if (lane == 0) {
+        for (unsigned s = 0; s < k; ++s) weights[static_cast<unsigned long long>(t) * k + s] = chosen[s] / (sum + normEps) * weightScale;
+    }
 }
 """
 
