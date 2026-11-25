@@ -350,14 +350,6 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     val k = ws.o("k")
     val v = ws.o("v")
     val r = ws.o("r")
-    ok = this.denseX5(backend, ws, ip, normedQ, normedK, normedV, q, kRaw, vRaw, r, ws.o("gate"), tokens)
-    if (!isSwa) {
-        ok = ok && this.dense(backend, ws, "blk.$ip.attn_k_conv_proj.weight", normedK, ws.o("kDyn"), tokens)
-        ok = ok && this.dense(backend, ws, "blk.$ip.attn_v_conv_proj.weight", normedV, ws.o("vDyn"), tokens)
-    }
-    if (!ok) return -1
-
-    // short convolutions on K and V
     val historyBytes = (c.nConv - 1) * (2 * kvDim + 2 * n) * 4
     val historyBase = visit * historyBytes
     val kHistory = historyBase
@@ -368,12 +360,59 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     val plainScale = f64ToF32(1.0 / sqrt(f64FromInt(c.nConv + 1)))
     val kConv = this.wr("blk.$ip.attn_k_conv.weight")
     val vConv = this.wr("blk.$ip.attn_v_conv.weight")
+    val qClip = this.wr("blk.$ip.attn_q_clip.weight")
+    val relClip = this.wr("blk.$ip.attn_rel_clip.weight")
+    val sinks = ws.o("sinks")
+    val table = ws.o("table")
+    val relBias = this.wr("blk.$ip.attn_rel_bias.weight")
+    if (prefillVerifyRows > 0) {
+        // verification (recorded): the chains q; k; v; the relative table with the sinks; the output gate only read the norm outputs, so they run as parallel branches
+        ok = backend.fork(4)
+        ok = ok && this.dense(backend, ws, "blk.$ip.attn_q.weight", normedQ, q, tokens)
+        ok = ok && backend.launch("l2clip_rows", kernelArgs().pointer(ws.buffer, q).pointer(this.arena, qClip.offset).pointer(ws.buffer, q)
+            .u32(tokens * c.nHead).u32(c.headDim).f32(c.qkClip).u32(c.nHead), [tokens * c.nHead])
+        ok = ok && backend.branch(1)
+        ok = ok && this.dense(backend, ws, "blk.$ip.attn_k.weight", normedK, kRaw, tokens)
+        if (!isSwa) ok = ok && this.dense(backend, ws, "blk.$ip.attn_k_conv_proj.weight", normedK, ws.o("kDyn"), tokens)
+        ok = ok && this.convRows(backend, ws, kRaw, kHistory, kConv.offset, ws.o("kDyn"), !isSwa, k, kvDim, c.nHeadKv, dynScale, tokens)
+        ok = ok && backend.launch("l2clip_rows", kernelArgs().pointer(ws.buffer, k).u64(0).pointer(ws.buffer, k)
+            .u32(tokens * c.nHeadKv).u32(c.headDim).f32(c.qkClip).u32(1), [tokens * c.nHeadKv])
+        ok = ok && backend.branch(2)
+        ok = ok && this.dense(backend, ws, "blk.$ip.attn_v.weight", normedV, vRaw, tokens)
+        if (!isSwa) ok = ok && this.dense(backend, ws, "blk.$ip.attn_v_conv_proj.weight", normedV, ws.o("vDyn"), tokens)
+        ok = ok && this.convRows(backend, ws, vRaw, vHistory, vConv.offset, ws.o("vDyn"), !isSwa, v, kvDim, c.nHeadKv, dynScale, tokens)
+        ok = ok && opRmsNormPlain(backend, ws.buffer, v, ws.buffer, v, c.headDim, c.rmsEps, tokens * c.nHeadKv)
+        ok = ok && backend.branch(3)
+        ok = ok && this.dense(backend, ws, "blk.$ip.attn_rel.weight", normedQ, r, tokens)
+        ok = ok && backend.launch("l2clip_rows", kernelArgs().pointer(ws.buffer, r).pointer(this.arena, relClip.offset).pointer(ws.buffer, r)
+            .u32(tokens * c.nHead).u32(c.nRel).f32(c.relClip).u32(c.nHead), [tokens * c.nHead])
+        if (!isSwa) {
+            ok = ok && backend.launch("scale_tau_rows", kernelArgs().pointer(ws.buffer, r).u32(c.nRel * c.nHead).pointer(posBuf, posOff).u32(c.logFloor).f32(c.logAlpha).u32(tokens),
+                [c.nRel * c.nHead, tokens])
+        }
+        ok = ok && this.dense(backend, ws, "blk.$ip.attn_sink_proj.weight", normedQ, sinks, tokens)
+        ok = ok && backend.launch("rel_table_rows", kernelArgs().pointer(this.arena, relBias.offset).pointer(ws.buffer, r).pointer(ws.buffer, sinks)
+            .pointer(ws.buffer, table).u32(c.nRel).u32(extent).u32(tokens * c.nHead), [extent + 1, tokens * c.nHead])
+        ok = ok && backend.branch(4)
+        ok = ok && this.dense(backend, ws, "blk.$ip.attn_gate.weight", normedQ, ws.o("gate"), tokens)
+        ok = ok && backend.branch(0)
+        if (!isSwa) {
+            ok = ok && backend.launch("scale_tau_rows", kernelArgs().pointer(ws.buffer, q).u32(qDim).pointer(posBuf, posOff).u32(c.logFloor).f32(c.logAlpha).u32(tokens), [qDim, tokens])
+        }
+        ok = ok && backend.join()
+    } else {
+    ok = this.denseX5(backend, ws, ip, normedQ, normedK, normedV, q, kRaw, vRaw, r, ws.o("gate"), tokens)
+    if (!isSwa) {
+        ok = ok && this.dense(backend, ws, "blk.$ip.attn_k_conv_proj.weight", normedK, ws.o("kDyn"), tokens)
+        ok = ok && this.dense(backend, ws, "blk.$ip.attn_v_conv_proj.weight", normedV, ws.o("vDyn"), tokens)
+    }
+    if (!ok) return -1
+
+    // short convolutions on K and V
     ok = this.convRows(backend, ws, kRaw, kHistory, kConv.offset, ws.o("kDyn"), !isSwa, k, kvDim, c.nHeadKv, dynScale, tokens)
     ok = ok && this.convRows(backend, ws, vRaw, vHistory, vConv.offset, ws.o("vDyn"), !isSwa, v, kvDim, c.nHeadKv, dynScale, tokens)
 
     // clip / normalize
-    val qClip = this.wr("blk.$ip.attn_q_clip.weight")
-    val relClip = this.wr("blk.$ip.attn_rel_clip.weight")
     ok = ok && backend.launch("l2clip_rows", kernelArgs().pointer(ws.buffer, q).pointer(this.arena, qClip.offset).pointer(ws.buffer, q)
         .u32(tokens * c.nHead).u32(c.headDim).f32(c.qkClip).u32(c.nHead), [tokens * c.nHead])
     ok = ok && backend.launch("l2clip_rows", kernelArgs().pointer(ws.buffer, k).u64(0).pointer(ws.buffer, k)
@@ -388,13 +427,13 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
     }
     if (!ok) return -1
 
-    // relative-position bias table (sinks folded in), KV store, attention
-    val sinks = ws.o("sinks")
-    val table = ws.o("table")
-    val relBias = this.wr("blk.$ip.attn_rel_bias.weight")
+    // relative-position bias table (sinks folded in)
     ok = this.dense(backend, ws, "blk.$ip.attn_sink_proj.weight", normedQ, sinks, tokens)
     ok = ok && backend.launch("rel_table_rows", kernelArgs().pointer(this.arena, relBias.offset).pointer(ws.buffer, r).pointer(ws.buffer, sinks)
         .pointer(ws.buffer, table).u32(c.nRel).u32(extent).u32(tokens * c.nHead), [extent + 1, tokens * c.nHead])
+    }
+    if (!ok) return -1
+    // KV store, attention
     val layerCacheBytes = c.nHeadKv * this.maxCtx * c.headDim * 4
     ok = ok && backend.launch("kv_store_batch_ptr", kernelArgs().pointer(ws.buffer, k).pointer(ws.buffer, v).pointer(this.kCache, visit * layerCacheBytes)
         .pointer(this.vCache, visit * layerCacheBytes).pointer(posBuf, posOff).u32(c.nHeadKv).u32(c.headDim).u32(this.maxCtx).u32(tokens), [kvDim, tokens])
