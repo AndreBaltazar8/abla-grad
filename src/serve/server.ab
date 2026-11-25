@@ -26,11 +26,11 @@ import "template.ab"
 import "outparse.ab"
 import "openai.ab"
 
-// The context when --ctx is not given: what the free device memory allows. From 65536 positions on the target keeps its cache in F16/Q8 (8192 bytes per
-// position, measured at 65536 and 131072); shorter contexts use the F32 ring (80000 bytes per position with the drafter).
 // Speculation stops paying near this prompt length (replay of the opencode capture: speculation 136.9 / 116.3 tok/s at 19.5k / 38k tokens, plain 124.9 / 115.6;
 // at 56k and 75k plain wins 110.4 / 105.6 against 106.3 / 101.7): longer prompts decode plain.
 private val SERVE_PLAIN_FROM = 45000
+// The long-session estimate (measured at 65536 and 131072) includes compact drafter K/V and rolling taps.
+// Shorter sessions use the conservative estimate for the full drafter cache and taps.
 private val SERVE_MAX_CTX = 131072
 private val SERVE_LONG_FROM = 65536
 private val SERVE_LONG_BYTES_PER_POSITION = 8192

@@ -17,7 +17,7 @@ The pinned model visits 48 layers, with eight global and forty sliding visits.
 Global KV switches from F16 to block Q8 at 8,192 allocated positions. The
 grouped decode kernel shares KV across three query heads. Sliding attention
 sees 1,024 keys and uses a 1,536-slot ring for long contexts, switching from
-F32 to F16 at 65,536 allocated positions. Physical ring offsets wrap;
+F32 to F16 at 8,192 allocated positions. Physical ring offsets wrap;
 logical positions still drive masking and relative bias.
 
 [Prefill and verification](../src/model/inkling_prefill.ab) operate on rows in

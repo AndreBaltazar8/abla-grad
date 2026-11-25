@@ -181,7 +181,8 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
     val visits = inklingVisits(c)
     val scratch = backend.allocate(map.total)
     val groupedShape = c.nHead == 3 * c.nHeadKv && c.headDim == 128
-    val autoQuantize = quantizeKv || (!halfKv && (maxCtx > INKLING_Q8_KV_CONTEXT || (groupedShape && maxCtx >= INKLING_GROUPED_CONTEXT)))
+    val groupedContext = groupedShape && maxCtx >= INKLING_GROUPED_CONTEXT
+    val autoQuantize = quantizeKv || (!halfKv && (maxCtx > INKLING_Q8_KV_CONTEXT || groupedContext))
     val bits = if (globalKvBits != 0) globalKvBits else if (autoQuantize && c.headDim % 32 == 0) 8 else 16
     if ((bits != 8 && bits != 16 && bits != 32) || (bits == 8 && c.headDim % 32 != 0)) {
         inklingError = "unsupported global K/V precision for this head dimension"
@@ -189,7 +190,7 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
     }
     val ringVisits: array<bool> = []
     var hasSlidingRing = false
-    val kvElementBytes = if (quantizeKv || halfKv || maxCtx >= INKLING_HALF_KV_CONTEXT) 2 else 4
+    val kvElementBytes = if (quantizeKv || halfKv || groupedContext || maxCtx >= INKLING_HALF_KV_CONTEXT) 2 else 4
     val cacheOffsets = [0]
     val core = c.loopEnd - c.loopStart
     for (visit in 0 until visits) {
