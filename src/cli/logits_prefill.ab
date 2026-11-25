@@ -57,6 +57,8 @@ fun cmdPrefillBench(args: array<string>): int {
     var chunk = 512
     var reps = 3
     var decode = false
+    var profile = false
+    var times = false
     var path = ""
     var index = 0
     while (index < args.size) {
@@ -72,6 +74,12 @@ fun cmdPrefillBench(args: array<string>): int {
         } else if (args[index] == "--moe-tile" && index + 1 < args.size) {
             setPrefillMoeTile(args[index + 1].parseInt() ?? 32)
             index = index + 2
+        } else if (args[index] == "--times") {
+            times = true
+            index = index + 1
+        } else if (args[index] == "--profile") {
+            profile = true
+            index = index + 1
         } else if (args[index] == "--decode") {
             decode = true
             index = index + 1
@@ -102,6 +110,59 @@ fun cmdPrefillBench(args: array<string>): int {
     if (!decode && ws == null) {
         println("prefill-bench: ${inklingPrefillLastError()}")
         return 1
+    }
+    if (times && ws != null) {
+        // Wall time of every kernel family in one prefill, each launch bracketed by stream syncs (launch overhead inflates the small kernels a little).
+        if (!model.reset(backend) || !model.prefill(backend, ws, ids, 0) || !backend.synchronize()) return 1
+        cudaDebugAlways = true
+        cudaTimeKernels = true
+        if (!model.reset(backend) || !model.prefill(backend, ws, ids, 0) || !backend.synchronize()) return 1
+        cudaDebugAlways = false
+        cudaTimeKernels = false
+        var total = 0
+        for (name in cudaKernelNanos.keys()) total = total + (cudaKernelNanos.get(name) ?? 0)
+        for (name in cudaKernelNanos.keys()) {
+            val ns = cudaKernelNanos.get(name) ?? 0
+            println("prefill-bench times: $name x${cudaLaunchCounts.get(name) ?? 0}: ${f64FromInt(ns) / 1000000.0} ms (${f64FromInt(ns) * 100.0 / f64FromInt(total)}%)")
+        }
+        println("prefill-bench times: total ${f64FromInt(total) / 1000000.0} ms")
+        return 0
+    }
+    if (profile && ws != null) {
+        // Price every kernel family: count the launches of one prefill, then time the prefill with each family left out (output is garbage, the sum of the deltas
+        // approximates each family's share of the run; big kernels do not overlap so the deltas are close to the kernels' own times).
+        cudaDebugAlways = true
+        if (!model.reset(backend) || !model.prefill(backend, ws, ids, 0) || !backend.synchronize()) return 1
+        val names: array<string> = []
+        val counts: array<int> = []
+        for (name in cudaLaunchCounts.keys()) {
+            names.append(name)
+            counts.append(cudaLaunchCounts.get(name) ?? 0)
+        }
+        var base = 1000000.0
+        for (rep in 0 until 3) {
+            if (!model.reset(backend)) return 1
+            val t0 = monotonicNanoseconds()
+            if (!model.prefill(backend, ws, ids, 0) || !backend.synchronize()) return 1
+            val ms = f64FromInt(monotonicNanoseconds() - t0) / 1000000.0
+            if (ms < base) base = ms
+        }
+        println("prefill-bench profile: baseline $base ms for $tokens tokens (${f64FromInt(tokens) / base * 1000.0} tok/s)")
+        for (i in 0 until names.size) {
+            cudaSkipSingle = names[i]
+            var best = 1000000.0
+            for (rep in 0 until 2) {
+                if (!model.reset(backend)) return 1
+                val t0 = monotonicNanoseconds()
+                if (!model.prefill(backend, ws, ids, 0) || !backend.synchronize()) return 1
+                val ms = f64FromInt(monotonicNanoseconds() - t0) / 1000000.0
+                if (ms < best) best = ms
+            }
+            println("prefill-bench profile: ${names[i]} x${counts[i]}: ${base - best} ms")
+        }
+        cudaSkipSingle = ""
+        cudaDebugAlways = false
+        return 0
     }
     for (rep in 0 until reps + 1) {
         if (!model.reset(backend)) return 1

@@ -17,6 +17,7 @@ import "abla/crypto"
 import "abla/bytes"
 import "abla/fs"
 import "abla/process/environment"
+import "abla/process/time"
 import "../kernels/rmsnorm.ab"
 import "../kernels/rope.ab"
 import "../kernels/attention_decode.ab"
@@ -65,6 +66,12 @@ val cudaLaunchCounts: Map<string, int> = Map()
 
 // Debug (decode-bench --skip a,b): launches of these kernels are left out of a recording, to price their share of the critical path (the output is garbage).
 val cudaSkipKernels: array<string> = []
+// Debug: apply the skip list to every launch (not only recordings) and count every launch (prefill-bench --profile).
+var cudaDebugAlways = false
+var cudaSkipSingle = ""
+// Debug: when set (with cudaDebugAlways), every launch is bracketed by stream synchronizations and its wall time added to cudaKernelNanos[kernel].
+var cudaTimeKernels = false
+val cudaKernelNanos: Map<string, int> = Map()
 
 fun cudaLastError(): string = cudaError
 
@@ -992,7 +999,8 @@ class CudaBackend(
     }
 
     trusted fun launch(kernel: string, args: KernelArgs, problem: array<int>): bool {
-        if (this.recording && cudaSkipKernels.size > 0) {
+        if (cudaDebugAlways && cudaSkipSingle != "" && cudaSkipSingle == kernel) return true
+        if ((this.recording || cudaDebugAlways) && cudaSkipKernels.size > 0) {
             for (skipped in cudaSkipKernels) if (skipped == kernel) return true
         }
         val spec = cudaKernelSpec(kernel)
@@ -1018,11 +1026,21 @@ class CudaBackend(
             }
             val gridX = u32((problem[0] + spec.itemsPerBlock - 1) / spec.itemsPerBlock)
             val gridY = u32(if (spec.problemDimensions == 2) problem[1] else 1)
+            var timed = 0
+            if (cudaTimeKernels) {
+                cuStreamSynchronize(nativePointerFromAddress(this.stream))
+                timed = monotonicNanoseconds()
+            }
             ok = cudaStatus(cuLaunchKernel(nativePointerFromAddress(function.handle),
                 gridX, gridY, 1, u32(spec.blockX), 1, 1, 0,
                 nativePointerFromAddress(if (this.currentBranch == 0) this.stream else this.sideStreams[this.currentBranch - 1]),
                 pointers.address, nativeNullPointer()), "cuLaunchKernel")
+            if (cudaTimeKernels) {
+                cuStreamSynchronize(nativePointerFromAddress(this.stream))
+                cudaKernelNanos.set(kernel, (cudaKernelNanos.get(kernel) ?? 0) + (monotonicNanoseconds() - timed))
+            }
         }
+        if (ok && cudaDebugAlways) cudaLaunchCounts.set(kernel, (cudaLaunchCounts.get(kernel) ?? 0) + 1)
         if (ok && this.recording) {
             this.recordedLaunches += 1
             cudaLaunchCounts.set(kernel, (cudaLaunchCounts.get(kernel) ?? 0) + 1)
