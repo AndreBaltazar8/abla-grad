@@ -376,3 +376,78 @@ step gate counted 28 rows outside the short-prompt limits on 05, with
 `verify-check` covered each accepted length from zero through four.
 At prompt 05, forty windows starting at position 200 produced zero
 argmax differences from plain decode at both three and five rows.
+
+### Which verification changes transfer to plain decode
+
+These graph-mode screens use the 16- and 513-token fixed prefixes in
+`~/src/abla-grad-oracle/profile-9a46740/`, 128 generated tokens,
+context capacity 700, and `8db7496` as the implementation baseline.
+All arms generated the same 128 IDs at each depth. The figures are
+single runs unless the row specifies a median. They price separate
+experiments and do not add to the released throughput.
+
+| Plain graph | d15 tok/s | d512 tok/s |
+|---|---:|---:|
+| Five-change baseline | 132.81 | 127.96 |
+| One block per small BF16 projection output | 132.73 | 127.91 |
+| Fixed eight-slot NVFP4 down projection | 124.20 | 126.78 |
+| Four-tap specialization of the existing fused convolutions | 135.13 | 129.78 |
+| All three transfers together | 134.70 | 130.30 |
+| Paired norms plus fused gain/forget/message mix | 135.66 | 129.68 |
+| Generated norm/down controller plus fused gain/forget/message mix | 137.83 | 131.72 |
+
+The one-row route already writes the selected IDs straight to the expert
+matvec. There is no union map or extra history snapshot to remove.
+The eight-slot gate/up already includes SiTU. The four-tap screen
+specializes the loops inside the existing plain convolution and residual
+kernels. The small-row LM head handles multiple activations sharing a
+weight read, an opportunity absent at one row.
+
+The strongest measured plain change is fusing the loop-controller work
+on the three existing attention lanes and the FFN lane. The generated
+norm/down and the gain/forget/mix tail together remove 384 launches
+per token, with 1,571 remaining. The two-depth result is well short of
+the proposed 150–165 tok/s. At d15, 150 tok/s still requires removing
+0.59 ms/token from the fastest observed arm. The standalone cooperative
+controller prototype saved only 0.94 µs per invocation at one row and
+ran slower at five rows. Its best plain saving over all 96 controllers
+would be about 0.09 ms/token before accounting for branch overlap.
+
+Replaying the generated norm/down kernel from `b7d402c` by itself, on
+the current three-lane schedule, gave medians of 135.95 and 130.17 tok/s
+across three runs per depth. The corresponding baseline medians were
+132.37 and 127.78. The kernel matched the separate operations bit for bit
+on its 64-output fixture. Both the norm/down-only build and the combined
+controller build reproduced every original FP32 logit on the 324
+short-gate rows in step mode.
+The combined controller also reproduced the original step logits byte for byte on both long prompts (5,924 rows).
+
+### Fixed-four proposal shortlist and controller experiment
+
+Two more fixed-four runs used the same 512-token museum and fog prompts.
+Within groups of 32 vocabulary IDs, DSpark evaluated the Markov
+projection for the four highest base-plus-bias scores. The target still
+verified the proposed tokens. The verify graph also used a fused
+controller tail, a 256-thread controller-down reduction and 20 expert
+grid entries per pass with a strided loop over the remaining entries.
+
+| Prompt | Timed tokens | Cycles | Milliseconds per full cycle, two runs | Tok/s, two runs |
+|---|---:|---:|---:|---:|
+| Museum | 511 | 212 | 14.69, 14.62 | 164.1, 164.8 |
+| Fog | 511 | 260 | 14.54, 14.76 | 135.2, 133.1 |
+
+Both repeats matched the 512 output IDs from the shortlist-only build on
+each prompt. Fog took 260 cycles with the shortlist, versus 258 with the
+released full-proposal build. Restricting candidates can change draft
+acceptance. The corrected compact expert grid alone removed about
+0.11 ms from the isolated verifier. An earlier grid probe accumulated
+the wrong expert address on its second iteration; its timings have been
+excluded. The corrected kernel passed the independent multi-expert
+comparison. The frozen executable and patch are `combo-correct` and
+`combo-fixed.patch` in the experiment archive.
+
+The combined fixed-four diagnostic passed `make test-host`, `verify-check`,
+the two- and four-proposal spec gates on 01–05, the short step and
+chunk-256 gates, and the long step gates on 05 and 06. These figures
+describe the archived experimental build. The released five-change
+throughput appears in the adaptive table above.
