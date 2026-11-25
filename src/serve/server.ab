@@ -24,7 +24,7 @@ import "template.ab"
 import "outparse.ab"
 import "openai.ab"
 
-private val SERVE_DEFAULT_CTX = 12288
+private val SERVE_DEFAULT_CTX = 10240
 private val SERVE_DEFAULT_MAX_TOKENS = 4096
 
 private fun serveDrafterPath(model: string): string {
@@ -201,6 +201,11 @@ private fun serveChat(
     eprintln("[serve] ${tokens.size} prompt tokens (${kept} reused), ${stats.generated} generated, first token after ${ttft} s, ${f64FromInt(stats.generated) / (if (decodeSeconds > 0.0) decodeSeconds else 1.0)} tok/s, finish $finish${if (streaming) ", streamed" else ""}")
 }
 
+private fun serveFail(message: string): int {
+    eprintln("serve: $message")
+    1
+}
+
 fun cmdServe(args: array<string>): int {
     var modelPath = ""
     var tokenizerPath = ""
@@ -252,8 +257,8 @@ fun cmdServe(args: array<string>): int {
         eprintln("serve: only Inkling models are supported (architecture '$architecture')")
         return 1
     }
-    val config = inklingConfigFrom(file) ?? return 1
-    val tokenizer = (if (tokenizerPath == "") tokenizerFromGguf(file) else tokenizerFromJson(tokenizerPath)) ?? return 1
+    val config = inklingConfigFrom(file) ?? return serveFail("the model configuration is not usable: ${inklingConfigLastError()}")
+    val tokenizer = (if (tokenizerPath == "") tokenizerFromGguf(file) else tokenizerFromJson(tokenizerPath)) ?? return serveFail("the tokenizer could not be loaded: ${tokenizerLastError()}")
     val draftFile = ggufOpen(if (drafterPath != "") drafterPath else serveDrafterPath(modelPath))
     if (draftFile == null) {
         eprintln("serve: the drafter model is missing (${ggufLastError()}); put dspark-Inkling-2-Mini-Q8_0.gguf next to the model or pass --drafter PATH")
@@ -262,11 +267,11 @@ fun cmdServe(args: array<string>): int {
     val stops = generationStops(file, tokenizer, architecture)
     val ids = [serveSpecialId(tokenizer, "<|message_model|>"), serveSpecialId(tokenizer, "<|content_thinking|>"), serveSpecialId(tokenizer, "<|content_text|>"),
         serveSpecialId(tokenizer, "<|content_invoke_tool_json|>"), serveSpecialId(tokenizer, "<|end_message|>")]
-    var backend = cudaBackend() ?? return 1
+    var backend = cudaBackend() ?? return serveFail("no CUDA device: ${cudaLastError()}")
     eprintln("serve: loading the model (context $context tokens)...")
-    var model = inklingLoad(backend, file, config, context + SPEC_CONTEXT_SLACK) ?? return 1
-    if (!model.reset(backend)) return 1
-    var session = specSessionCreate(backend, model, draftFile, SPEC_DEFAULT_PROPOSALS) ?? return 1
+    var model = inklingLoad(backend, file, config, context + SPEC_CONTEXT_SLACK) ?? return serveFail("loading the model failed (context $context): ${inklingLastError()} ${cudaLastError()}; try a smaller --ctx")
+    if (!model.reset(backend)) return serveFail("clearing the model state failed: ${cudaLastError()}")
+    var session = specSessionCreate(backend, model, draftFile, SPEC_DEFAULT_PROPOSALS) ?? return serveFail("setting up speculation failed: ${speculateLastError()} ${cudaLastError()}; try a smaller --ctx")
     session.exactWindow = 192
     var listener = tcpListenAddress(ipv4SocketAddress("127.0.0.1", port), 16)
     if (listener.descriptor < 0) {
