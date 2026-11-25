@@ -15,31 +15,28 @@ prefixes and one run per depth; llama-bench uses synthetic prefixes, F16
 K/V, CUDA graphs, full offload and the mean of three runs. A dash means
 unmeasured.
 
-| Cached tokens | abla-grad `cf6578c` tok/s | llama.cpp mainline tok/s | Unsloth tok/s |
+| Cached tokens | abla-grad `d002328` tok/s | llama.cpp mainline tok/s | Unsloth tok/s |
 |---:|---:|---:|---:|
-| 0 | 138.57 | 77.90 | 102.85 |
-| 8,192 | 126.72 | 74.03 | 95.03 |
-| 32,768 | 119.01 | 64.63 | 89.92 |
-| 65,536 | 111.35 | — | — |
-| 131,072 | 95.58 | 48.88 | 64.95 |
+| 0 | 138.80 | 77.90 | 102.85 |
+| 8,192 | 128.83 | 74.03 | 95.03 |
+| 32,768 | 120.85 | 64.63 | 89.92 |
+| 65,536 | 111.34 | — | — |
+| 131,072 | 95.92 | 48.88 | 64.95 |
 
 Run from the Nix shell with the [README model path](../README.md#build-and-run).
-Use the archived `ship-final` binary or build `cf6578c` in a detached checkout.
-The 8,192 run explicitly supplied the shipped default of 64 global splits.
+The timed executable is `swa-half-gemm`; `d002328` includes the subsequent
+verify-check reference fix. Step, chunk-256, fixed long prompts and both speculation caps passed.
 
 ```sh
 h="$HOME/archive/abla-grad-depth-1254"
 for n in 0 8192 32768 65536 131072; do
     ctx=$(((n + 169 + 255) / 256 * 256))
-    flags=()
-    if ((n == 8192)); then flags=(--global-splits 64); fi
-    tools/gpu-lock.sh -t 240 -- taskset -c 24-27 "$h/ship-final" decode-bench \
-        "$model" "$h/d$n.ids" --ctx "$ctx" --mode graph --n 128 --batch-seed "${flags[@]}"
+    tools/gpu-lock.sh -t 240 -- taskset -c 24-27 "$h/swa-half-gemm" decode-bench \
+        "$model" "$h/d$n.ids" --ctx "$ctx" --mode graph --n 128 --batch-seed
 done
 ```
 
-The archive contains `run-monitored`, the input IDs and `time-main-cf6578c-d*.log`
-(8,192 is `time-shallow-s64-d8192.log`). The reference commands and JSON live
+The archive contains `run-monitored`, the input IDs and `time-swa-half-gemm-d*.log`. The reference commands and JSON live
 in `~/src/abla-grad-oracle/tg128-current-main` (0 and 8,192) and
 `~/src/abla-grad-oracle/tg128-128k` (32,768 and 131,072).
 Set `bench` to either command below. Run the Unsloth command from
