@@ -5,7 +5,7 @@ The runners pin CPUs 24–27 and take the GPU lock per invocation.
 The original target GGUF and llama.cpp mainline pin (`33aeb17`) are in
 [models.txt](../tools/oracle/models.txt). The other reference is the Unsloth
 `app-b12649-mix-c7059d6-linux-x64-cuda12-portable.tar.gz` build. See
-[Serving](serving.md) for the DSpark drafter hash. Abla builds use ablac
+[Serving](serving.md) for the DSpark drafter hash. Older Abla builds use ablac
 0.2.73 with `--fast`. Rows identify the measured build. [Unsloth release](https://github.com/unslothai/llama.cpp/releases/tag/b12649-mix-c7059d6)
 
 ## Plain decode by cached depth
@@ -15,28 +15,28 @@ prefixes and one run per depth; llama-bench uses synthetic prefixes, F16
 K/V, CUDA graphs, full offload and the mean of three runs. A dash means
 unmeasured.
 
-| Cached tokens | abla-grad `2a12ee8` tok/s | llama.cpp mainline tok/s | Unsloth tok/s |
+| Cached tokens | abla-grad `9b3bbf3` tok/s | llama.cpp mainline tok/s | Unsloth tok/s |
 |---:|---:|---:|---:|
-| 0 | 138.32 | 77.90 | 102.85 |
-| 8,192 | 128.98 | 74.03 | 95.03 |
-| 32,768 | 119.88 | 64.63 | 89.92 |
-| 65,536 | 113.73 | — | — |
-| 131,072 | 100.50 | 48.88 | 64.95 |
+| 0 | 138.69 | 77.90 | 102.85 |
+| 8,192 | 133.85 | 74.03 | 95.03 |
+| 32,768 | 125.54 | 64.63 | 89.92 |
+| 65,536 | 118.86 | — | — |
+| 131,072 | 101.39 | 48.88 | 64.95 |
 
 Run from the Nix shell with the [README model path](../README.md#build-and-run).
-Use the archived `depth-release` binary or build `2a12ee8`. Step, chunk-256,
+Use `slide75-release` or build `9b3bbf3` with ablac 0.2.74 and `--fast`. Step, chunk-256,
 fixed 05/06, both speculation caps and all-row 32k/102,400 gates passed.
 
 ```sh
 h="$HOME/archive/abla-grad-depth-1254"
 for n in 0 8192 32768 65536 131072; do
     ctx=$(((n + 169 + 255) / 256 * 256))
-    tools/gpu-lock.sh -t 240 -- taskset -c 24-27 "$h/depth-release" decode-bench \
+    tools/gpu-lock.sh -t 240 -- taskset -c 24-27 "$h/slide75-release" decode-bench \
         "$model" "$h/d$n.ids" --ctx "$ctx" --mode graph --n 128 --batch-seed
 done
 ```
 
-The archive contains `run-monitored`, the input IDs and `time-depth-release-d*.log`. The reference commands and JSON live
+The archive contains `run-monitored`, the input IDs and `time-slide75-final-d*.log`. The reference commands and JSON live
 in `~/src/abla-grad-oracle/tg128-current-main` (0 and 8,192) and
 `~/src/abla-grad-oracle/tg128-128k` (32,768 and 131,072).
 Set `bench` to either command below. Run the Unsloth command from
