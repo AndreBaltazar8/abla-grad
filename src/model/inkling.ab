@@ -15,6 +15,9 @@ import "dump.ab"
 
 private var inklingError = ""
 
+// Debug trace of the router ids (see InklingModel.traceIds): nExpertUsed ints per layer visit, in order.
+val inklingIdLog: array<int> = []
+
 // Blocks per head in the split decode attention (position-parallel; the recorded graph keeps this fixed).
 val ATTENTION_SPLITS_MAX = 64
 
@@ -119,6 +122,8 @@ resource class InklingModel(
     // 16 bytes until `enableTaps`, then maxCtx records. Written by the step-mode forward only.
     var taps: DeviceBuffer,
     var tapsOn: bool = false,
+    // Debug: when set, every layer visit appends the router's expert ids (nExpertUsed ints) to idLog (host sync per visit; direct mode only).
+    var traceIds: bool = false,
     // Use the step-buffer kernels (token and position come from `step`, uploaded by `forward`); required for `inklingCapture`.
     var useStep: bool = false,
     // Split-position decode attention in step mode (--no-split restores the one-block-per-head kernel for A/B runs).
@@ -400,6 +405,9 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
     ok = this.matvec(backend, "blk.$ip.ffn_gate_inp.weight", x, routerLogits)
     ok = ok && opMoeRoute(backend, this.scratch, routerLogits, this.arena, bias.offset, true, c.nExpert, c.nExpertUsed, this.scratch, ids,
         this.scratch, weights, 0.00000000000000000001, c.expertScale)
+    if (this.traceIds) {
+        for (id in this.readIds(backend, ids)) inklingIdLog.append(id)
+    }
     this.dump(backend, pos, "ffn_moe_logits-$slot", routerLogits, c.nExpert)
     this.dump(backend, pos, "ffn_moe_weights-$slot", weights, c.nExpertUsed)
     val guRef = this.w("blk.$ip.ffn_gate_up_exps.weight")
@@ -701,6 +709,21 @@ trusted fun InklingModel.readTap(var backend: Backend, position: int, slot: int)
     }
     val out: array<f32> = []
     for (i in 0 until n) out.append(f32FromBits(u32(ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * i)))))
+    host.close()
+    out
+}
+
+// The router's ids of the current visit (scratch offset `ids`), as host ints.
+private trusted fun InklingModel.readIds(var backend: Backend, ids: int): array<int> {
+    val used = this.config.nExpertUsed
+    val host = nativeByteBuffer(used * 4 + 4)
+    val address = nativePointerAddress(host.address)
+    val out: array<int> = []
+    if (backend.download(this.scratch, ids, address, used * 4)) {
+        for (i in 0 until used) out.append(ablaUnsafeLoadU32(nativePointerFromAddress(address + 4 * i)))
+    } else {
+        for (i in 0 until used) out.append(-1)
+    }
     host.close()
     out
 }
