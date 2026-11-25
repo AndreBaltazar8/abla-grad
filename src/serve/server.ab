@@ -26,9 +26,9 @@ import "outparse.ab"
 import "openai.ab"
 
 // The context when --ctx is not given: what the free device memory allows, at most SERVE_DEFAULT_CTX_MAX.
-private val SERVE_DEFAULT_CTX_MAX = 10240
-private val SERVE_BYTES_PER_POSITION = 400000
-private val SERVE_FIXED_BYTES = 19200000000
+private val SERVE_DEFAULT_CTX_MAX = 32768
+private val SERVE_BYTES_PER_POSITION = 80000
+private val SERVE_FIXED_BYTES = 20300000000
 private val SERVE_DEFAULT_MAX_TOKENS = 4096
 
 private fun serveDrafterPath(model: string): string {
