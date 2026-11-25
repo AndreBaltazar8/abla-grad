@@ -24,8 +24,10 @@ val SPEC_CONTEXT_SLACK = 40
 // Proposals per cycle the product uses at most (2..4); the adaptive controller may use fewer.
 val SPEC_DEFAULT_PROPOSALS = 2
 
-private val SPEC_BATCH_CYCLES = 4
-private val SPEC_BATCH_TOKENS = 16
+private val SPEC_BATCH_CYCLES = 2          // while sweeping or probing; the steady state uses twice that
+private val SPEC_BATCH_CYCLES_RUN = 4
+private val SPEC_BATCH_TOKENS = 8
+private val SPEC_BATCH_TOKENS_RUN = 32
 // The drafter attends to at most this many recent taps (dspark_config: sliding window 1025); older prompt positions may come from the batched prefill.
 private val SPEC_EXACT_WINDOW = 1025
 
@@ -127,7 +129,7 @@ fun speculativeGenerate(
     // neighbours is probed every few hundred tokens.
     val arms = if (maxProposals >= 4) 4 else if (maxProposals >= 3) 3 else 2
     val rate: array<f64> = [0.0, 0.0, 0.0, 0.0]
-    var arm = arms - 1
+    var arm = if (adaptive) 0 else arms - 1
     var best = arm
     var sweeping = adaptive
     var probing = false
@@ -139,12 +141,13 @@ fun speculativeGenerate(
         val before = position
         val t0 = monotonicNanoseconds()
         if (arm == 0) {
-            if (!model.replayMany(backend, plain, SPEC_BATCH_TOKENS)) {
+            if (!model.replayMany(backend, plain, if (sweeping || probing || warm) SPEC_BATCH_TOKENS else SPEC_BATCH_TOKENS_RUN)) {
                 speculateError = inklingLastError()
                 return false
             }
         } else {
-            for (b in 0 until SPEC_BATCH_CYCLES) {
+            val batchCycles = if (sweeping || probing || warm) SPEC_BATCH_CYCLES else SPEC_BATCH_CYCLES_RUN
+            for (b in 0 until batchCycles) {
                 val replayed = if (arm == 1) backend.replay(cycle2) else if (arm == 2) replayOptional(backend, cycle3)
                     else replayOptional(backend, cycle4)
                 if (!replayed) {
@@ -152,7 +155,7 @@ fun speculativeGenerate(
                     return false
                 }
             }
-            stats.cycles = stats.cycles + SPEC_BATCH_CYCLES
+            stats.cycles = stats.cycles + batchCycles
         }
         if (!backend.synchronize()) {
             speculateError = "the device failed while decoding"
@@ -191,8 +194,8 @@ fun speculativeGenerate(
         if (!warm) {
             rate[arm] = if (rate[arm] == 0.0) measured else 0.5 * rate[arm] + 0.5 * measured
             if (sweeping) {
-                if (arm > 0) {
-                    next = arm - 1
+                if (arm < arms - 1) {
+                    next = arm + 1
                 } else {
                     sweeping = false
                     for (a in 0 until arms) if (rate[a] > rate[best]) best = a
