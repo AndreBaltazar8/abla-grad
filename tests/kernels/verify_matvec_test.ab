@@ -176,7 +176,9 @@ private fun verifyIndexed(var backend: Backend, rows: int, cols: int, slots: int
             .pointer(map).u32(capacity).u64(expertStride).u32(slots).u32(vectorStride).u32(slotStride)
         if (withScales) args.pointer(scales)
         else args.u64(0)
-        val rowKernel = name + "_rows"
+        val fixedFive = vectors == 5 && rows == 2304 && slots == 8 && kind == "nvfp4" && withScales &&
+            vectorPadding == 0 && ((cols == 2304 && slotStride == 0) || (cols == 1152 && slotStride == cols))
+        val rowKernel = if (fixedFive) "matvec_nvfp4_inkling_five" else name + "_rows"
         val shape = [rows, capacity]
         if (!backend.launch(rowKernel, args, shape) || !backend.synchronize() ||
             !verifyEqual(backend, rowKernel, vectors, y, ref, vectors * count)) return false
@@ -203,6 +205,8 @@ private fun verifyAll(var backend: Backend): bool {
         verifyDense(backend, "q8", 7, 160) &&
         verifyDense(backend, "q8", 11, 96, xOffset = 4) &&
         verifyDense(backend, "q8", 11, 96, wOffset = 1) &&
+        verifyIndexed(backend, 2304, 2304, 8, "mixed", 0, 0, true) &&
+        verifyIndexed(backend, 2304, 1152, 8, "overlap", 1152, 0, true) &&
         verifyIndexed(backend, 7, 320, 3, "overlap", 0, 0, false) &&
         verifyIndexed(backend, 7, 320, 3, "overlap", 321, 1, true) &&
         verifyIndexed(backend, 11, 1152, 4, "mixed", 1161, 1, true) &&

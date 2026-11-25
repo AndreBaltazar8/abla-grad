@@ -386,3 +386,60 @@ extern "C" __global__ void matvec_bf16_output(const unsigned short *w, const flo
     }
 }
 """
+
+// The five-row top-8 map has six words per expert. Specialize both input layouts
+// so NVRTC can fold strides and dot-product lengths into each sharing case.
+val kernelVerifyNvfp4Five = verifyNvfp4Format + """
+template<unsigned Used, unsigned Cols>
+static __device__ __forceinline__ void project_used(const unsigned char *weights, const float *x, float *y,
+    unsigned row, unsigned rows, unsigned mask, const unsigned *record, float scale) {
+    const float *inputs[Used];
+    float *outputs[Used];
+    const unsigned vectorStride = Cols == 2304 ? Cols : 8 * Cols;
+    const unsigned slotStride = Cols == 2304 ? 0 : Cols;
+    #pragma unroll
+    for (unsigned i = 0; i < Used; ++i) {
+        const unsigned token = __ffs(mask) - 1;
+        const unsigned slot = record[token + 1];
+        mask &= mask - 1;
+        inputs[i] = x + token * vectorStride + slot * slotStride;
+        outputs[i] = y + (token * 8 + slot) * rows + row;
+    }
+    if (Used == 1) {
+        const float sum = nvfp4_dot_impl<true>(weights, inputs[0], Cols);
+        if ((threadIdx.x & 31) == 0) *outputs[0] = sum * scale;
+    } else {
+        verify_nvfp4<Used, true>(weights, inputs, outputs, Cols, scale, true);
+    }
+}
+
+template<unsigned Cols>
+static __device__ __forceinline__ void project_five(const unsigned char *weights, const float *x, float *y,
+    unsigned rows, const unsigned *map, unsigned long long expertStride, const float *scales) {
+    const unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const unsigned *record = map + blockIdx.y * 6;
+    unsigned mask = 0;
+    #pragma unroll
+    for (unsigned i = 0; i < 5; ++i) {
+        if (record[i + 1] < 8) mask |= 1u << i;
+    }
+    if (!mask) return;
+    const unsigned expert = record[0];
+    weights += expert * expertStride + row * (Cols / 64 * 36);
+    const float scale = scales[expert];
+    switch (__popc(mask)) {
+    case 1: project_used<1, Cols>(weights, x, y, row, rows, mask, record, scale); break;
+    case 2: project_used<2, Cols>(weights, x, y, row, rows, mask, record, scale); break;
+    case 3: project_used<3, Cols>(weights, x, y, row, rows, mask, record, scale); break;
+    case 4: project_used<4, Cols>(weights, x, y, row, rows, mask, record, scale); break;
+    case 5: project_used<5, Cols>(weights, x, y, row, rows, mask, record, scale); break;
+    }
+}
+
+extern "C" __global__ void matvec_nvfp4_inkling_five(const unsigned char *weights, const float *x, float *y,
+    unsigned rows, unsigned cols, unsigned vectors, const unsigned *map, unsigned capacity,
+    unsigned long long expertStride, unsigned slots, unsigned vectorStride, unsigned slotStride, const float *scales) {
+    if (cols == 2304) project_five<2304>(weights, x, y, rows, map, expertStride, scales);
+    else project_five<1152>(weights, x, y, rows, map, expertStride, scales);
+}
+"""

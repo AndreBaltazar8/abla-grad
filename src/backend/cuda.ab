@@ -542,6 +542,14 @@ private fun cudaVerifyIndexedShape(args: KernelArgs, problem: array<int>, blockE
 private fun cudaVerifyNvfp4Shape(args: KernelArgs, problem: array<int>): bool =
     args.words[0] % 4 == 0 && args.words[8] % 4 == 0 && cudaVerifyIndexedShape(args, problem, 64, 36)
 
+private fun cudaVerifyNvfp4FiveShape(args: KernelArgs, problem: array<int>): bool {
+    val cols = args.words[4]
+    val gateUp = cols == 2304 && args.words[10] == cols && args.words[11] == 0
+    val down = cols == 1152 && args.words[10] == 8 * cols && args.words[11] == cols
+    cudaVerifyNvfp4Shape(args, problem) && problem[0] == 2304 && problem[1] == 40 &&
+        args.words[5] == 5 && args.words[9] == 8 && args.words[1] % 16 == 0 && args.words[12] != 0 && (gateUp || down)
+}
+
 private fun cudaVerifyQ8IndexedShape(args: KernelArgs, problem: array<int>): bool =
     cudaVerifyIndexedShape(args, problem, 32, 34)
 
@@ -553,6 +561,8 @@ private val cudaKernels = [
     CudaKernelSpec("matvec_bf16_output", kernelVerifyBf16Output, 1, 256, cudaVerifyMatvecArguments, cudaVerifyBf16OutputShape, 2),
     CudaKernelSpec("matvec_bf16_rows", kernelVerifyF32, 4, 128, cudaVerifyMatvecArguments, cudaVerifyDenseShape),
     CudaKernelSpec("matvec_q8_0_rows", kernelVerifyQ8_0, 4, 128, cudaVerifyMatvecArguments, cudaVerifyQ8Shape),
+    CudaKernelSpec("matvec_nvfp4_inkling_five", kernelVerifyNvfp4Five, 4, 128,
+        cudaVerifyIndexedArguments, cudaVerifyNvfp4FiveShape, 2),
     CudaKernelSpec("matvec_nvfp4_indexed_rows", kernelVerifyNvfp4, 4, 128,
         cudaVerifyIndexedArguments, cudaVerifyNvfp4Shape, 2, 12),
     CudaKernelSpec("matvec_q8_0_indexed_rows", kernelVerifyQ8Indexed, 4, 128,

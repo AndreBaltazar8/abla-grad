@@ -542,8 +542,11 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
         guArgs.u32(c.nExpertUsed)
         guArgs.u32(n)
         guArgs.u32(0)
-        if (this.hasWeight("blk.$ip.ffn_gate_up_exps.scale")) guArgs.pointer(this.arena, guScalesRows.offset) else guArgs.u64(0)
-        ok = ok && backend.launch("matvec_${guKind}_indexed_rows", guArgs, [2 * nFfRows, capacity])
+        val fiveRowShape = tokens == 5 && c.nExpertUsed == 8 && n == 2304 && nFfRows == 1152
+        val guScaled = this.hasWeight("blk.$ip.ffn_gate_up_exps.scale")
+        if (guScaled) guArgs.pointer(this.arena, guScalesRows.offset) else guArgs.u64(0)
+        val guKernel = if (fiveRowShape && guScaled && guKind == "nvfp4" && x % 16 == 0) "matvec_nvfp4_inkling_five" else "matvec_${guKind}_indexed_rows"
+        ok = ok && backend.launch(guKernel, guArgs, [2 * nFfRows, capacity])
         ok = ok && opSitu(backend, ws.buffer, ws.o("gu"), ws.buffer, ws.o("act"), pairs, nFfRows, c.situBeta, c.situLinear)
         var downArgs = kernelArgs()
         downArgs.pointer(this.arena, downRef.offset)
@@ -558,8 +561,10 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
         downArgs.u32(c.nExpertUsed)
         downArgs.u32(c.nExpertUsed * nFfRows)
         downArgs.u32(nFfRows)
-        if (this.hasWeight("blk.$ip.ffn_down_exps.scale")) downArgs.pointer(this.arena, downScalesRows.offset) else downArgs.u64(0)
-        ok = ok && backend.launch("matvec_${downKind}_indexed_rows", downArgs, [n, capacity])
+        val downScaled = this.hasWeight("blk.$ip.ffn_down_exps.scale")
+        if (downScaled) downArgs.pointer(this.arena, downScalesRows.offset) else downArgs.u64(0)
+        val downKernel = if (fiveRowShape && downScaled && downKind == "nvfp4" && ws.o("act") % 16 == 0) "matvec_nvfp4_inkling_five" else "matvec_${downKind}_indexed_rows"
+        ok = ok && backend.launch(downKernel, downArgs, [n, capacity])
         ok = ok && backend.launch("moe_combine_batch", kernelArgs().pointer(ws.buffer, ws.o("down")).pointer(ws.buffer, ws.o("iota")).pointer(ws.buffer, weights)
             .pointer(ws.buffer, ws.o("moe")).u32(n).u32(c.nExpertUsed).u32(tokens), [n, tokens])
     } else {
