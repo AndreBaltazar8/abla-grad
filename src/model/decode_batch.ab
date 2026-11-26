@@ -106,28 +106,6 @@ private fun launchDecodeNode(var backend: Backend, plans: array<DecodePlan>, ste
     true
 }
 
-fun inklingCaptureBatch(var backend: Backend, first: InklingModel, second: InklingModel,
-    third: InklingModel? = null, fourth: InklingModel? = null): Recording? {
-    if (third == null && fourth != null) return null
-    val plans: array<DecodePlan> = []
-    var a = DecodePlan()
-    var b = DecodePlan()
-    if (!a.record(first) || !b.record(second)) return null
-    plans.append(a)
-    plans.append(b)
-    if (third != null) {
-        var c = DecodePlan()
-        if (!c.record(third)) return null
-        plans.append(c)
-    }
-    if (fourth != null) {
-        var d = DecodePlan()
-        if (!d.record(fourth)) return null
-        plans.append(d)
-    }
-    captureDecodePlans(backend, plans)
-}
-
 // Capture only the live models. Every model owns independent position and KV
 // state, but its weights must come from the same original Inkling model.
 fun inklingCaptureLanes(var backend: Backend, models: array<InklingModel>, lanes: array<int>): Recording? {

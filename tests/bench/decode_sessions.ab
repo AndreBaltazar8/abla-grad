@@ -1,3 +1,4 @@
+// Usage: decode_sessions MODEL STEPS LANES [CONTEXT]
 import "abla/float"
 import "abla/float/text"
 import "abla/integer"
@@ -52,31 +53,34 @@ private fun measure(var backend: Backend, var model: InklingModel, count: int, l
     val t0 = monotonicNanoseconds()
     if (!model.replayMany(backend, single, count)) return false
     println("single: ${speed(monotonicNanoseconds() - t0, count)} tok/s")
-    var second = model.newDecodeLane(backend, model.maxCtx) ?? return false
-    var third = model.newDecodeLane(backend, model.maxCtx) ?? return false
-    var fourth = model.newDecodeLane(backend, model.maxCtx) ?? return false
-    val batch = inklingCaptureBatch(backend, model, second, if (lanes >= 3) third else null, if (lanes >= 4) fourth else null) ?? return false
-    if (!seedLane(backend, model, 0) || !seedLane(backend, second, 1) ||
-        (lanes >= 3 && !seedLane(backend, third, 2)) ||
-        (lanes >= 4 && !seedLane(backend, fourth, 3)) || !backend.synchronize()) return false
+    var models: array<InklingModel> = []
+    val active: array<int> = []
+    for (lane in 0 until lanes) {
+        val state = model.newDecodeLane(backend, count + 64) ?? return false
+        models.append(move(state))
+        active.append(lane)
+    }
+    val batch = inklingCaptureLanes(backend, models, active) ?? return false
+    for (lane in active) if (!seedLane(backend, models[lane], lane)) return false
+    if (!backend.synchronize()) return false
     val t1 = monotonicNanoseconds()
-    if (!model.replayMany(backend, batch, count)) return false
+    if (!models[0].replayMany(backend, batch, count)) return false
     val rate = speed(monotonicNanoseconds() - t1, count)
     println("batch $lanes: ${rate * f64FromInt(lanes)} aggregate tok/s, $rate per lane")
-    laneMatches(backend, model, 0, count) && laneMatches(backend, second, 1, count) &&
-        (lanes < 3 || laneMatches(backend, third, 2, count)) &&
-        (lanes < 4 || laneMatches(backend, fourth, 3, count))
+    for (lane in active) if (!laneMatches(backend, models[lane], lane, count)) return false
+    true
 }
 
 fun main: int {
-    if (processArgumentCount() != 3) return 2
+    if (processArgumentCount() < 3 || processArgumentCount() > 4) return 2
     val count = processArgument(1).parseInt() ?? 0
     val lanes = processArgument(2).parseInt() ?? 0
-    if (count <= 0 || lanes < 2 || lanes > 4) return 2
+    val context = if (processArgumentCount() == 4) processArgument(3).parseInt() ?? 0 else count + 64
+    if (count <= 0 || lanes < 2 || lanes > 4 || context < count + 64) return 2
     val file = ggufOpen(processArgument(0)) ?? return 1
     val config = inklingConfigFrom(file) ?? return 1
     var backend = cudaBackend() ?? return 1
-    var model = inklingLoad(backend, file, config, count + 64) ?? return 1
+    var model = inklingLoad(backend, file, config, context) ?? return 1
     model.useStep = true
     if (!measure(backend, model, count, lanes)) {
         eprintln("decode-sessions: ${inklingLastError()} (${cudaLastDiagnostic()})")
