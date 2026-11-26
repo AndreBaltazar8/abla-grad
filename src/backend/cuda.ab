@@ -17,6 +17,7 @@ import "../kernels/verify_matvec.ab"
 import "../kernels/matvec_bf16.ab"
 import "abla/crypto"
 import "abla/bytes"
+import "abla/text"
 import "abla/fs"
 import "abla/process/environment"
 import "abla/process/time"
@@ -37,6 +38,12 @@ import "../kernels/dspark_step.ab"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 
+private trusted noescape extern:"c" fun cuDriverGetVersion(version: i64*): i32
+private trusted noescape extern:"c" fun cuLinkCreate_v2(count: u32, options: i64*, values: i64*, state: i64*): i32
+private trusted noescape extern:"c" fun cuLinkAddData_v2(state: i64*, kind: i32, data: cstring, bytes: u64,
+    name: cstring, count: u32, options: i64*, values: i64*): i32
+private trusted noescape extern:"c" fun cuLinkComplete(state: i64*, image: i64*, bytes: i64*): i32
+private trusted noescape extern:"c" fun cuLinkDestroy(state: i64*): i32
 private trusted noescape extern:"c" fun cuInit(flags: u32): i32
 private trusted noescape extern:"c" fun cuDeviceGet(device: i64*, ordinal: i32): i32
 private trusted noescape extern:"c" fun cuDeviceGetAttribute(value: i64*, attribute: i32, device: i32): i32
@@ -47,7 +54,7 @@ private trusted noescape extern:"c" fun cuMemAlloc_v2(address: i64*, bytes: u64)
 private trusted noescape extern:"c" fun cuMemFree_v2(address: u64): i32
 private trusted noescape extern:"c" fun cuMemcpyHtoD_v2(destination: u64, source: i64*, bytes: u64): i32
 private trusted noescape extern:"c" fun cuMemcpyDtoH_v2(destination: i64*, source: u64, bytes: u64): i32
-private trusted noescape extern:"c" fun cuModuleLoadData(module: i64*, data: cstring): i32
+private trusted noescape extern:"c" fun cuModuleLoadData(module: i64*, data: i64*): i32
 private trusted noescape extern:"c" fun cuModuleUnload(module: i64*): i32
 private trusted noescape extern:"c" fun cuModuleGetFunction(function: i64*, module: i64*, name: cstring): i32
 private trusted noescape extern:"c" fun cuLaunchKernel(
@@ -929,23 +936,70 @@ private fun cudaKernelSpec(name: string): CudaKernelSpec? {
     null
 }
 
-private trusted fun cudaPtxCachePath(spec: CudaKernelSpec, architecture: string): Path? {
+private class CudaImage(val bytes: string, val cubin: bool = false)
+
+private class CudaImageCache(val directory: string, val identity: string) {
+    fun key(source: string, abla: bool): string =
+        hexEncode(sha256("cuda-image-v1:$identity:${if (abla) "ptx" else "cuda"}:${hexEncode(sha256(source))}"))
+
+    fun read(key: string): CudaImage? {
+        val entry = path("$directory/$key.image").readText()
+        // Key, format byte, payload SHA-256, newline, and raw bytes. One
+        // atomic file keeps the payload and its identity together.
+        if (entry.size <= 130 || entry.slice(0, 64) != key || entry[129] != 10) return null
+        val format = entry[64]
+        if (format != 66 && format != 80) return null // B (cubin), P (PTX)
+        val payload = entry.slice(130, entry.size)
+        if (hexEncode(sha256(payload)) != entry.slice(65, 129)) return null
+        CudaImage(payload, format == 66)
+    }
+
+    fun write(key: string, image: CudaImage): void {
+        val format = if (image.cubin) "B" else "P"
+        val digest = hexEncode(sha256(image.bytes))
+        path("$directory/$key.image").writeTextAtomic("$key$format$digest\n${image.bytes}", 0o600)
+        return
+    }
+}
+
+private trusted fun cudaImageCache(architecture: string): CudaImageCache? {
+    val driver = nativeI64Cell(0)
     val major = nativeI64Cell(0)
     val minor = nativeI64Cell(0)
-    if (nvrtcVersion(major.address, minor.address) != 0) return null
-
+    if (cuDriverGetVersion(driver.address) != 0 || nvrtcVersion(major.address, minor.address) != 0) return null
+    // The CUDA API level alone may stay the same across a driver update.
+    val release = path("/sys/module/nvidia/version").readText().trim()
+    if (release == "") return null
     var root = processEnvironmentOr("XDG_CACHE_HOME", "")
     if (root == "" || root[0] != 47) {
         val home = processEnvironmentOr("HOME", "")
         if (home == "" || home[0] != 47) return null
-        root = "${home}/.cache"
+        root = "$home/.cache"
     }
-    val directory = path("${root}/abla-grad")
-    if (!directory.createDirectories(0o700)) return null
+    val directory = "$root/abla-grad/cuda-images-v1"
+    if (!path(directory).createDirectories(0o700)) return null
+    CudaImageCache(directory, "$architecture:$release:${driver.load()}:${major.load()}.${minor.load()}")
+}
 
-    val key = hexEncode(sha256(
-        "ptx-v1:${major.load()}.${minor.load()}:${architecture}:${spec.name}:${spec.source}"))
-    path("${root}/abla-grad/${key}.ptx")
+// Link for the current context's architecture. The linker owns the cubin
+// memory, so copy it before destroying the link state.
+private trusted fun cudaLinkPtx(name: string, ptx: string): CudaImage? {
+    val empty = nativeNullPointer()
+    val state = nativePointerCell(empty)
+    if (!cudaStatus(cuLinkCreate_v2(0, empty, empty, state.address), "cuLinkCreate")) return null
+    val handle = state.load()
+    val data = nativePointerCell(empty)
+    val size = nativeI64Cell(0)
+    var image: CudaImage? = null
+    if (cudaStatus(cuLinkAddData_v2(handle, 1, ptx, u64(ptx.size + 1), name, 0, empty, empty), "cuLinkAddData") &&
+        cudaStatus(cuLinkComplete(handle, data.address, size.address), "cuLinkComplete") &&
+        size.load() > 0 && !pointerIsNull(data.load())) {
+        val buffer = nativeByteBuffer(size.load() + 1)
+        ablaUnsafeCopyMemory(nativePointerAddress(buffer.address), nativePointerAddress(data.load()), size.load())
+        image = CudaImage(buffer.adoptString(size.load()), true)
+    }
+    cuLinkDestroy(handle)
+    image
 }
 
 class CudaBackend(
@@ -964,7 +1018,8 @@ class CudaBackend(
     var forkEvent: int = 0,
     var forked: int = 0,
     var currentBranch: int = 0,
-    val modules: array<CudaModule> = []
+    val modules: array<CudaModule> = [],
+    val imageCache: CudaImageCache? = null
 ) : Backend {
     fun name(): string = "cuda"
     fun supportsFp8Kv(): bool = this.architecture == "compute_89"
@@ -1202,9 +1257,10 @@ class CudaBackend(
         loaded
     }
 
-    trusted fun loadPtx(spec: CudaKernelSpec, ptx: string): CudaFunction? {
+    trusted fun loadImage(spec: CudaKernelSpec, image: CudaImage): CudaFunction? {
         val module = nativePointerCell(nativeNullPointer())
-        if (!cudaStatus(cuModuleLoadData(module.address, ptx), "cuModuleLoadData")) return null
+        val data = if (image.cubin) nativeStringDataAddress(image.bytes) else nativeCStringAddress(image.bytes)
+        if (!cudaStatus(cuModuleLoadData(module.address, nativePointerFromAddress(data)), "cuModuleLoadData")) return null
         val handle = module.load()
         val loaded = this.bindFunction(spec.name, handle)
         if (loaded == null) {
@@ -1225,19 +1281,34 @@ class CudaBackend(
                 return this.bindFunction(spec.name, nativePointerFromAddress(module.handle))
             }
         }
-        if (spec.abla) return this.loadPtx(spec, kernelPtx())
-        val cache = cudaPtxCachePath(spec, this.architecture)
+        val source = if (spec.abla) kernelPtx() else spec.source
+        val cache = this.imageCache
+        val key = if (cache != null) cache.key(source, spec.abla) else ""
         if (cache != null) {
-            val previous = cache.readText()
-            if (previous != "") {
-                val cached = this.loadPtx(spec, previous)
+            val previous = cache.read(key)
+            if (previous != null) {
+                val cached = this.loadImage(spec, previous)
                 if (cached != null) return cached
+                cudaClearAllocationError()
             }
         }
-        val ptx = cudaCompilePtx(spec.source, "${spec.name}.cu", this.architecture)
-        if (ptx == null) return null
-        val loaded = this.loadPtx(spec, ptx) ?? return null
-        if (cache != null) cache.writeTextAtomic(ptx, 0o600)
+        val ptx = if (spec.abla) source else cudaCompilePtx(source, "${spec.name}.cu", this.architecture) ?? return null
+        if (cache != null) {
+            val cubin = cudaLinkPtx(spec.name, ptx)
+            if (cubin != null) {
+                val linked = this.loadImage(spec, cubin)
+                if (linked != null) {
+                    cache.write(key, cubin)
+                    return linked
+                }
+            }
+            cudaClearAllocationError()
+        }
+        // Some PTX images can be loaded directly even when the linker cannot
+        // turn them into a standalone cubin.
+        val image = CudaImage(ptx)
+        val loaded = this.loadImage(spec, image) ?? return null
+        if (cache != null) cache.write(key, image)
         loaded
     }
 
@@ -1368,5 +1439,7 @@ trusted fun cudaBackend(ordinal: i32 = 0): CudaBackend? {
         cuCtxDestroy_v2(nativePointerFromAddress(address))
         return null
     }
-    CudaBackend(address, "compute_${major.load()}${minor.load()}")
+    val architecture = "compute_${major.load()}${minor.load()}"
+    val backend = CudaBackend(address, architecture, imageCache = cudaImageCache(architecture))
+    backend
 }
