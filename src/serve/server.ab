@@ -147,6 +147,29 @@ class ServeRun(
     }
 }
 
+private fun ServeRun.begin(): void {
+    if (!this.streaming) return
+    this.send("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n")
+    val role = jsonObject(["role", "content"], [jsonString("assistant"), jsonString("")])
+    this.send(serveChunk(this.id, this.created, this.name, role, "", -1, 0, 0, true))
+    return
+}
+
+private fun ServeRun.complete(var connection: TcpConnection, includeUsage: bool,
+    promptTokens: int, generated: int, kept: int, stopped: bool): string {
+    if (!this.stopMatched && this.pending != "") this.deliverContent(this.pending)
+    val finish = if (this.calls.size > 0) "tool_calls" else if (this.stopMatched || stopped) "stop" else "length"
+    if (this.streaming) {
+        this.send(serveChunk(this.id, this.created, this.name, jsonObject([], []), finish, -1, 0, 0, true))
+        if (includeUsage) this.send(serveChunk(this.id, this.created, this.name, jsonObject([], []), "", promptTokens, generated, kept, false))
+        this.send("data: [DONE]\n\n")
+    } else {
+        serveWriteJson(connection, 200, serveCompletionBody(this.id, this.created, this.name, this.content, this.reasoning, this.calls,
+            finish, promptTokens, generated, kept))
+    }
+    finish
+}
+
 /** Handles one chat-completions request on `connection`. */
 private fun serveChat(
     var backend: Backend, var model: InklingModel, var session: SpecSession, var connection: TcpConnection, tokenizer: Tokenizer, stops: array<int>,
@@ -189,11 +212,8 @@ private fun serveChat(
     val parser = ServeOutputParser(ids[0], ids[1], ids[2], ids[3], ids[4])
     val streaming = request.stream
     val fd = connection.descriptor
-    if (streaming) {
-        connection.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n")
-        connection.write(serveChunk(id, created, name, jsonObject(["role", "content"], [jsonString("assistant"), jsonString("")]), "", -1, 0, 0, true))
-    }
-    val run = ServeRun(fd, streaming, id, created, name, request.stop, "call_${counters.requests}")
+    var run = ServeRun(fd, streaming, id, created, name, request.stop, "call_${counters.requests}")
+    run.begin()
     val rules = serveToolRules(tools)
     val events: array<ServeEvent> = []
     var stats = SpecStats()
@@ -272,17 +292,9 @@ private fun serveChat(
         connection.close()
         return allocation == ""
     }
-    if (!run.stopMatched && run.pending != "") run.deliverContent(run.pending)
-    val finish = if (run.calls.size > 0) "tool_calls" else if (run.stopMatched || stats.stopped) "stop" else "length"
+    val finish = run.complete(connection, request.includeUsage, tokens.size, stats.generated, kept, stats.stopped)
     val seconds = f64FromInt(monotonicNanoseconds() - started) / 1000000000.0
     val decodeSeconds = f64FromInt(stats.loopNanos) / 1000000000.0
-    if (streaming) {
-        run.send(serveChunk(id, created, name, jsonObject([], []), finish, -1, 0, 0, true))
-        if (request.includeUsage) run.send(serveChunk(id, created, name, jsonObject([], []), "", tokens.size, stats.generated, kept, false))
-        run.send("data: [DONE]\n\n")
-    } else {
-        serveWriteJson(connection, 200, serveCompletionBody(id, created, name, run.content, run.reasoning, run.calls, finish, tokens.size, stats.generated, kept))
-    }
     connection.close()
     val rawTtft = if (run.firstRaw > 0) f64FromInt(run.firstRaw - started) / 1000000000.0 else seconds
     val ttft = if (run.firstToken > 0) f64FromInt(run.firstToken - started) / 1000000000.0 else seconds
@@ -368,10 +380,7 @@ private fun ServeBatchRequest.start(modelName: string, var counters: ServeCounte
     this.run.name = name
     this.run.callPrefix = "call_${counters.requests}"
     this.opened = true
-    if (this.run.streaming) {
-        this.run.send("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n")
-        this.run.send(serveChunk(id, this.run.created, name, jsonObject(["role", "content"], [jsonString("assistant"), jsonString("")]), "", -1, 0, 0, true))
-    }
+    this.run.begin()
     return
 }
 
@@ -382,17 +391,8 @@ private fun ServeBatchRequest.finish(message: string = ""): void {
         if (this.run.streaming) this.run.send("data: ${serveErrorBody(message, "server_error", "")}\n\n")
         else serveWriteError(connection, 500, message, "server_error", "")
     } else {
-        if (!this.run.stopMatched && this.run.pending != "") this.run.deliverContent(this.run.pending)
-        val finish = if (this.run.calls.size > 0) "tool_calls" else if (this.run.stopMatched || this.stopped) "stop" else "length"
-        if (this.run.streaming) {
-            this.run.send(serveChunk(this.run.id, this.run.created, this.run.name, jsonObject([], []), finish, -1, 0, 0, true))
-            if (this.request.includeUsage) this.run.send(serveChunk(this.run.id, this.run.created, this.run.name, jsonObject([], []), "",
-                this.tokens.size, this.generated, 0, false))
-            this.run.send("data: [DONE]\n\n")
-        } else {
-            serveWriteJson(connection, 200, serveCompletionBody(this.run.id, this.run.created, this.run.name,
-                this.run.content, this.run.reasoning, this.run.calls, finish, this.tokens.size, this.generated, 0))
-        }
+        val finish = this.run.complete(connection, this.request.includeUsage,
+            this.tokens.size, this.generated, 0, this.stopped)
         val ended = monotonicNanoseconds()
         val firstRaw = if (this.run.firstRaw > 0) this.run.firstRaw else ended
         val first = if (this.run.firstToken > 0) this.run.firstToken else ended
