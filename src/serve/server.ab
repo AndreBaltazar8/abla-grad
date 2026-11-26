@@ -1,4 +1,4 @@
-// `abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N] [--capture-requests FILE] [--no-speculation]`: an OpenAI-compatible server for
+// `abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N] [--capture-requests FILE] [--no-speculation] [--plain-from TOKENS]`: an OpenAI-compatible server for
 // Inkling on the GPU, on 127.0.0.1 only. One request at a time (the rest wait in the listen queue). Endpoints: GET /v1/models, POST /v1/chat/completions
 // (streaming SSE and plain JSON, tools and tool calls, usage), GET /health. The model's KV cache and state stay between requests: a request whose prompt shares
 // its beginning with the previous conversation (opencode resends the whole history every turn) only processes the tokens after the shared part.
@@ -26,9 +26,9 @@ import "template.ab"
 import "outparse.ab"
 import "openai.ab"
 
-// Speculation stops paying near this prompt length (replay of the opencode capture: speculation 136.9 / 116.3 tok/s at 19.5k / 38k tokens, plain 124.9 / 115.6;
-// at 56k and 75k plain wins 110.4 / 105.6 against 106.3 / 101.7): longer prompts decode plain.
-private val SERVE_PLAIN_FROM = 45000
+// Speculation stops paying near this prompt length (replay of the opencode capture on b97ba0d, speculation / plain decode tok/s: 19.5k 152.8 / 126.9, 38k 121.5 / 124.8,
+// 56k 115.2 / 117.6, 75k 109.1 / 113.0, 111k 101.4 / 105.2): longer prompts decode plain. The crossover lies between 19.5k and 38k.
+private var servePlainFrom = 30000
 // The long-session estimate (measured at 65536 and 131072) includes compact drafter K/V and rolling taps.
 // Shorter sessions use the conservative estimate for the full drafter cache and taps.
 private val SERVE_MAX_CTX = 131072
@@ -186,7 +186,7 @@ private fun serveChat(
     val control = SpecControl()
     val events: array<ServeEvent> = []
     var stats = SpecStats()
-    val ok = session.turn(backend, model, maxTokens, stops, true, counters.plainOnly || tokens.size > SERVE_PLAIN_FROM, control, stats, { token ->
+    val ok = session.turn(backend, model, maxTokens, stops, true, counters.plainOnly || tokens.size > servePlainFrom, control, stats, { token ->
         if (run.firstRaw == 0) run.firstRaw = monotonicNanoseconds()
         parser.feed(token, tokenizer.decode([token]), events)
         for (event in events) run.handle(event)
@@ -263,6 +263,9 @@ fun cmdServe(args: array<string>): int {
         } else if (flag == "--max-tokens" && index + 1 < args.size) {
             maxTokens = args[index + 1].parseInt() ?? 0
             index = index + 2
+        } else if (flag == "--plain-from" && index + 1 < args.size) {
+            servePlainFrom = args[index + 1].parseInt() ?? 0
+            index = index + 2
         } else if (flag == "--no-speculation") {
             plainOnly = true
             index = index + 1
@@ -279,7 +282,7 @@ fun cmdServe(args: array<string>): int {
         }
     }
     if (modelPath == "" || port < 1 || port > 65535 || (context != 0 && context < 512) || maxTokens < 1) {
-        eprintln("usage: abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N] [--capture-requests FILE] [--no-speculation]")
+        eprintln("usage: abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N] [--capture-requests FILE] [--no-speculation] [--plain-from TOKENS]")
         return 2
     }
     val file = ggufOpen(modelPath)

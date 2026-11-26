@@ -24,7 +24,7 @@ while (($#)); do
             shift
             continue
             ;;
-        --ctx|--tokenizer|--drafter|--model-name|--max-tokens)
+        --ctx|--tokenizer|--drafter|--model-name|--max-tokens|--plain-from)
             [[ $# -ge 2 ]] || usage
             serve_options+=("$1" "$2")
             ;;
