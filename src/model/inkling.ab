@@ -166,6 +166,13 @@ private fun historyBytesPerVisit(c: InklingConfig): int = (c.nConv - 1) * (2 * c
 
 fun InklingModel.halfCache(sliding: bool): bool = if (sliding) this.slidingKvElementBytes == 2 else this.globalKvBits == 16
 
+private fun inklingVisitLayer(c: InklingConfig, visit: int): int {
+    if (!c.looped || visit < c.loopStart) return visit
+    val core = c.loopEnd - c.loopStart
+    if (visit < c.loopStart + core * c.loopCount) return c.loopStart + (visit - c.loopStart) % core
+    visit - core * (c.loopCount - 1)
+}
+
 // A caller that verifies unusually wide speculative batches can reserve linear caches for rollback.
 fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: int, maxVerifyRows: int = 5, halfKv: bool = false, quantizeKv: bool = false, globalKvBits: int = 0, forceFp8: bool = false): InklingModel? {
     inklingError = ""
@@ -199,11 +206,8 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
     var hasSlidingRing = false
     val kvElementBytes = if (quantizeKv || halfKv || groupedContext || maxCtx >= INKLING_HALF_KV_CONTEXT) 2 else 4
     val cacheOffsets = [0]
-    val core = c.loopEnd - c.loopStart
     for (visit in 0 until visits) {
-        val ip = if (!c.looped || visit < c.loopStart) visit
-            else if (visit < c.loopStart + core * c.loopCount) c.loopStart + (visit - c.loopStart) % core
-            else visit - core * (c.loopCount - 1)
+        val ip = inklingVisitLayer(c, visit)
         val sliding = plan.refs.get("blk.$ip.attn_q_inp_norm.weight") == null
         val slots = if (sliding && maxCtx > INKLING_KV_RING && c.nSwa > 0 && c.nSwa <= INKLING_KV_RING - INKLING_KV_SEGMENT &&
             maxVerifyRows <= INKLING_KV_RING - c.nSwa) INKLING_KV_RING else maxCtx
@@ -214,22 +218,19 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
     inklingAllocateState(backend, c, plan, map, maxCtx, groupedContext, kvElementBytes, bits, fp8, ringVisits, hasSlidingRing, visits, cacheOffsets, move(arena))
 }
 
-// The original model owns the arena. Drop every cloned state and recording
-// before dropping that model. Only weights are shared, never writable state.
 private fun inklingVisitKvBytes(c: InklingConfig, slots: int, sliding: bool, kvElementBytes: int, bits: int, fp8: bool): int {
     val elements = slots * c.nHeadKv * c.headDim
     if (sliding) elements * kvElementBytes else if (fp8) elements else if (bits == 8) elements / 32 * 36 else elements * (bits / 8)
 }
 
+// The original model owns the shared read-only arena. Drop every lane and
+// recording before dropping that model. Each lane allocates its own state.
 fun InklingModel.newDecodeLane(var backend: Backend, positions: int): InklingModel? {
     if (positions < 1 || positions > this.maxCtx) return null
     val c = this.config
     val offsets = [0]
-    val core = c.loopEnd - c.loopStart
     for (visit in 0 until this.visits) {
-        val ip = if (!c.looped || visit < c.loopStart) visit
-            else if (visit < c.loopStart + core * c.loopCount) c.loopStart + (visit - c.loopStart) % core
-            else visit - core * (c.loopCount - 1)
+        val ip = inklingVisitLayer(c, visit)
         val sliding = !this.has("blk.$ip.attn_q_inp_norm.weight")
         val slots = if (this.ringVisit(visit)) INKLING_KV_RING else positions
         val bytes = inklingVisitKvBytes(c, slots, sliding, this.slidingKvElementBytes, this.globalKvBits, this.globalFp8)
