@@ -1,0 +1,164 @@
+import "abla/text"
+import "../backend/backend.ab"
+import "inkling.ab"
+
+private class DecodeLaunch(val name: string, val args: KernelArgs, val problem: array<int>)
+
+// The model emits the same operation schedule for each lane. Capture the
+// arguments before starting CUDA capture so adjacent equal projections can
+// share a launch and a weight read. Active positions stay in each lane's step
+// buffer, so one graph can be replayed with different prompts and depths.
+private class DecodePlan(val launches: array<DecodeLaunch> = []) : Backend {
+    fun name(): string = "decode-plan"
+    fun supportsFp8Kv(): bool = false
+    fun allocate(bytes: int): DeviceBuffer? = null
+    fun upload(destination: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool = false
+    fun download(source: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool = false
+    fun launch(kernel: string, args: KernelArgs, problem: array<int>): bool {
+        this.launches.append(DecodeLaunch(kernel, args, problem))
+        true
+    }
+    fun synchronize(): bool = false
+    fun freeMemory(): int = 0
+    fun beginRecording(): bool = false
+    fun endRecording(): Recording? = null
+    fun replay(recording: Recording): bool = false
+    fun fork(count: int): bool = this.launch("", kernelArgs(), [0, count])
+    fun branch(index: int): bool = this.launch("", kernelArgs(), [1, index])
+    fun join(): bool = this.launch("", kernelArgs(), [2])
+    fun releaseRecording(handle: int): void {
+    }
+    fun release(handle: int, bytes: int): void {
+    }
+}
+
+private fun DecodePlan.record(model: InklingModel): bool = model.recordDecode(this)
+
+private fun copyDecodeArg(var args: KernelArgs, source: KernelArgs, index: int): void {
+    args.kinds.append(source.kinds[index])
+    args.words.append(source.words[index])
+    args.extents.append(source.extents[index])
+}
+
+private fun launchDenseBatch(var backend: Backend, plans: array<DecodePlan>, step: int): bool {
+    val first = plans[0].launches[step]
+    var args = kernelArgs()
+    copyDecodeArg(args, first.args, 0)
+    args.u32(first.args.words[3])
+    args.u32(first.args.words[4])
+    args.u32(plans.size)
+    for (lane in 0 until 4) {
+        val plan = plans[if (lane < plans.size) lane else 0].launches[step]
+        copyDecodeArg(args, plan.args, 1)
+        copyDecodeArg(args, plan.args, 2)
+    }
+    backend.launch("matvec_q8_0_decode_batch", args, first.problem)
+}
+
+private fun splitAttentionLaunch(name: string): bool =
+    name.startsWith("attention_rel_split_step") || name.startsWith("attention_rel_grouped_step")
+
+private fun launchAttentionBatch(var backend: Backend, plans: array<DecodePlan>, step: int): bool {
+    val first = plans[0].launches[step]
+    val split = splitAttentionLaunch(first.name)
+    val pointers = if (split) 6 else 3
+    var args = kernelArgs()
+    for (lane in 0 until 4) {
+        val source = plans[if (lane < plans.size) lane else 0].launches[step].args
+        for (i in 0 until pointers) copyDecodeArg(args, source, i)
+        if (split) copyDecodeArg(args, source, 11)
+    }
+    for (i in pointers until first.args.words.size) {
+        if (!split || i != 11) copyDecodeArg(args, first.args, i)
+    }
+    backend.launch(first.name + "_decode_batch", args, [first.problem[0], plans.size])
+}
+
+private fun sameDecodeNode(a: DecodeLaunch, b: DecodeLaunch): bool {
+    if (a.name != b.name || a.problem.size != b.problem.size) return false
+    for (i in 0 until a.problem.size) if (a.problem[i] != b.problem[i]) return false
+    if (splitAttentionLaunch(a.name) || a.name == "attention_rel_merge_gated") {
+        val pointers = if (splitAttentionLaunch(a.name)) 6 else 3
+        for (i in pointers until a.args.words.size) {
+            if (i != 11 && a.args.words[i] != b.args.words[i]) return false
+        }
+        return true
+    }
+    if (a.name != "matvec_q8_0") return true
+    a.args.words[0] == b.args.words[0] &&
+        a.args.words[3] == b.args.words[3] && a.args.words[4] == b.args.words[4]
+}
+
+private fun launchDecodeNode(var backend: Backend, plans: array<DecodePlan>, step: int): bool {
+    val first = plans[0].launches[step]
+    if (first.name == "") {
+        val action = first.problem[0]
+        if (action == 0) return backend.fork(first.problem[1])
+        if (action == 1) return backend.branch(first.problem[1])
+        return backend.join()
+    }
+    if (first.name == "matvec_q8_0") return launchDenseBatch(backend, plans, step)
+    if (splitAttentionLaunch(first.name) || first.name == "attention_rel_merge_gated") return launchAttentionBatch(backend, plans, step)
+    for (plan in plans) {
+        val launch = plan.launches[step]
+        if (!backend.launch(launch.name, launch.args, launch.problem)) return false
+    }
+    true
+}
+
+fun inklingCaptureBatch(var backend: Backend, first: InklingModel, second: InklingModel,
+    third: InklingModel? = null, fourth: InklingModel? = null): Recording? {
+    if (third == null && fourth != null) return null
+    val plans: array<DecodePlan> = []
+    var a = DecodePlan()
+    var b = DecodePlan()
+    if (!a.record(first) || !b.record(second)) return null
+    plans.append(a)
+    plans.append(b)
+    if (third != null) {
+        var c = DecodePlan()
+        if (!c.record(third)) return null
+        plans.append(c)
+    }
+    if (fourth != null) {
+        var d = DecodePlan()
+        if (!d.record(fourth)) return null
+        plans.append(d)
+    }
+    captureDecodePlans(backend, plans)
+}
+
+// Capture only the live models. Every model owns independent position and KV
+// state, but its weights must come from the same original Inkling model.
+fun inklingCaptureLanes(var backend: Backend, models: array<InklingModel>, lanes: array<int>): Recording? {
+    if (lanes.size < 2 || lanes.size > 4) return null
+    val plans: array<DecodePlan> = []
+    for (lane in lanes) {
+        var plan = DecodePlan()
+        if (!plan.record(models[lane])) return null
+        plans.append(plan)
+    }
+    captureDecodePlans(backend, plans)
+}
+
+private fun captureDecodePlans(var backend: Backend, plans: array<DecodePlan>): Recording? {
+    val a = plans[0]
+    val nodes = a.launches.size
+    for (plan in plans) if (plan.launches.size != nodes) return null
+    for (step in 0 until nodes) {
+        for (lane in 1 until plans.size) {
+            if (!sameDecodeNode(a.launches[step], plans[lane].launches[step])) return null
+        }
+    }
+    if (!backend.beginRecording()) return null
+    var ok = true
+    for (step in 0 until nodes) {
+        if (!launchDecodeNode(backend, plans, step)) {
+            ok = false
+            break
+        }
+    }
+    val recording = backend.endRecording()
+    if (!ok) return null
+    move(recording)
+}

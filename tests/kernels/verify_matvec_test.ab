@@ -105,6 +105,18 @@ private fun verifyDense(var backend: Backend, kind: string, rows: int, cols: int
             val expected = downloadFloats(backend, ref, vectors * rows) ?? return false
             for (i in 0 until got.size) if (!testNear(projection, i, got[i], f32ToF64(expected[i]))) return false
         }
+        if (kind == "q8" && vectors >= 2 && vectors <= 4) {
+            val decoded = verifyOutput(backend, vectors * rows) ?? return false
+            var separate = kernelArgs().pointer(w, wOffset).u32(rows).u32(cols).u32(vectors)
+            for (stream in 0 until 4) {
+                val source = if (stream < vectors) stream else 0
+                separate.pointer(x, xOffset + source * cols * 4)
+                separate.pointer(decoded, source * rows * 4)
+            }
+            val batchName = "matvec_q8_0_decode_batch"
+            if (!backend.launch(batchName, separate, [rows]) ||
+                !verifyEqual(backend, batchName, vectors, decoded, ref, vectors * rows)) return false
+        }
         if (bench && !timeVerify(backend, newName, args, [rows], "${newName} ${rows}x${cols}", vectors)) return false
     }
     true

@@ -1,4 +1,4 @@
-// `abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N] [--capture-requests FILE] [--no-speculation] [--plain-from TOKENS]`: an OpenAI-compatible server for
+// `abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N] [--capture-requests FILE] [--no-speculation] [--plain-from TOKENS] [--batch-decode 1..4]`: an OpenAI-compatible server for
 // Inkling on the GPU, on 127.0.0.1 only. Ready requests share one generation slot. Endpoints: GET /v1/models, POST /v1/chat/completions
 // (streaming SSE and plain JSON, tools and tool calls, usage), GET /health. A request with the same session ID can reuse the shared start of the previous prompt.
 import "abla/io"
@@ -15,6 +15,8 @@ import "../backend/backend.ab"
 import "../backend/cuda.ab"
 import "../gguf/reader.ab"
 import "../model/inkling.ab"
+import "../model/decode_batch.ab"
+import "../model/prompt_checkpoint.ab"
 import "../model/inkling_config.ab"
 import "../model/speculate.ab"
 import "../model/inkling_prefill.ab"
@@ -81,7 +83,7 @@ class ServeCounters(var requests: int = 0, var plainOnly: bool = false, var resi
 
 /** The state of one running chat request: what was sent, what is held back for stop strings, and the calls found. */
 class ServeRun(
-    val fd: int, val streaming: bool, val id: string, val created: int, val name: string, val stop: array<string>, val callPrefix: string,
+    val fd: int, val streaming: bool, var id: string, var created: int, var name: string, val stop: array<string>, var callPrefix: string,
     var content: string = "", var reasoning: string = "", var pending: string = "", var stopMatched: bool = false, var firstToken: int = 0,
     var connected: bool = true, var cancel: bool = false, var firstRaw: int = 0, val calls: array<Json> = []
 ) {
@@ -288,6 +290,251 @@ private fun serveChat(
     true
 }
 
+private class ServeBatchRequest(
+    val entry: ServeQueuedRequest, val request: ServeRequest, val tokens: array<int>, val maxTokens: int,
+    val started: int, val parser: ServeOutputParser, val run: ServeRun, var opened: bool = false,
+    var generated: int = 0, var stopped: bool = false
+)
+
+private fun serveBatchCandidate(entry: ServeQueuedRequest, tokenizer: Tokenizer, ids: array<int>,
+    context: int, maxTokens: int, resident: string): ServeBatchRequest? {
+    val started = monotonicNanoseconds()
+    val request = entry.request
+    if (entry.session == "" || entry.session == resident || request.method != "POST" ||
+        (request.path != "/v1/chat/completions" && request.path != "/chat/completions")) return null
+    val errors: array<string> = []
+    val parsed = serveParseRequest(request.body, errors) ?? return null
+    if (parsed.tools.size > 0 && !parsed.toolChoiceNone) return null
+    val prompt = serveRenderPrompt(parsed.messages, [], parsed.effort, errors)
+    if (prompt == "") return null
+    val tokens = tokenizer.encode(prompt, true, true)
+    val room = context - tokens.size
+    if (tokens.size == 0 || room < 16) return null
+    val wanted = if (parsed.maxTokens > 0) parsed.maxTokens else maxTokens
+    ServeBatchRequest(entry, parsed, tokens, if (wanted < room) wanted else room, started,
+        ServeOutputParser(ids[0], ids[1], ids[2], ids[3], ids[4]), ServeRun(entry.descriptor, parsed.stream, "", 0, "", parsed.stop, ""))
+}
+
+// Match the serial server's cold prompt schedule, including its trailing
+// step-mode window and optional stride before that window.
+private fun serveBatchPrefill(var backend: Backend, model: InklingModel, tokens: array<int>, boundary: int, recording: Recording): bool {
+    if (!model.reset(backend)) return false
+    val end = tokens.size - 1 - 192
+    var first = 0
+    if (end > 0) {
+        val ws = specSeedWorkspace(backend, model.config) ?? return false
+        var stride = ((tokens.size - 2) / PROMPT_CHECKPOINT_STRIDE) * PROMPT_CHECKPOINT_STRIDE
+        if (stride > 0 && stride < end) stride = (stride / ws.chunk) * ws.chunk
+        while (first < end) {
+            val stop = if (first < stride && stride < end) stride else end
+            val count = if (stop - first > ws.chunk) ws.chunk else stop - first
+            val prefix: array<int> = []
+            for (i in first until first + count) prefix.append(tokens[i])
+            if (!model.prefill(backend, ws, prefix, first)) return false
+            first += count
+        }
+    }
+    for (p in first until boundary) if (!model.replayToken(backend, recording, tokens[p], p)) return false
+    true
+}
+
+private fun ServeBatchRequest.sendToken(token: int, tokenizer: Tokenizer, stops: array<int>): void {
+    if (!this.opened || this.stopped || this.run.cancel) return
+    for (stop in stops) if (token == stop) {
+        this.stopped = true
+        return
+    }
+    if (this.run.firstRaw == 0) this.run.firstRaw = monotonicNanoseconds()
+    this.generated += 1
+    val events: array<ServeEvent> = []
+    this.parser.feed(token, tokenizer.decodePiece(token), events)
+    for (event in events) this.run.handle(event)
+    return
+}
+
+private fun ServeBatchRequest.finished(): bool {
+    this.stopped || this.generated >= this.maxTokens || !this.opened || this.run.cancel
+}
+
+private fun ServeBatchRequest.start(modelName: string, var counters: ServeCounters): void {
+    val prepared = serveQueuedConnection(this.entry.descriptor)
+    if (prepared.descriptor < 0) return
+    prepared.descriptor = -1
+    counters.requests += 1
+    val id = "chatcmpl-${counters.requests}-${monotonicMilliseconds()}"
+    val name = if (this.request.model != "") this.request.model else modelName
+    this.run.id = id
+    this.run.created = realtimeMilliseconds() / 1000
+    this.run.name = name
+    this.run.callPrefix = "call_${counters.requests}"
+    this.opened = true
+    if (this.run.streaming) {
+        this.run.send("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n")
+        this.run.send(serveChunk(id, this.run.created, name, jsonObject(["role", "content"], [jsonString("assistant"), jsonString("")]), "", -1, 0, 0, true))
+    }
+    return
+}
+
+private fun ServeBatchRequest.finish(message: string = ""): void {
+    if (!this.opened) return
+    var connection = TcpConnection(this.run.fd)
+    if (message != "") {
+        if (this.run.streaming) this.run.send("data: ${serveErrorBody(message, "server_error", "")}\n\n")
+        else serveWriteError(connection, 500, message, "server_error", "")
+    } else {
+        if (!this.run.stopMatched && this.run.pending != "") this.run.deliverContent(this.run.pending)
+        val finish = if (this.run.calls.size > 0) "tool_calls" else if (this.run.stopMatched || this.stopped) "stop" else "length"
+        if (this.run.streaming) {
+            this.run.send(serveChunk(this.run.id, this.run.created, this.run.name, jsonObject([], []), finish, -1, 0, 0, true))
+            if (this.request.includeUsage) this.run.send(serveChunk(this.run.id, this.run.created, this.run.name, jsonObject([], []), "",
+                this.tokens.size, this.generated, 0, false))
+            this.run.send("data: [DONE]\n\n")
+        } else {
+            serveWriteJson(connection, 200, serveCompletionBody(this.run.id, this.run.created, this.run.name,
+                this.run.content, this.run.reasoning, this.run.calls, finish, this.tokens.size, this.generated, 0))
+        }
+        val ended = monotonicNanoseconds()
+        val firstRaw = if (this.run.firstRaw > 0) this.run.firstRaw else ended
+        val first = if (this.run.firstToken > 0) this.run.firstToken else ended
+        eprintln("[serve batch] ${this.tokens.size} prompt tokens (0 reused), ${this.generated} generated, first output after ${f64FromInt(first - this.started) / 1000000000.0} s (first token ${f64FromInt(firstRaw - this.started) / 1000000000.0} s), finish $finish, id ${this.run.id}")
+    }
+    connection.close()
+    this.opened = false
+    return
+}
+
+private fun serveBatchStage(var backend: Backend, models: array<InklingModel>,
+    var jobs: array<ServeBatchRequest>, steps: Recording, var active: array<int>, var at: array<int>,
+    tokenizer: Tokenizer, stops: array<int>, var queue: ServeQueue): bool {
+    val lanes = active.size
+    val first = active[0]
+    while (active.size == lanes && !tcpShutdownRequested()) {
+        var count = 4
+        for (i in active) {
+            val remaining = jobs[i].maxTokens - jobs[i].generated
+            if (remaining < count) count = remaining
+        }
+        if (!models[first].replayMany(backend, steps, count)) return false
+        var lane = 0
+        while (lane < active.size) {
+            val i = active[lane]
+            val tokens = models[i].readLog(backend, at[i], count) ?? return false
+            at[i] += count
+            for (token in tokens) {
+                jobs[i].sendToken(token, tokenizer, stops)
+                if (jobs[i].finished()) break
+            }
+            if (jobs[i].finished()) {
+                jobs[i].finish()
+                active.takeAt(lane)
+            } else lane += 1
+        }
+        queue.pump(0)
+    }
+    !tcpShutdownRequested()
+}
+
+private fun serveBatchDecode(var backend: Backend, var models: array<InklingModel>, var jobs: array<ServeBatchRequest>,
+    initial: Recording, tokenizer: Tokenizer, stops: array<int>, var queue: ServeQueue): bool {
+    var active: array<int> = []
+    for (i in 0 until jobs.size) if (!jobs[i].finished()) active.append(i)
+    var at: array<int> = []
+    for (job in jobs) at.append(job.tokens.size)
+    if (active.size == jobs.size && !serveBatchStage(backend, models, jobs, initial, active, at, tokenizer, stops, queue)) return false
+    while (active.size > 0) {
+        val steps = if (active.size > 1) inklingCaptureLanes(backend, models, active) else models[active[0]].capture(backend)
+        if (steps == null || !serveBatchStage(backend, models, jobs, steps, active, at, tokenizer, stops, queue)) return false
+    }
+    true
+}
+
+private fun serveBatchAllocationFail(lane: int): int {
+    eprintln("serve: could not reserve batch lane $lane: ${inklingLastError()} ${cudaLastDiagnostic()}; using serial decode")
+    cudaClearAllocationError()
+    0
+}
+
+// Returns 0 if ordinary single-session dispatch should handle the request,
+// 1 if this cohort was served, and -1 for an allocation failure after dispatch.
+private fun tryServeBatch(var backend: Backend, model: InklingModel, entry: ServeQueuedRequest,
+    tokenizer: Tokenizer, ids: array<int>, stops: array<int>, context: int, maxTokens: int, modelName: string,
+    limit: int, var queue: ServeQueue, var counters: ServeCounters): int {
+    if (entry.session == "" || entry.session == counters.residentSession) return 0
+    // Admit clients accepted by the previous poll and give simultaneously
+    // arriving headers a short window to enter the same cohort.
+    queue.pump(0)
+    if (queue.waiting.size + queue.reading.size == 0) return 0
+    val deadline = monotonicMilliseconds() + 8
+    while (queue.waiting.size < limit - 1 && !queue.failed && !tcpShutdownRequested()) {
+        val remaining = deadline - monotonicMilliseconds()
+        if (remaining <= 0) break
+        queue.pump(remaining)
+    }
+    if (queue.waiting.size == 0) return 0
+    val first = serveBatchCandidate(entry, tokenizer, ids, context, maxTokens, counters.residentSession) ?? return 0
+    var jobs = [first]
+    val indices: array<int> = []
+    val seen = [entry.session]
+    for (i in 0 until queue.waiting.size) {
+        if (jobs.size >= limit) break
+        val item = queue.waiting[i]
+        var duplicate = false
+        for (session in seen) if (session == item.session) duplicate = true
+        if (duplicate) continue
+        seen.append(item.session)
+        val candidate = serveBatchCandidate(item, tokenizer, ids, context, maxTokens, counters.residentSession)
+        if (candidate != null) {
+            jobs.append(candidate)
+            indices.append(i)
+        }
+    }
+    if (jobs.size < 2) return 0
+    var models: array<InklingModel> = []
+    var tail = 193
+    for (job in jobs) if (job.tokens.size < tail) tail = job.tokens.size
+    for (i in 0 until jobs.size) {
+        val tokens = jobs[i].tokens
+        val positions = tokens.size + jobs[i].maxTokens
+        var lane = model.newDecodeLane(backend, positions) ?? return serveBatchAllocationFail(i + 1)
+        val single = lane.capture(backend) ?? return 0
+        if (!serveBatchPrefill(backend, lane, tokens, tokens.size - tail, single)) {
+            eprintln("serve: batch prefill failed: ${inklingPrefillLastError()} ${cudaLastDiagnostic()}; using serial decode")
+            cudaClearAllocationError()
+            return 0
+        }
+        models.append(move(lane))
+    }
+    val lanes: array<int> = []
+    for (i in 0 until jobs.size) lanes.append(i)
+    val initial = inklingCaptureLanes(backend, models, lanes) ?? return 0
+    for (offset in 0 until tail) {
+        for (i in lanes) {
+            val position = jobs[i].tokens.size - tail + offset
+            if (!models[i].seed(backend, jobs[i].tokens[position], position)) return 0
+        }
+        if (!backend.replay(initial)) return 0
+    }
+    val anchors: array<int> = []
+    for (i in lanes) anchors.append(models[i].readStepWord(backend, 0) ?? return 0)
+    for (i in 0 until indices.size) {
+        val removed = queue.waiting.takeAt(indices[indices.size - i - 1])
+        queue.bytes -= removed.bytes
+    }
+    queue.lastSession = jobs[jobs.size - 1].entry.session
+    for (i in 0 until jobs.size) {
+        jobs[i].start(modelName, counters)
+        jobs[i].sendToken(anchors[i], tokenizer, stops)
+        if (jobs[i].finished()) jobs[i].finish()
+    }
+    eprintln("[serve batch] ${jobs.size} concurrent sessions")
+    if (serveBatchDecode(backend, models, jobs, initial, tokenizer, stops, queue)) return 1
+    val allocation = cudaLastAllocationError()
+    val message = "batched decode failed: ${cudaLastDiagnostic()}"
+    eprintln("serve: $message")
+    for (i in 0 until jobs.size) jobs[i].finish(message)
+    if (allocation == "") 1 else -1
+}
+
 private fun serveFail(message: string): int {
     eprintln("serve: $message")
     1
@@ -312,6 +559,7 @@ fun cmdServe(args: array<string>): int {
     var modelName = "inkling-2-mini"
     var capturePath = ""
     var plainOnly = false
+    var batchLimit = 1
     var index = 0
     while (index < args.size) {
         val flag = args[index]
@@ -336,6 +584,10 @@ fun cmdServe(args: array<string>): int {
         } else if (flag == "--plain-from" && index + 1 < args.size) {
             servePlainFrom = args[index + 1].parseInt() ?? 0
             index = index + 2
+        } else if (flag == "--batch-decode" && index + 1 < args.size) {
+            batchLimit = args[index + 1].parseInt() ?? 0
+            if (batchLimit < 1 || batchLimit > 4) return serveFail("--batch-decode needs 1 to 4 lanes")
+            index += 2
         } else if (flag == "--no-speculation") {
             plainOnly = true
             index = index + 1
@@ -351,6 +603,7 @@ fun cmdServe(args: array<string>): int {
             return 2
         }
     }
+    if (batchLimit > 1 && !plainOnly) return serveFail("--batch-decode above 1 needs --no-speculation")
     if (modelPath == "" || port < 1 || port > 65535 || (context != 0 && context < 512) || maxTokens < 1) {
         eprintln("usage: abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N] [--capture-requests FILE] [--no-speculation] [--plain-from TOKENS]")
         return 2
@@ -418,6 +671,11 @@ fun cmdServe(args: array<string>): int {
         if (tcpShutdownRequested()) break
         val entry = queue.take()
         if (entry == null) continue
+        if (batchLimit > 1 && capture == null) {
+            val result = tryServeBatch(backend, model, entry, tokenizer, ids, stops, context, maxTokens, modelName, batchLimit, queue, counters)
+            if (result < 0) return 1
+            if (result > 0) continue
+        }
         var connection = serveQueuedConnection(entry.descriptor)
         if (connection.descriptor < 0) continue
         val request = entry.request

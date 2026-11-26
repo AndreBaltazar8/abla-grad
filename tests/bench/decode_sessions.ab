@@ -1,0 +1,86 @@
+import "abla/float"
+import "abla/float/text"
+import "abla/integer"
+import "abla/io"
+import "abla/process/arguments"
+import "abla/process/time"
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "../../src/gguf/reader.ab"
+import "../../src/model/inkling.ab"
+import "../../src/model/inkling_config.ab"
+import "../../src/model/decode_batch.ab"
+
+private fun seedLane(var backend: Backend, model: InklingModel, lane: int): bool {
+    if (!model.reset(backend)) return false
+    val depth = lane * 9 + 3
+    for (position in 0 until depth) {
+        if (!model.forward(backend, 300 + lane * 19 + position, position)) return false
+    }
+    model.seed(backend, 302 + lane * 17, depth)
+}
+
+private fun laneMatches(var backend: Backend, var model: InklingModel, lane: int, count: int): bool {
+    val depth = lane * 9 + 3
+    val actual = model.readLog(backend, depth, count) ?? return false
+    val actualNext = model.readStepWord(backend, 0) ?? return false
+    val actualLogits = model.readLogits(backend) ?? return false
+    val single = model.capture(backend) ?? return false
+    if (!seedLane(backend, model, lane) || !model.replayMany(backend, single, count)) return false
+    val expected = model.readLog(backend, depth, count) ?? return false
+    val expectedNext = model.readStepWord(backend, 0) ?? return false
+    val expectedLogits = model.readLogits(backend) ?? return false
+    for (index in 0 until count) {
+        if (actual[index] != expected[index]) {
+            eprintln("lane $lane token $index: expected ${expected[index]}, got ${actual[index]}")
+            return false
+        }
+    }
+    var different = 0
+    for (i in 0 until actualLogits.size) {
+        if (f32ToBits(actualLogits[i]) != f32ToBits(expectedLogits[i])) different += 1
+    }
+    println("lane $lane: $different differences in the final logits out of ${actualLogits.size}")
+    actualNext == expectedNext && different == 0
+}
+
+private fun speed(nanos: int, tokens: int): f64 = f64FromInt(tokens) * 1000000000.0 / f64FromInt(nanos)
+
+private fun measure(var backend: Backend, var model: InklingModel, count: int, lanes: int): bool {
+    val single = model.capture(backend) ?? return false
+    if (!seedLane(backend, model, 0) || !backend.synchronize()) return false
+    val t0 = monotonicNanoseconds()
+    if (!model.replayMany(backend, single, count)) return false
+    println("single: ${speed(monotonicNanoseconds() - t0, count)} tok/s")
+    var second = model.newDecodeLane(backend, model.maxCtx) ?? return false
+    var third = model.newDecodeLane(backend, model.maxCtx) ?? return false
+    var fourth = model.newDecodeLane(backend, model.maxCtx) ?? return false
+    val batch = inklingCaptureBatch(backend, model, second, if (lanes >= 3) third else null, if (lanes >= 4) fourth else null) ?? return false
+    if (!seedLane(backend, model, 0) || !seedLane(backend, second, 1) ||
+        (lanes >= 3 && !seedLane(backend, third, 2)) ||
+        (lanes >= 4 && !seedLane(backend, fourth, 3)) || !backend.synchronize()) return false
+    val t1 = monotonicNanoseconds()
+    if (!model.replayMany(backend, batch, count)) return false
+    val rate = speed(monotonicNanoseconds() - t1, count)
+    println("batch $lanes: ${rate * f64FromInt(lanes)} aggregate tok/s, $rate per lane")
+    laneMatches(backend, model, 0, count) && laneMatches(backend, second, 1, count) &&
+        (lanes < 3 || laneMatches(backend, third, 2, count)) &&
+        (lanes < 4 || laneMatches(backend, fourth, 3, count))
+}
+
+fun main: int {
+    if (processArgumentCount() != 3) return 2
+    val count = processArgument(1).parseInt() ?? 0
+    val lanes = processArgument(2).parseInt() ?? 0
+    if (count <= 0 || lanes < 2 || lanes > 4) return 2
+    val file = ggufOpen(processArgument(0)) ?? return 1
+    val config = inklingConfigFrom(file) ?? return 1
+    var backend = cudaBackend() ?? return 1
+    var model = inklingLoad(backend, file, config, count + 64) ?? return 1
+    model.useStep = true
+    if (!measure(backend, model, count, lanes)) {
+        eprintln("decode-sessions: ${inklingLastError()} (${cudaLastDiagnostic()})")
+        return 1
+    }
+    0
+}

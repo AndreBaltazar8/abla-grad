@@ -59,10 +59,12 @@ fun KernelArgs.pointer(buffer: DeviceBuffer, offset: int = 0): KernelArgs {
 }
 
 // Owned device memory. It is created by a Backend's `allocate` and returns itself to that backend when dropped.
-// `owner` carries the context identity (the CUDA context, a Vulkan device, ...): a buffer is only valid with its owner.
-resource class DeviceBuffer(val owner: Backend, val handle: int, val bytes: int) {
+// `owner` carries the context identity. A null owner is an address view used
+// for shared read-only weights within the owning model’s lifetime.
+resource class DeviceBuffer(val owner: Backend?, val handle: int, val bytes: int) {
     fun drop(): void {
-        this.owner.release(this.handle, this.bytes)
+        val owner = this.owner
+        if (owner != null) owner.release(this.handle, this.bytes)
     }
 }
 

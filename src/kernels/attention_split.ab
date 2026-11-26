@@ -216,3 +216,47 @@ extern "C" __global__ void attention_rel_grouped_step(const float *q, const kv_e
     }
 }
 """
+
+// Each CTA still reads only its stream's keys, values and position. The
+// second grid dimension replaces independent launches for those contexts.
+val decodeAttentionBatch = """
+struct DecodeAttentionLane {
+    const float *q;
+    const kv_element *k;
+    const kv_element *v;
+    const float *table;
+    float *part;
+    const unsigned *step;
+    unsigned context;
+};
+#define ATTN_LANE_ARGS(n) const float *q##n, const kv_element *k##n, const kv_element *v##n, \
+    const float *table##n, float *part##n, const unsigned *step##n, unsigned context##n
+#define ATTN_LANE(n) DecodeAttentionLane{q##n, k##n, v##n, table##n, part##n, step##n, context##n}
+extern "C" __global__ void DECODE_ATTENTION_BATCH(
+    ATTN_LANE_ARGS(0), ATTN_LANE_ARGS(1), ATTN_LANE_ARGS(2), ATTN_LANE_ARGS(3),
+    unsigned heads, unsigned kvHeads, unsigned dim, unsigned window,
+    unsigned extent, float scale, unsigned splits) {
+    const unsigned lane = blockIdx.y;
+    const DecodeAttentionLane args =
+        lane == 0 ? ATTN_LANE(0) : lane == 1 ? ATTN_LANE(1) : lane == 2 ? ATTN_LANE(2) : ATTN_LANE(3);
+    decode_attention_lane(args.q, args.k, args.v, args.table, args.part, args.step,
+        heads, kvHeads, dim, window, extent, args.context, scale, splits);
+}
+#undef ATTN_LANE_ARGS
+#undef ATTN_LANE
+"""
+
+val decodeAttentionMergeBatch = kernelAttentionSplit + "\n" + """
+extern "C" __global__ void attention_rel_merge_gated_decode_batch(
+    const float *part0, float *out0, const float *gate0,
+    const float *part1, float *out1, const float *gate1,
+    const float *part2, float *out2, const float *gate2,
+    const float *part3, float *out3, const float *gate3,
+    unsigned nHead, unsigned dim, unsigned nSplit) {
+    const unsigned lane = blockIdx.y;
+    const float *part = lane == 0 ? part0 : lane == 1 ? part1 : lane == 2 ? part2 : part3;
+    float *out = lane == 0 ? out0 : lane == 1 ? out1 : lane == 2 ? out2 : out3;
+    const float *gate = lane == 0 ? gate0 : lane == 1 ? gate1 : lane == 2 ? gate2 : gate3;
+    rel_merge(part, out, gate, dim, nSplit);
+}
+"""

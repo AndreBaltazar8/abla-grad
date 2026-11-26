@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end test of `abla-grad serve` on the 4090: tools/gpu-lock.sh -t 800 -- tools/test-serve.sh [model.gguf]
+# Append --batch after the model to test greedy HTTP parity and retirement in a four-session decode batch.
 # Append --long-checkpoint after the model to exercise both checkpoint slots at context 131072 (requires jq).
 # Checks the OpenAI shapes (models, completion, stream, usage, errors), a tool-call round trip, prefix reuse (second turn reports cached_tokens > 0 and a
 # rewritten history reports fewer), and that greedy output equals `abla-grad generate` on the same rendered prompt.
@@ -9,8 +10,10 @@ bin=${ABLA_GRAD_BIN:-build/abla-grad}
 port=${PORT:-18080}
 context=4096
 if [[ ${2:-} == --long-checkpoint ]]; then context=131072; fi
+extra=()
+if [[ ${2:-} == --batch ]]; then extra=(--no-speculation --batch-decode 4); fi
 log=$(mktemp)
-"$bin" serve "$model" --port "$port" --ctx "$context" >"$log" 2>&1 &
+"$bin" serve "$model" --port "$port" --ctx "$context" "${extra[@]}" >"$log" 2>&1 &
 pid=$!
 cleanup() {
     if [[ -n $pid ]]; then
@@ -23,6 +26,46 @@ trap cleanup EXIT
 for _ in $(seq 1 240); do curl -fs "http://127.0.0.1:$port/health" >/dev/null 2>&1 && break; sleep 2; done
 u="http://127.0.0.1:$port"
 fail() { echo "FAIL: $*"; cat "$log"; exit 1; }
+if [[ ${2:-} == --batch ]]; then
+    run_dir=$(mktemp -d)
+    trap 'rm -rf -- "$run_dir"; cleanup' EXIT
+    chat_batch() {
+        local index=$1 key=$2
+        local text="Count upward from $((101 + 100 * index)), using comma separators and no explanation."
+        local count=$((16 + 7 * index))
+        curl --max-time 45 -fs "$u/v1/chat/completions" -H "X-Session-ID: $key" \
+            --data-binary "$(jq -nc --arg text "$text" --argjson count "$count" \
+                '{messages:[{role:"user",content:$text}],max_tokens:$count}')"
+    }
+    pids=()
+    for i in 0 1 2 3; do chat_batch "$i" "single-$i" >"$run_dir/single-$i.json"; done
+    # Hold the model briefly while the four HTTP requests become ready.
+    # This makes the cohort independent of curl process scheduling.
+    curl --max-time 45 -fs "$u/v1/chat/completions" -H 'X-Session-ID: blocker' \
+        -d '{"messages":[{"role":"user","content":"List consecutive positive integers starting with 101, using comma separators and no explanation."}],"max_tokens":192}' \
+        >"$run_dir/blocker.json" &
+    blocker=$!
+    for _ in {1..300}; do
+        [[ -z $(ss -Htn state established "sport = :$port") ]] || break
+        sleep 0.1
+    done
+    for i in 0 1 2 3; do
+        chat_batch "$i" "batch-$i" >"$run_dir/batch-$i.json" &
+        pids+=("$!")
+    done
+    wait "$blocker" || fail "queue barrier request failed"
+    for child in "${pids[@]}"; do wait "$child" || fail "batch HTTP request failed"; done
+    grep -F '[serve batch] 4 concurrent sessions' "$log" >/dev/null || fail "four separate sessions were not batched"
+    for i in 0 1 2 3; do
+        filter='{choices:.choices,completion_tokens:.usage.completion_tokens}'
+        [[ $(jq -c "$filter" "$run_dir/single-$i.json") == "$(jq -c "$filter" "$run_dir/batch-$i.json")" ]] ||
+            fail "batch lane $i differs from independent plain decode"
+        [[ $(jq -er '.usage.prompt_tokens_details.cached_tokens' "$run_dir/batch-$i.json") == 0 ]] ||
+            fail "batch lane $i reused another session's prompt"
+    done
+    echo "test-serve: four independent batched sessions match plain decode"
+    exit 0
+fi
 # The long mode checks target, drafter and tap rings, and an edit inside the previous prompt.
 if [[ ${2:-} == --long-checkpoint ]]; then
     prefix=$(awk 'BEGIN { for (i=0;i<900;i++) printf "The index lists each number. " }')

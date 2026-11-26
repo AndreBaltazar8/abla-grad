@@ -112,6 +112,7 @@ resource class InklingModel(
     val plan: ArenaPlan,
     val scratchMap: ScratchMap,
     val maxCtx: int,
+    val groupedContext: bool,
     val slidingKvElementBytes: int,
     val globalKvBits: int,
     val globalFp8: bool,
@@ -208,10 +209,49 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
             maxVerifyRows <= INKLING_KV_RING - c.nSwa) INKLING_KV_RING else maxCtx
         ringVisits.append(slots < maxCtx)
         if (slots < maxCtx) hasSlidingRing = true
-        val elements = slots * c.nHeadKv * c.headDim
-        val bytes = if (sliding) elements * kvElementBytes else if (fp8) elements else if (bits == 8) elements / 32 * 36 else elements * (bits / 8)
-        cacheOffsets.append(cacheOffsets[visit] + bytes)
+        cacheOffsets.append(cacheOffsets[visit] + inklingVisitKvBytes(c, slots, sliding, kvElementBytes, bits, fp8))
     }
+    inklingAllocateState(backend, c, plan, map, maxCtx, groupedContext, kvElementBytes, bits, fp8, ringVisits, hasSlidingRing, visits, cacheOffsets, move(arena))
+}
+
+// The original model owns the arena. Drop every cloned state and recording
+// before dropping that model. Only weights are shared, never writable state.
+private fun inklingVisitKvBytes(c: InklingConfig, slots: int, sliding: bool, kvElementBytes: int, bits: int, fp8: bool): int {
+    val elements = slots * c.nHeadKv * c.headDim
+    if (sliding) elements * kvElementBytes else if (fp8) elements else if (bits == 8) elements / 32 * 36 else elements * (bits / 8)
+}
+
+fun InklingModel.newDecodeLane(var backend: Backend, positions: int): InklingModel? {
+    if (positions < 1 || positions > this.maxCtx) return null
+    val c = this.config
+    val offsets = [0]
+    val core = c.loopEnd - c.loopStart
+    for (visit in 0 until this.visits) {
+        val ip = if (!c.looped || visit < c.loopStart) visit
+            else if (visit < c.loopStart + core * c.loopCount) c.loopStart + (visit - c.loopStart) % core
+            else visit - core * (c.loopCount - 1)
+        val sliding = !this.has("blk.$ip.attn_q_inp_norm.weight")
+        val slots = if (this.ringVisit(visit)) INKLING_KV_RING else positions
+        val bytes = inklingVisitKvBytes(c, slots, sliding, this.slidingKvElementBytes, this.globalKvBits, this.globalFp8)
+        offsets.append(offsets[visit] + bytes)
+    }
+    val arena = DeviceBuffer(null, this.arena.handle, this.arena.bytes)
+    var lane = inklingAllocateState(backend, this.config, this.plan, this.scratchMap, positions, this.groupedContext,
+        this.slidingKvElementBytes, this.globalKvBits, this.globalFp8, this.ringVisits, this.hasSlidingRing,
+        this.visits, offsets, move(arena)) ?? return null
+    lane.useStep = this.useStep
+    lane.splitAttention = this.splitAttention
+    lane.attentionSplits = this.attentionSplits
+    lane.globalAttentionSplits = this.globalAttentionSplits
+    lane.groupedAttention = this.groupedAttention
+    lane.fused = this.fused
+    lane.fusedController = this.fusedController
+    move(lane)
+}
+
+private fun inklingAllocateState(var backend: Backend, c: InklingConfig, plan: ArenaPlan, map: ScratchMap,
+    maxCtx: int, groupedContext: bool, kvElementBytes: int, bits: int, fp8: bool, ringVisits: array<bool>,
+    hasSlidingRing: bool, visits: int, cacheOffsets: array<int>, own arena: DeviceBuffer): InklingModel? {
     val kvBytes = cacheOffsets[visits]
     val scratch = allocateBuffer(backend, map.total, "Inkling scratch", { message -> inklingError = message }) ?? return null
     val kCache = allocateBuffer(backend, kvBytes, "Inkling key cache", { message -> inklingError = message }) ?? return null
@@ -222,7 +262,7 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
     val bank = allocateBuffer(backend, stateBytes, "Inkling bank outputs", { message -> inklingError = message }) ?? return null
     val step = allocateBuffer(backend, 16 + 4 * maxCtx, "Inkling decode state and token log", { message -> inklingError = message }) ?? return null
     val taps = allocateBuffer(backend, 16, "Inkling tap placeholder", { message -> inklingError = message }) ?? return null
-    InklingModel(c, plan, map, maxCtx, kvElementBytes, bits, fp8, ringVisits, hasSlidingRing, visits, cacheOffsets, move(arena), move(scratch), move(kCache), move(vCache), move(history), move(blocks), move(bank), move(step), move(taps))
+    InklingModel(c, plan, map, maxCtx, groupedContext, kvElementBytes, bits, fp8, ringVisits, hasSlidingRing, visits, cacheOffsets, move(arena), move(scratch), move(kCache), move(vCache), move(history), move(blocks), move(bank), move(step), move(taps))
 }
 
 // Zeroes the convolution histories (a fresh sequence).
@@ -443,7 +483,7 @@ private fun InklingModel.layer(var backend: Backend, ip: int, visit: int, loopPa
             this.step, c.nHeadKv, c.headDim, this.maxCtx, ring, this.halfCache(isSwa), this.globalKvBits == 8 && !isSwa, this.globalFp8 && !isSwa)
         val window = if (isSwa) c.nSwa else 0
         if (this.splitAttention) {
-            val grouped = this.groupedAttention && !isSwa && this.maxCtx >= INKLING_GROUPED_CONTEXT && c.nHead == 3 * c.nHeadKv && c.headDim == 128
+            val grouped = this.groupedAttention && !isSwa && this.groupedContext
             val splits = if (!isSwa && this.globalAttentionSplits > 0) this.globalAttentionSplits else if (grouped) 64 else this.attentionSplits
             ok = ok && opAttentionRelSplitStep(backend, this.scratch, q, this.kCache, cache, this.vCache, cache,
                 this.scratch, table, this.scratch, this.so("attPart"), this.scratch, att, this.step, c.nHead, c.nHeadKv, c.headDim, window, extent,
@@ -592,14 +632,9 @@ fun InklingModel.capture(var backend: Backend): Recording? {
         inklingError = "the backend cannot record"
         return null
     }
-    val c = this.config
     val saved = this.dumpDir
     this.dumpDir = ""
-    var ok = this.run(backend, 0, 1)
-    // greedy token feedback on the device: step[0] = argmax(logits), log[pos] = token, pos += 1
-    ok = ok && opArgmax(backend, this.scratch, this.so("logits"), c.nVocab, this.step, 0)
-    ok = ok && opStepRecord(backend, this.step)
-    ok = ok && opStepAdvance(backend, this.step)
+    val ok = this.recordDecode(backend)
     this.dumpDir = saved
     val recording = backend.endRecording()
     if (!ok || recording == null) {
@@ -607,6 +642,18 @@ fun InklingModel.capture(var backend: Backend): Recording? {
         return null
     }
     recording
+}
+
+// Builds a greedy, replayable token for one stream. The caller owns recording.
+fun InklingModel.recordDecode(var backend: Backend): bool {
+    if (!this.useStep || this.dumpDir != "") return false
+    val c = this.config
+    var ok = this.run(backend, 0, 1)
+    // greedy token feedback on the device: step[0] = argmax(logits), log[pos] = token, pos += 1
+    ok = ok && opArgmax(backend, this.scratch, this.so("logits"), c.nVocab, this.step, 0)
+    ok = ok && opStepRecord(backend, this.step)
+    ok = ok && opStepAdvance(backend, this.step)
+    ok
 }
 
 // One token from a recording: one step upload and one replay. The logits are in the scratch buffer after the backend synchronizes.
