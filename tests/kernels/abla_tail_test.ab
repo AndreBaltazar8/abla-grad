@@ -1,0 +1,93 @@
+// The Abla moe_combine_conv_residual and rel_table (src/kernels/abla_tail.ab) against a host reference in the CUDA C
+// kernels' order, with nvcc's contractions (`s += a * b` an fma; `sum * outScale + residual` an fma): the same bits on
+// Inkling's shapes (the unrolled fast paths) and on others (the checked loops), and the history moved on by one.
+import "abla/io"
+import "abla/float"
+import "abla/math"
+import "../../src/backend/backend.ab"
+import "../../src/backend/cuda.ab"
+import "support.ab"
+
+// testSignal scaled by 1/pi plus a small varying offset: values that round, so a different summation order changes the bits
+// (testSignal alone is in sixteenths, whose sums are exact in any order).
+fun roughSignal(count: int, seed: int): array<f32> {
+    val base = testSignal(count, seed)
+    val out: array<f32> = []
+    for (i in 0 until count) out.append(base[i] * f32(0.31830987) + f32FromInt(i % 7) * f32(0.0137))
+    out
+}
+
+fun sameBits(name: string, got: array<f32>, expected: array<f32>): bool {
+    for (i in 0 until expected.size) {
+        if (f32ToBits(got[i]) != f32ToBits(expected[i])) {
+            println("$name: element $i is ${got[i]}, expected ${expected[i]}")
+            return false
+        }
+    }
+    true
+}
+
+fun testCombine(var backend: Backend, rows: int, nUsed: int, nConv: int): bool {
+    val expertOut = roughSignal(nUsed * rows, 61)
+    val weights = roughSignal(nUsed, 62)
+    val history = roughSignal((nConv - 1) * rows, 63)
+    val w = roughSignal(rows * nConv, 64)
+    val residual = roughSignal(rows, 65)
+    val scale: f32 = 0.4472136
+    val expectedOut: array<f32> = []
+    val expectedHistory: array<f32> = []
+    for (i in 0 until history.size) expectedHistory.append(history[i])
+    for (c in 0 until rows) {
+        var current = f32(0.0)
+        for (i in 0 until nUsed) current = fma(weights[i], expertOut[i * rows + c], current)
+        var sum = current
+        for (k in 0 until nConv) sum = fma(w[c * nConv + k], if (k + 1 < nConv) history[k * rows + c] else current, sum)
+        for (k in 0 until nConv - 1) expectedHistory[k * rows + c] = if (k + 2 < nConv) history[(k + 1) * rows + c] else current
+        expectedOut.append(fma(sum, scale, residual[c]))
+    }
+    val de = uploadFloats(backend, expertOut) ?? return false
+    val dw = uploadFloats(backend, weights) ?? return false
+    val dh = uploadFloats(backend, history) ?? return false
+    val dk = uploadFloats(backend, w) ?? return false
+    val dres = uploadFloats(backend, residual) ?? return false
+    val dout = uploadFloats(backend, roughSignal(rows, 66)) ?? return false
+    if (!backend.launch("moe_combine_conv_residual", kernelArgs().pointer(de).pointer(dw).pointer(dh).pointer(dk).pointer(dout)
+        .pointer(dres).u32(rows).u32(nUsed).u32(nConv).f32(scale), [rows])) return false
+    val label = "moe_combine_conv_residual (${nUsed} experts, ${nConv} taps)"
+    sameBits("$label output", downloadFloats(backend, dout, rows) ?? return false, expectedOut) &&
+        sameBits("$label history", downloadFloats(backend, dh, history.size) ?? return false, expectedHistory)
+}
+
+fun testRelTable(var backend: Backend, nRel: int, extent: int, nHead: int): bool {
+    val relBias = roughSignal(extent * nRel, 71)
+    val r = roughSignal(nHead * nRel, 72)
+    val sinks = roughSignal(nHead, 73)
+    val n = nHead * (extent + 1)
+    val expected: array<f32> = []
+    for (i in 0 until n) {
+        val h = i / (extent + 1)
+        val d = i % (extent + 1)
+        var sum = f32(0.0)
+        if (d < extent) for (k in 0 until nRel) sum = fma(relBias[d * nRel + k], r[h * nRel + k], sum)
+        expected.append(sum - sinks[h])
+    }
+    val db = uploadFloats(backend, relBias) ?? return false
+    val dr = uploadFloats(backend, r) ?? return false
+    val ds = uploadFloats(backend, sinks) ?? return false
+    val dt = uploadFloats(backend, roughSignal(n, 74)) ?? return false
+    if (!backend.launch("rel_table", kernelArgs().pointer(db).pointer(dr).pointer(ds).pointer(dt).u32(nRel).u32(extent).u32(nHead), [n]))
+        return false
+    sameBits("rel_table (${nRel} positions)", downloadFloats(backend, dt, n) ?? return false, expected)
+}
+
+fun main: int {
+    var backend = cudaBackend() ?? return 1
+    val ok = testCombine(backend, 300, 8, 4) && testCombine(backend, 300, 3, 5) && testCombine(backend, 257, 8, 2) &&
+        testRelTable(backend, 16, 33, 6) && testRelTable(backend, 5, 33, 6)
+    if (!ok || !backend.close()) {
+        println("abla tail kernel test FAILED (${cudaLastError()})")
+        return 1
+    }
+    println("abla tail kernels match the CUDA C order bit for bit")
+    0
+}

@@ -1,0 +1,155 @@
+import "abla/kernel"
+
+// moe_combine_conv_residual (tail_fused.ab) and rel_table (inkling_small.ab) as Abla `@kernel` functions, with the CUDA C
+// kernels' bits (nvcc contracts `s += a * b` to an fma, and so do these). Both are one thread an element whose CUDA C
+// loop waits on one load at a time; for Inkling's shapes (8 experts and a 4-tap convolution; 16 relative positions)
+// these check the thread's indexes once and issue all its loads before the arithmetic.
+
+// The launch names of these kernels: their CudaKernelSpecs, and their PTX entries (the functions' own names).
+val ablaCombineConvKernel = "moe_combine_conv_residual"
+val ablaRelTableKernel = "rel_table"
+
+// Element `index` of `buffer`, unchecked when `fast` (the caller has shown it inside).
+private trusted fun tailLoad(buffer: KernelF32Buffer, index: int, fast: bool): f32 =
+    if (fast) buffer.loadUnchecked(index) else buffer.load(index)
+
+/** out[c] = (current + conv of the history and current) * outScale + residual[c], where current is the weighted sum of the
+ *  nUsed experts' outputs at c, and the history moves on by one (tail_fused.ab's moe_combine_conv_residual). */
+@kernel
+fun moe_combine_conv_residual(expertOut: KernelF32Buffer, weights: KernelF32Buffer, history: KernelF32Buffer,
+    w: KernelF32Buffer, out: KernelF32Buffer, residual: KernelF32Buffer, rows: int, nUsed: int, nConv: int, outScale: f32) {
+    val c = kernelGlobalId()
+    if (c >= rows || nConv > 64) return
+    val fast = nUsed == 8 && nConv == 4 && c >= 0 && 8 * rows <= expertOut.size() && 8 <= weights.size() &&
+        3 * rows <= history.size() && rows * 4 <= w.size() && rows <= residual.size()
+    if (fast) {
+        val e0 = tailLoad(expertOut, c, true)
+        val e1 = tailLoad(expertOut, rows + c, true)
+        val e2 = tailLoad(expertOut, 2 * rows + c, true)
+        val e3 = tailLoad(expertOut, 3 * rows + c, true)
+        val e4 = tailLoad(expertOut, 4 * rows + c, true)
+        val e5 = tailLoad(expertOut, 5 * rows + c, true)
+        val e6 = tailLoad(expertOut, 6 * rows + c, true)
+        val e7 = tailLoad(expertOut, 7 * rows + c, true)
+        val h0 = tailLoad(history, c, true)
+        val h1 = tailLoad(history, rows + c, true)
+        val h2 = tailLoad(history, 2 * rows + c, true)
+        val k0 = tailLoad(w, c * 4, true)
+        val k1 = tailLoad(w, c * 4 + 1, true)
+        val k2 = tailLoad(w, c * 4 + 2, true)
+        val k3 = tailLoad(w, c * 4 + 3, true)
+        val res = tailLoad(residual, c, true)
+        var current = f32(0.0)
+        current = kernelFma(tailLoad(weights, 0, true), e0, current)
+        current = kernelFma(tailLoad(weights, 1, true), e1, current)
+        current = kernelFma(tailLoad(weights, 2, true), e2, current)
+        current = kernelFma(tailLoad(weights, 3, true), e3, current)
+        current = kernelFma(tailLoad(weights, 4, true), e4, current)
+        current = kernelFma(tailLoad(weights, 5, true), e5, current)
+        current = kernelFma(tailLoad(weights, 6, true), e6, current)
+        current = kernelFma(tailLoad(weights, 7, true), e7, current)
+        var sum = current
+        sum = kernelFma(k0, h0, sum)
+        sum = kernelFma(k1, h1, sum)
+        sum = kernelFma(k2, h2, sum)
+        sum = kernelFma(k3, current, sum)
+        history.store(c, h1)
+        history.store(rows + c, h2)
+        history.store(2 * rows + c, current)
+        out.store(c, kernelFma(sum, outScale, res))
+        return
+    }
+    var current = f32(0.0)
+    var i = 0
+    while (i < nUsed) {
+        current = kernelFma(weights.load(i), expertOut.load(i * rows + c), current)
+        i = i + 1
+    }
+    // The window is the history's nConv - 1 rows, then current; the history then moves on by one.
+    var sum = current
+    var k = 0
+    while (k < nConv) {
+        val value = if (k + 1 < nConv) history.load(k * rows + c) else current
+        sum = kernelFma(w.load(c * nConv + k), value, sum)
+        k = k + 1
+    }
+    k = 0
+    while (k + 1 < nConv) {
+        history.store(k * rows + c, if (k + 2 < nConv) history.load((k + 1) * rows + c) else current)
+        k = k + 1
+    }
+    out.store(c, kernelFma(sum, outScale, residual.load(c)))
+}
+
+/** table[h * (extent + 1) + d] = relBias row d . r row h (nRel values; 0 at d = extent) minus sinks[h]
+ *  (inkling_small.ab's rel_table). */
+@kernel
+fun rel_table(relBias: KernelF32Buffer, r: KernelF32Buffer, sinks: KernelF32Buffer, table: KernelF32Buffer, nRel: int,
+    extent: int, nHead: int) {
+    val i = kernelGlobalId()
+    val stride = extent + 1
+    if (i >= nHead * stride) return
+    val h = i / stride
+    val d = i % stride
+    var sum = f32(0.0)
+    if (d < extent) {
+        val fast = nRel == 16 && (d + 1) * 16 <= relBias.size() && (h + 1) * 16 <= r.size()
+        if (fast) {
+            val b0 = tailLoad(relBias, d * 16, true)
+            val b1 = tailLoad(relBias, d * 16 + 1, true)
+            val b2 = tailLoad(relBias, d * 16 + 2, true)
+            val b3 = tailLoad(relBias, d * 16 + 3, true)
+            val b4 = tailLoad(relBias, d * 16 + 4, true)
+            val b5 = tailLoad(relBias, d * 16 + 5, true)
+            val b6 = tailLoad(relBias, d * 16 + 6, true)
+            val b7 = tailLoad(relBias, d * 16 + 7, true)
+            val b8 = tailLoad(relBias, d * 16 + 8, true)
+            val b9 = tailLoad(relBias, d * 16 + 9, true)
+            val b10 = tailLoad(relBias, d * 16 + 10, true)
+            val b11 = tailLoad(relBias, d * 16 + 11, true)
+            val b12 = tailLoad(relBias, d * 16 + 12, true)
+            val b13 = tailLoad(relBias, d * 16 + 13, true)
+            val b14 = tailLoad(relBias, d * 16 + 14, true)
+            val b15 = tailLoad(relBias, d * 16 + 15, true)
+            val q0 = tailLoad(r, h * 16, true)
+            val q1 = tailLoad(r, h * 16 + 1, true)
+            val q2 = tailLoad(r, h * 16 + 2, true)
+            val q3 = tailLoad(r, h * 16 + 3, true)
+            val q4 = tailLoad(r, h * 16 + 4, true)
+            val q5 = tailLoad(r, h * 16 + 5, true)
+            val q6 = tailLoad(r, h * 16 + 6, true)
+            val q7 = tailLoad(r, h * 16 + 7, true)
+            val q8 = tailLoad(r, h * 16 + 8, true)
+            val q9 = tailLoad(r, h * 16 + 9, true)
+            val q10 = tailLoad(r, h * 16 + 10, true)
+            val q11 = tailLoad(r, h * 16 + 11, true)
+            val q12 = tailLoad(r, h * 16 + 12, true)
+            val q13 = tailLoad(r, h * 16 + 13, true)
+            val q14 = tailLoad(r, h * 16 + 14, true)
+            val q15 = tailLoad(r, h * 16 + 15, true)
+            sum = kernelFma(b0, q0, sum)
+            sum = kernelFma(b1, q1, sum)
+            sum = kernelFma(b2, q2, sum)
+            sum = kernelFma(b3, q3, sum)
+            sum = kernelFma(b4, q4, sum)
+            sum = kernelFma(b5, q5, sum)
+            sum = kernelFma(b6, q6, sum)
+            sum = kernelFma(b7, q7, sum)
+            sum = kernelFma(b8, q8, sum)
+            sum = kernelFma(b9, q9, sum)
+            sum = kernelFma(b10, q10, sum)
+            sum = kernelFma(b11, q11, sum)
+            sum = kernelFma(b12, q12, sum)
+            sum = kernelFma(b13, q13, sum)
+            sum = kernelFma(b14, q14, sum)
+            sum = kernelFma(b15, q15, sum)
+        } else {
+            var k = 0
+            while (k < nRel) {
+                sum = kernelFma(relBias.load(d * nRel + k), r.load(h * nRel + k), sum)
+                k = k + 1
+            }
+        }
+    }
+    table.store(i, sum - sinks.load(h))
+}
