@@ -107,7 +107,7 @@ extern "C" __global__ void gather_row_q8_0_step(const unsigned char *table,
 // Independent decode streams have separate scratch buffers. Read each weight
 // once and preserve q8_dot's lane assignment and reduction for every stream.
 val kernelBatchQ8_0 = kernelMatvecQ8_0 + "\n" + """
-template <unsigned Streams>
+template <unsigned Streams, bool Aligned>
 static __device__ __forceinline__ void q8_decode_batch(
     const unsigned char *weights, const float *const (&x)[4], float *const (&y)[4],
     unsigned row, unsigned cols) {
@@ -124,6 +124,10 @@ static __device__ __forceinline__ void q8_decode_batch(
     } else {
         const unsigned part = lane & 7;
         const unsigned short *packed = reinterpret_cast<const unsigned short *>(weights);
+        // Unrolled so a warp has six blocks' loads in flight: a row is 18 to 24 iterations, and the small projections
+        // (384 or 1024 rows) leave too few warps an SM to hide one load's latency per iteration. The order of each
+        // stream's additions is unchanged.
+        #pragma unroll 6
         for (unsigned block = lane >> 3; block < cols / 32; block += 4) {
             const unsigned short *quant = packed + static_cast<unsigned long long>(block) * 17;
             float scale;
@@ -137,7 +141,7 @@ static __device__ __forceinline__ void q8_decode_batch(
             #pragma unroll
             for (unsigned stream = 0; stream < Streams; ++stream) {
                 const float *input = x[stream] + block * 32 + part * 4;
-                const float4 values = reinterpret_cast<unsigned long long>(input) & 15u ?
+                const float4 values = !Aligned ?
                     make_float4(input[0], input[1], input[2], input[3]) :
                     *reinterpret_cast<const float4 *>(input);
                 float sum = sums[stream];
@@ -166,8 +170,20 @@ extern "C" __global__ void matvec_q8_0_decode_batch(
     const unsigned char *weights = w + static_cast<unsigned long long>(row) * (cols / 32) * 34;
     const float *const inputs[4] = {x0, x1, x2, x3};
     float *const outputs[4] = {y0, y1, y2, y3};
-    if (streams == 2) q8_decode_batch<2>(weights, inputs, outputs, row, cols);
-    if (streams == 3) q8_decode_batch<3>(weights, inputs, outputs, row, cols);
-    if (streams == 4) q8_decode_batch<4>(weights, inputs, outputs, row, cols);
+    // The streams' inputs are read as float4 at 16-byte steps from their starts, so one check of the starts decides
+    // the loads for the whole row (outside the loop, where a choice per load kept the loads of later blocks from
+    // being issued early).
+    bool aligned = true;
+    for (unsigned stream = 0; stream < streams && stream < 4; ++stream)
+        if (reinterpret_cast<unsigned long long>(inputs[stream]) & 15u) aligned = false;
+    if (aligned) {
+        if (streams == 2) q8_decode_batch<2, true>(weights, inputs, outputs, row, cols);
+        if (streams == 3) q8_decode_batch<3, true>(weights, inputs, outputs, row, cols);
+        if (streams == 4) q8_decode_batch<4, true>(weights, inputs, outputs, row, cols);
+        return;
+    }
+    if (streams == 2) q8_decode_batch<2, false>(weights, inputs, outputs, row, cols);
+    if (streams == 3) q8_decode_batch<3, false>(weights, inputs, outputs, row, cols);
+    if (streams == 4) q8_decode_batch<4, false>(weights, inputs, outputs, row, cols);
 }
 """
