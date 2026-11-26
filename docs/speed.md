@@ -188,7 +188,8 @@ and gate commands are in `~/archive/abla-grad-prefill-profile-1275.sQakOmXj`.
 Same private eight-request capture, original GGUF and DSpark. Session HTTP
 is the sum of the requests and excludes model load. Other columns describe
 the final request. Request 5 stopped after 261 tokens on `b22b960`
-and hit the 512-token limit from `cf6578c` through `a67d6f8`. The title
+and hit the 512-token limit from `cf6578c` through `a67d6f8`. It stopped
+after 189 tokens on `389066b`, which reduced the session total. The title
 request produced 167 tokens on `2ea30b6`, down from 198 on `86df7a9`.
 
 | Main landing | Prompt tokens | Reused tokens | Generated tokens | First raw token (s) | Decode (tok/s) | Final HTTP (s) | Session HTTP (s) |
@@ -208,6 +209,7 @@ request produced 167 tokens on `2ea30b6`, down from 198 on `86df7a9`.
 | `5f39f33` | 74917 | 56662 | 202 | 7.463 | 113.04 | 9.251 | 40.547 |
 | `b97ba0d` | 74917 | 56662 | 202 | 7.465 | 113.16 | 9.250 | 40.201 |
 | `a67d6f8` | 74917 | 56662 | 202 | 7.481 | 112.28 | 9.280 | 40.221 |
+| `389066b` | 74917 | 56662 | 202 | 6.198 | 113.08 | 7.985 | 34.280 |
 
 ```sh
 capture="$HOME/archive/abla-grad-serve-replay/capture/requests.jsonl"
