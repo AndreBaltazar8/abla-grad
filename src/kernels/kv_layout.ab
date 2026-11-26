@@ -19,10 +19,14 @@ val kvAddressing = """
 #if defined(INKLING_FP8_KV)
 typedef unsigned char kv_element;
 // Ada converts two E4M3 bytes to two FP16 values in one instruction.
-static __device__ __forceinline__ float kv_read_fp8(unsigned short pair) {
+static __device__ __forceinline__ unsigned kv_expand_fp8_pair(unsigned short pair) {
     unsigned halves;
-    float f;
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(halves) : "h"(pair));
+    return halves;
+}
+static __device__ __forceinline__ float kv_read_fp8(unsigned short pair) {
+    unsigned halves = kv_expand_fp8_pair(pair);
+    float f;
     asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"((unsigned short)halves));
     return f;
 }
@@ -36,9 +40,8 @@ static __device__ __forceinline__ void kv_put(kv_element *base, unsigned long lo
 }
 static __device__ __forceinline__ float4 kv_load4(const kv_element *base, unsigned long long i) {
     const unsigned bytes = *reinterpret_cast<const unsigned *>(base + i);
-    unsigned lo, hi;
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(lo) : "h"((unsigned short)bytes));
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(hi) : "h"((unsigned short)(bytes >> 16)));
+    const unsigned lo = kv_expand_fp8_pair((unsigned short)bytes);
+    const unsigned hi = kv_expand_fp8_pair((unsigned short)(bytes >> 16));
     float4 f;
     asm("cvt.f32.f16 %0, %1;" : "=f"(f.x) : "h"((unsigned short)lo));
     asm("cvt.f32.f16 %0, %1;" : "=f"(f.y) : "h"((unsigned short)(lo >> 16)));

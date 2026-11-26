@@ -25,6 +25,16 @@ private fun cache(var backend: Backend, count: int, seed: int, suffix: string): 
             val j = i * 2 + seed
             words.append(halves[j % halves.size] | (halves[(j + 1) % halves.size] << 16))
         }
+    } else if (suffix == "_fp8") {
+        // Finite E4M3 codes, including positive and negative subnormals.
+        for (word in 0 until count / 4) {
+            var bits = 0
+            for (byte in 0 until 4) {
+                val code = (seed + word * 37 + byte * 53) % 256
+                bits = bits | ((if ((code & 127) == 127) code - 1 else code) << (byte * 8))
+            }
+            words.append(bits)
+        }
     } else {
         for (block in 0 until count / 32) {
             words.append(int(f32ToBits(f32FromInt((block + seed) % 7 + 1) / 128.0)))
@@ -64,6 +74,36 @@ private fun check(var backend: Backend, pos: int, splits: int, suffix: string): 
     true
 }
 
+private fun checkPrefill(var backend: Backend, pos: int, suffix: string): bool {
+    val heads = 6
+    val kvHeads = 2
+    val dim = 128
+    val ctx = 257
+    val extent = 64
+    val tokens = 33
+    val words = tokens * heads * dim
+    val q = uploadFloats(backend, testSignal(words, 7)) ?? return false
+    val k = cache(backend, kvHeads * dim * ctx, 13, suffix) ?? return false
+    val v = cache(backend, kvHeads * dim * ctx, 19, suffix) ?? return false
+    val table = uploadFloats(backend, testSignal(tokens * heads * (extent + 1), 23)) ?? return false
+    val cursor = uploadWords(backend, [pos]) ?? return false
+    val reference = backend.allocate(words * 4) ?? return false
+    val grouped = backend.allocate(words * 4) ?? return false
+    val kernel = "attention_prefill_tc" + suffix
+    for (useGrouped in [false, true]) {
+        val args = kernelArgs().pointer(q).pointer(k).pointer(v).pointer(table).pointer(if (useGrouped) grouped else reference)
+            .u32(heads).u32(kvHeads).u32(0).pointer(cursor).u32(extent).u32(ctx).f32(0.125).u32(tokens)
+        if (!backend.launch(kernel + (if (useGrouped) "_gqa3" else ""), args, [heads, (tokens + 31) / 32])) return false
+    }
+    val expected = downloadWords(backend, reference, words) ?? return false
+    val actual = downloadWords(backend, grouped, words) ?? return false
+    for (i in 0 until words) if (expected[i] != actual[i]) {
+        eprintln("grouped prefill$suffix mismatch at position $pos, output word $i")
+        return false
+    }
+    true
+}
+
 fun main: int {
     var backend = cudaBackend() ?? return 1
     for (suffix in ["", "_f16", "_q8"]) for (pos in [0, 127, 256]) for (splits in [1, 13, 64]) if (!check(backend, pos, splits, suffix)) {
@@ -74,6 +114,13 @@ fun main: int {
         eprintln(cudaLastError())
         return 1
     }
+    for (pos in [0, 127, 224]) {
+        if (!checkPrefill(backend, pos, "_q8") || (backend.supportsFp8Kv() && !checkPrefill(backend, pos, "_fp8"))) {
+            eprintln(cudaLastError())
+            return 1
+        }
+    }
     println("grouped and sliding attention produce identical FP32 partials")
+    println("grouped prefill produces identical FP32 outputs")
     0
 }

@@ -1,6 +1,6 @@
 import "kv_layout.ab"
 // Tensor-core attention for a chunk of tokens (docs/engine.md). Two warps process 32 consecutive tokens for each head.
-// The global Q8 variant can stage K and V once per group of three query heads. Keys are processed 32 at a time: K and V tiles go f32 -> f16 into shared memory, S = Q K^T (mma m16n8k16, f16 in, f32 accumulate; Q and K are split into an f16 high and low part and the product is Qh Kh + Qh Kl + Ql Kh, because logits reach 40 and one f16 rounding of Q and K would already move them by 0.02), then
+// The grouped global variants stage K and V once per group of three query heads. Keys are processed 32 at a time: K and V tiles go into shared memory, S = Q K^T (mma m16n8k16, f16 in, f32 accumulate; Q and K are split into an f16 high and low part and the product is Qh Kh + Qh Kl + Ql Kh, because logits reach 40 and one f16 rounding of Q and K would already move them by 0.02), then
 // logit = S * scale + table[token][head][min(pos - key, extent)] (the relative-position bias with the sink folded in), causal and window masks, online softmax
 // that starts from the sink's zero logit (running max 0, running sum 1), P (f16) times V accumulates the output. Head dimension 128.
 // problem [nHead, ceil(tokens / 32)]; q, out [token][head][128]; table [token][head][extent + 1]; caches [kvHead][maxCtx][128] (f32).
@@ -48,8 +48,19 @@ enum { AT_KEYS = 32, AT_DIM = 128, AT_PITCH = 136, AT_WARPS = 2 };
 
 #ifdef INKLING_PREFILL_GQA3
 #define AT_BLOCK_THREADS 192
+#ifdef INKLING_FP8_KV
+// Every stored finite E4M3 value is exactly representable in FP16.
+#define AT_DIRECT_FP8
+#endif
 #else
 #define AT_BLOCK_THREADS 64
+#endif
+
+#ifdef AT_DIRECT_FP8
+static __device__ __forceinline__ uint4 at_expand_fp8_8(uint2 bytes) {
+    return make_uint4(kv_expand_fp8_pair((unsigned short)bytes.x), kv_expand_fp8_pair((unsigned short)(bytes.x >> 16)),
+        kv_expand_fp8_pair((unsigned short)bytes.y), kv_expand_fp8_pair((unsigned short)(bytes.y >> 16)));
+}
 #endif
 
 extern "C" __global__ void __launch_bounds__(AT_BLOCK_THREADS) attention_prefill_tc(
@@ -57,7 +68,9 @@ extern "C" __global__ void __launch_bounds__(AT_BLOCK_THREADS) attention_prefill
     unsigned window, const unsigned *posPtr, unsigned extent, unsigned maxCtx, float scale, unsigned tokens) {
     const unsigned firstPos = *posPtr;
     __shared__ __align__(16) unsigned short ks[AT_KEYS * AT_PITCH];
+#ifndef AT_DIRECT_FP8
     __shared__ __align__(16) unsigned short kl[AT_KEYS * AT_PITCH];
+#endif
     __shared__ __align__(16) unsigned short vs[AT_KEYS * AT_PITCH];
     const unsigned tid = threadIdx.x;
     const unsigned lane = tid & 31u;
@@ -116,10 +129,31 @@ extern "C" __global__ void __launch_bounds__(AT_BLOCK_THREADS) attention_prefill
     float mA = 0.0f, mB = 0.0f, lA = 1.0f, lB = 1.0f;   // the sink: logit 0
     const float *tableA = table + (static_cast<unsigned long long>(validA ? rowA : 0) * nHead + head) * (extent + 1ull);
     const float *tableB = table + (static_cast<unsigned long long>(validB ? rowB : 0) * nHead + head) * (extent + 1ull);
+#ifdef INKLING_PREFILL_GQA3
+    // Short prompts initialize only the bias entries they can reach.
+    const unsigned farBias = posFirst >= extent ? extent : 0;
+    const float farA = tableA[farBias], farB = tableB[farBias];
+#endif
 
     for (unsigned j0 = keyFirst; j0 <= posLast; j0 += AT_KEYS) {
         __syncthreads();
         // load the K and V tiles (rows beyond the last key are zero)
+#ifdef AT_DIRECT_FP8
+        // Eight bytes from each cache become one 16-byte shared-memory store.
+        for (unsigned idx = tid; idx < AT_KEYS * (AT_DIM / 8); idx += AT_BLOCK_THREADS) {
+            const unsigned row = idx >> 4;
+            const unsigned c8 = (idx & 15u) * 8;
+            const unsigned key = j0 + row;
+            uint2 kb = make_uint2(0, 0), vb = kb;
+            if (key <= posLast) {
+                const auto at = static_cast<unsigned long long>(key) * AT_DIM + c8;
+                kb = *reinterpret_cast<const uint2 *>(kBase + at);
+                vb = *reinterpret_cast<const uint2 *>(vBase + at);
+            }
+            *reinterpret_cast<uint4 *>(&ks[row * AT_PITCH + c8]) = at_expand_fp8_8(kb);
+            *reinterpret_cast<uint4 *>(&vs[row * AT_PITCH + c8]) = at_expand_fp8_8(vb);
+        }
+#else
         for (unsigned idx = tid; idx < AT_KEYS * (AT_DIM / 4); idx += AT_BLOCK_THREADS) {
             unsigned row = idx >> 5;
             unsigned c4 = (idx & 31u) * 4;
@@ -137,8 +171,9 @@ extern "C" __global__ void __launch_bounds__(AT_BLOCK_THREADS) attention_prefill
             *reinterpret_cast<uint2 *>(&kl[row * AT_PITCH + c4]) = make_uint2(l0, l1);
             *reinterpret_cast<uint2 *>(&vs[row * AT_PITCH + c4]) = make_uint2(at_pack(vv.x, vv.y), at_pack(vv.z, vv.w));
         }
+#endif
         __syncthreads();
-        // S = Q K^T for 4 key tiles of 8, with the f16 hi/lo split of Q and K: Qh Kh + Qh Kl + Ql Kh
+        // S = Q K^T for 4 key tiles of 8. Native FP8 has no K rounding residual.
         float s[4][4];
         #pragma unroll
         for (int i = 0; i < 4; ++i) { s[i][0] = 0.f; s[i][1] = 0.f; s[i][2] = 0.f; s[i][3] = 0.f; }
@@ -147,35 +182,56 @@ extern "C" __global__ void __launch_bounds__(AT_BLOCK_THREADS) attention_prefill
             #pragma unroll
             for (int np = 0; np < 2; ++np) {
                 unsigned r[4];
-                unsigned rl[4];
                 unsigned key = np * 16 + (lane & 7u) + (lane >> 4) * 8u;
                 unsigned at = key * AT_PITCH + ks2 * 16 + ((lane >> 3) & 1u) * 8u;
                 at_ldmatrix(r, &ks[at]);
+#ifndef AT_DIRECT_FP8
+                unsigned rl[4];
                 at_ldmatrix(rl, &kl[at]);
+#endif
                 at_mma(s[2 * np], qa[ks2], r[0], r[1]);
                 at_mma(s[2 * np + 1], qa[ks2], r[2], r[3]);
+#ifndef AT_DIRECT_FP8
                 at_mma(s[2 * np], qa[ks2], rl[0], rl[1]);
                 at_mma(s[2 * np + 1], qa[ks2], rl[2], rl[3]);
+#endif
                 at_mma(s[2 * np], ql[ks2], r[0], r[1]);
                 at_mma(s[2 * np + 1], ql[ks2], r[2], r[3]);
             }
         }
         // logits, masks, online softmax
         float maxA = mA, maxB = mB;
-        #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
+#ifdef INKLING_PREFILL_GQA3
+        // If the entire key tile precedes the earliest query's bias extent,
+        // all keys are visible and use the same bias for each query.
+        if (validA && validB && posFirst >= extent && j0 + AT_KEYS - 1 <= posFirst - extent) {
             #pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const bool lower = e >= 2;
-                const unsigned pos = lower ? posB : posA;
-                const bool valid = lower ? validB : validA;
-                const unsigned key = j0 + nt * 8 + 2 * quad + (e & 1);
-                const unsigned d = pos - key;   // wraps for key > pos
-                const bool visible = valid && key <= pos && (window == 0 || d < window);
-                float value = -3.0e38f;
-                if (visible) value = s[nt][e] * scale + (lower ? tableB : tableA)[d < extent ? d : extent];
-                s[nt][e] = value;
-                if (lower) maxB = fmaxf(maxB, value); else maxA = fmaxf(maxA, value);
+            for (int nt = 0; nt < 4; ++nt) {
+                s[nt][0] = s[nt][0] * scale + farA;
+                s[nt][1] = s[nt][1] * scale + farA;
+                s[nt][2] = s[nt][2] * scale + farB;
+                s[nt][3] = s[nt][3] * scale + farB;
+                maxA = fmaxf(fmaxf(maxA, s[nt][0]), s[nt][1]);
+                maxB = fmaxf(fmaxf(maxB, s[nt][2]), s[nt][3]);
+            }
+        } else
+#endif
+        {
+            #pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const bool lower = e >= 2;
+                    const unsigned pos = lower ? posB : posA;
+                    const bool valid = lower ? validB : validA;
+                    const unsigned key = j0 + nt * 8 + 2 * quad + (e & 1);
+                    const unsigned d = pos - key;   // wraps for key > pos
+                    const bool visible = valid && key <= pos && (window == 0 || d < window);
+                    float value = -3.0e38f;
+                    if (visible) value = s[nt][e] * scale + (lower ? tableB : tableA)[d < extent ? d : extent];
+                    s[nt][e] = value;
+                    if (lower) maxB = fmaxf(maxB, value); else maxA = fmaxf(maxA, value);
+                }
             }
         }
         maxA = fmaxf(maxA, __shfl_xor_sync(0xffffffffu, maxA, 1));
@@ -235,6 +291,7 @@ extern "C" __global__ void __launch_bounds__(AT_BLOCK_THREADS) attention_prefill
     }
 }
 #undef AT_BLOCK_THREADS
+#undef AT_DIRECT_FP8
 extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc_split(
     const float *q, const kv_element *kCache, const kv_element *vCache, const float *table, float *out, unsigned nHead, unsigned nKvHead,
     unsigned window, const unsigned *posPtr, unsigned extent, unsigned maxCtx, float scale, unsigned tokens, unsigned splits, float *partO, float *partML) {
