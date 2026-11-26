@@ -128,6 +128,14 @@ private fun sameDecodeNode(a: DecodeLaunch, b: DecodeLaunch): bool {
         a.args.words[3] == b.args.words[3] && a.args.words[4] == b.args.words[4]
 }
 
+// Whether launchDecodeNode joins the lanes' launches at `step` into one batched launch.
+private fun batchedDecodeNode(plans: array<DecodePlan>, step: int): bool {
+    val first = plans[0].launches[step]
+    first.name == "matvec_q8_0" ||
+        (first.name == "matvec_nvfp4_indexed" && first.problem.size == 2 && expertLaunchesShare(plans, step)) ||
+        splitAttentionLaunch(first.name) || first.name == "attention_rel_merge_gated"
+}
+
 private fun launchDecodeNode(var backend: Backend, plans: array<DecodePlan>, step: int): bool {
     val first = plans[0].launches[step]
     if (first.name == "") {
@@ -172,12 +180,38 @@ private fun captureDecodePlans(var backend: Backend, plans: array<DecodePlan>): 
     }
     if (!backend.beginRecording()) return null
     var ok = true
+    // Outside the model's own fork, a run of launches that do not join into one batched launch goes to one branch a
+    // lane, so the lanes' small kernels run side by side instead of one after another on the main stream; each lane
+    // keeps its own order, and the branches join before the next batched or structural node. Inside the model's fork
+    // (which cannot nest) the lanes stay in order on their model branch.
+    var modelFork = false
+    var laneFork = false
     for (step in 0 until nodes) {
-        if (!launchDecodeNode(backend, plans, step)) {
-            ok = false
-            break
+        val first = a.launches[step]
+        val perLane = first.name != "" && !batchedDecodeNode(plans, step)
+        if (perLane && !modelFork) {
+            if (!laneFork) {
+                ok = backend.fork(plans.size - 1)
+                laneFork = true
+            }
+            for (lane in 0 until plans.size) {
+                val launch = plans[lane].launches[step]
+                ok = ok && backend.branch(lane) && backend.launch(launch.name, launch.args, launch.problem)
+            }
+        } else {
+            if (laneFork) {
+                ok = ok && backend.join()
+                laneFork = false
+            }
+            if (first.name == "") {
+                if (first.problem[0] == 0) modelFork = true
+                if (first.problem[0] == 2) modelFork = false
+            }
+            ok = ok && launchDecodeNode(backend, plans, step)
         }
+        if (!ok) break
     }
+    if (ok && laneFork) ok = backend.join()
     val recording = backend.endRecording()
     if (!ok) return null
     move(recording)
