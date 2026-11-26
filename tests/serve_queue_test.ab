@@ -1,0 +1,32 @@
+import "abla/http"
+import "abla/io"
+import "../src/serve/queue.ab"
+
+private fun entry(session: string, label: string): ServeQueuedRequest =
+    ServeQueuedRequest(-1, HttpRequest("POST", "/v1/chat/completions", "", [], label, [], []), session, label.size)
+
+fun main: int {
+    val queue = ServeQueue(-1, -1)
+    for (request in [entry("a", "a1"), entry("a", "a2"), entry("a", "a3"), entry("b", "b1"),
+        entry("b", "b2"), entry("c", "c1")]) {
+        queue.waiting.append(request)
+        queue.bytes += request.bytes
+    }
+    for (label in ["a1", "b1", "c1", "a2", "b2", "a3"]) {
+        val request = queue.take() ?? return 1
+        if (request.request.body != label) {
+            eprintln("serve queue: expected $label, got ${request.request.body}")
+            return 1
+        }
+        // Work admitted during a turn goes through the same rotation.
+        if (label == "a1") {
+            val late = entry("a", "a4")
+            queue.waiting.append(late)
+            queue.bytes += late.bytes
+        }
+    }
+    val last = queue.take() ?? return 1
+    if (last.request.body != "a4" || queue.take() != null || queue.bytes != 0) return 1
+    println("serve queue preserves per-session FIFO and rotates ready sessions")
+    0
+}

@@ -1,0 +1,188 @@
+// Intake uses nonblocking reads. Only a complete request can enter the
+// scheduler, so a client sending a partial request cannot occupy the model.
+import "abla/bytes"
+import "abla/http"
+import "abla/http/event"
+import "abla/net"
+import "abla/process/time"
+
+private val SERVE_HEADER_BYTES = 65536
+private val SERVE_BODY_BYTES = 67108864
+private val SERVE_INTAKE_BYTES = SERVE_HEADER_BYTES + SERVE_BODY_BYTES
+private val SERVE_INTAKE_SOCKETS = 16
+private val SERVE_SOCKET_TIMEOUT = 30000
+
+private class ServeReading(
+    val descriptor: int, val started: int, val chunks: HttpEventChunkState,
+    var buffer: ByteBuffer, var bytes: int = 0, var need: int = 0
+)
+
+class ServeQueuedRequest(val descriptor: int, val request: HttpRequest, val session: string, val bytes: int)
+
+private fun serveSessionKey(request: HttpRequest): string {
+    val explicit = request.header("X-Session-ID")
+    if (explicit != "") return explicit
+    val opencode = request.header("X-Opencode-Session-Id")
+    if (opencode != "") return opencode
+    request.header("X-Opencode-Session")
+}
+
+private fun serveIsChat(request: HttpRequest): bool =
+    request.method == "POST" && (request.path == "/v1/chat/completions" || request.path == "/chat/completions")
+
+class ServeQueue(
+    val listener: int, val poller: int,
+    val reading: array<ServeReading> = [], val waiting: array<ServeQueuedRequest> = [],
+    var bytes: int = 0, var lastSession: string = "", var servedSession: bool = false, var failed: bool = false
+) {
+    fun closePending(): void {
+        for (entry in this.reading) linuxTcpCloseDescriptor(entry.descriptor)
+        for (entry in this.waiting) linuxTcpCloseDescriptor(entry.descriptor)
+        this.reading.clear()
+        this.waiting.clear()
+        this.bytes = 0
+        return
+    }
+
+fun watch(descriptor: int, enabled: bool): bool {
+    val poller = SocketPoller(this.poller)
+    val watched = if (enabled) poller.watchDescriptor(descriptor) else poller.unwatchDescriptor(descriptor)
+    poller.descriptor = -1
+    watched
+}
+
+fun admit(): void {
+        for (index in 0 until SERVE_INTAKE_SOCKETS) {
+            val listener = TcpListener(this.listener)
+            val connection = listener.accept()
+            listener.descriptor = -1
+            if (connection.descriptor < 0) return
+            if (!connection.setNonblocking()) {
+                connection.close()
+                continue
+            }
+            if (this.reading.size + this.waiting.size >= SERVE_INTAKE_SOCKETS) {
+                connection.write(httpText("request queue is full", 503).render())
+                connection.close()
+                return
+            }
+            if (!this.watch(connection.descriptor, true)) {
+                connection.close()
+                continue
+            }
+            val fd = connection.descriptor
+            connection.descriptor = -1
+            this.reading.append(ServeReading(fd, monotonicMilliseconds(), httpEventChunkState(), byteBuffer()))
+        }
+        return
+    }
+
+    fun discard(entry: ServeReading): void {
+        this.bytes -= entry.bytes
+        this.watch(entry.descriptor, false)
+        linuxTcpCloseDescriptor(entry.descriptor)
+        return
+    }
+
+    fun readReady(index: int): void {
+        val entry = this.reading.takeAt(index)
+        val connection = TcpConnection(entry.descriptor)
+        val read = connection.readResult(131072)
+        connection.descriptor = -1
+        if (!read.hasData()) {
+            if (read.errorCode == 11) this.reading.append(entry) else this.discard(entry)
+            return
+        }
+        if (read.bytes.size > SERVE_INTAKE_BYTES - this.bytes) {
+            this.discard(entry)
+            return
+        }
+        this.bytes += read.bytes.size
+        entry.bytes += read.bytes.size
+        entry.buffer.appendText(read.bytes)
+        if (entry.buffer.size() < entry.need) {
+            this.reading.append(entry)
+            return
+        }
+        val wire = entry.buffer.toText()
+        val frame = entry.chunks.assemble(wire, SERVE_HEADER_BYTES, SERVE_BODY_BYTES, null)
+        if (frame.length < 0) {
+            this.discard(entry)
+            return
+        }
+        val request = frame.request
+        if (request != null) {
+            this.watch(entry.descriptor, false)
+            this.waiting.append(ServeQueuedRequest(entry.descriptor, request, serveSessionKey(request), entry.bytes))
+            return
+        }
+        if (frame.trim > 0) {
+            entry.buffer = byteBuffer()
+            entry.buffer.appendText(wire.slice(frame.trim, wire.size))
+        }
+        entry.need = frame.need
+        this.reading.append(entry)
+        return
+    }
+
+    fun pump(timeout: int): void {
+        if (this.failed || tcpShutdownRequested()) return
+        val poller = SocketPoller(this.poller)
+        val batch = poller.wait(SERVE_INTAKE_SOCKETS + 2, timeout)
+        poller.descriptor = -1
+        if (batch.errorCode != 0) {
+            this.failed = true
+            return
+        }
+        for (event in batch.events) {
+            if (event.descriptor == this.listener) this.admit()
+            else {
+                for (i in 0 until this.reading.size) {
+                    if (this.reading[i].descriptor == event.descriptor) {
+                        this.readReady(i)
+                        break
+                    }
+                }
+            }
+        }
+        val now = monotonicMilliseconds()
+        var i = this.reading.size
+        while (i > 0) {
+            i -= 1
+            if (now - this.reading[i].started >= SERVE_SOCKET_TIMEOUT) this.discard(this.reading.takeAt(i))
+        }
+        return
+    }
+
+    // Keep FIFO within a session, and give a different ready session a turn
+    // before servicing another request from the session that just ran.
+    fun take(): ServeQueuedRequest? {
+        if (this.waiting.size == 0) return null
+        if (this.servedSession) {
+            // Rotate the entire session to the back of the ready queue. This
+            // includes requests that arrived while its last turn was running.
+            var remaining = this.waiting.size
+            var i = 0
+            while (i < remaining) {
+                val entry = this.waiting[i]
+                if (serveIsChat(entry.request) && entry.session == this.lastSession) {
+                    this.waiting.append(this.waiting.takeAt(i))
+                    remaining -= 1
+                } else i += 1
+            }
+        }
+        val entry = this.waiting.takeAt(0)
+        this.bytes -= entry.bytes
+        if (serveIsChat(entry.request)) {
+            this.lastSession = entry.session
+            this.servedSession = true
+        }
+        entry
+    }
+}
+
+fun serveQueuedConnection(descriptor: int): TcpConnection {
+    val connection = TcpConnection(descriptor)
+    if (!connection.setNonblocking(false) || !connection.setTimeouts(SERVE_SOCKET_TIMEOUT, SERVE_SOCKET_TIMEOUT)) connection.close()
+    move(connection)
+}

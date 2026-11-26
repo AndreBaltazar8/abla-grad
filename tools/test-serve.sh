@@ -96,6 +96,27 @@ cold_choices=$(choices <<< "$cold")
 [[ -n $cold_choices && $cold_choices == "$(choices <<< "$again")" ]] || fail "restoring the checkpoint changed the greedy response"
 code=$(curl -s -o /dev/null -w '%{http_code}' "$u/v1/chat/completions" -d '{"messages":')
 [ "$code" = 400 ] || fail "bad json should be 400, got $code"
+# Equal prompts may reuse only within the same named session.
+named() { curl -fs "$u/v1/chat/completions" -H "$1: $2" -d "$q"; }
+a=$(named X-Session-ID session-a)
+aw=$(named X-Session-ID session-a)
+b=$(named X-Opencode-Session-Id session-b)
+bw=$(named X-Opencode-Session-Id session-b)
+again_a=$(named X-Session-ID session-a)
+for cold_session in "$a" "$b" "$again_a"; do
+    echo "$cold_session" | grep -F '"cached_tokens":0' >/dev/null || fail "KV was reused across sessions"
+    [[ $(choices <<< "$cold_session") == "$(choices <<< "$r1")" ]] || fail "a session switch changed the response"
+done
+for warm_session in "$aw" "$bw"; do
+    echo "$warm_session" | grep -E '"cached_tokens":[1-9]' >/dev/null || fail "same-session warm prefix was lost"
+done
+
+# A socket whose request is incomplete must not block a complete one.
+exec {partial}<>"/dev/tcp/127.0.0.1/$port"
+printf 'POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n' >&"$partial"
+curl -fs --max-time 5 "$u/health" >/dev/null || fail "partial request blocked a ready client"
+exec {partial}>&-
+
 # greedy output equals `generate` (the server is stopped first: the card holds one model)
 kill "$pid"; wait "$pid" 2>/dev/null || true
 pid=

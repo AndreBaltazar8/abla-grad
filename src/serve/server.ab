@@ -1,7 +1,6 @@
 // `abla-grad serve <model.gguf> [--port N] [--ctx N] [--tokenizer PATH] [--drafter PATH] [--model-name NAME] [--max-tokens N] [--capture-requests FILE] [--no-speculation] [--plain-from TOKENS]`: an OpenAI-compatible server for
-// Inkling on the GPU, on 127.0.0.1 only. One request at a time (the rest wait in the listen queue). Endpoints: GET /v1/models, POST /v1/chat/completions
-// (streaming SSE and plain JSON, tools and tool calls, usage), GET /health. The model's KV cache and state stay between requests: a request whose prompt shares
-// its beginning with the previous conversation (opencode resends the whole history every turn) only processes the tokens after the shared part.
+// Inkling on the GPU, on 127.0.0.1 only. Ready requests share one generation slot. Endpoints: GET /v1/models, POST /v1/chat/completions
+// (streaming SSE and plain JSON, tools and tool calls, usage), GET /health. A request with the same session ID can reuse the shared start of the previous prompt.
 import "abla/io"
 import "abla/text"
 import "abla/integer"
@@ -26,6 +25,7 @@ import "template.ab"
 import "outparse.ab"
 import "openai.ab"
 import "tool_schema.ab"
+import "queue.ab"
 
 // Speculation stops paying near this prompt length (replay of the opencode capture on b97ba0d, speculation / plain decode tok/s: 19.5k 152.8 / 126.9, 38k 121.5 / 124.8,
 // 56k 115.2 / 117.6, 75k 109.1 / 113.0, 111k 101.4 / 105.2): longer prompts decode plain. The crossover lies between 19.5k and 38k.
@@ -77,7 +77,7 @@ private fun serveUtf8Boundary(text: string, cut: int): int {
     at
 }
 
-class ServeCounters(var requests: int = 0, var plainOnly: bool = false)
+class ServeCounters(var requests: int = 0, var plainOnly: bool = false, var residentSession: string = "")
 
 /** The state of one running chat request: what was sent, what is held back for stop strings, and the calls found. */
 class ServeRun(
@@ -148,7 +148,8 @@ class ServeRun(
 /** Handles one chat-completions request on `connection`. */
 private fun serveChat(
     var backend: Backend, var model: InklingModel, var session: SpecSession, var connection: TcpConnection, tokenizer: Tokenizer, stops: array<int>,
-    ids: array<int>, body: string, modelName: string, context: int, defaultMaxTokens: int, var counters: ServeCounters
+    ids: array<int>, body: string, modelName: string, context: int, defaultMaxTokens: int, sessionKey: string,
+    var counters: ServeCounters, var queue: ServeQueue
 ): bool {
     val started = monotonicNanoseconds()
     val errors: array<string> = []
@@ -176,6 +177,12 @@ private fun serveChat(
     val created = realtimeMilliseconds() / 1000
     val name = if (request.model != "") request.model else modelName
     cudaClearAllocationError()
+    // The target and drafter have one resident KV cache. Clearing session
+    // boundaries also invalidates both prompt checkpoints.
+    if (counters.residentSession != sessionKey) {
+        session.restart()
+        counters.residentSession = sessionKey
+    }
     val kept = session.reuse(backend, model, tokens)
     val parser = ServeOutputParser(ids[0], ids[1], ids[2], ids[3], ids[4])
     val streaming = request.stream
@@ -205,6 +212,7 @@ private fun serveChat(
             if (run.firstRaw == 0) run.firstRaw = monotonicNanoseconds()
             if (token == ids[3] && parser.state == 1) bodyAt = position + 1
             position += 1
+            if ((position & 15) == 0) queue.pump(0)
             parser.feed(token, tokenizer.decodePiece(token), events)
             for (event in events) {
                 if (event.kind == 3 && rules.size > 0) {
@@ -390,27 +398,29 @@ fun cmdServe(args: array<string>): int {
     var session = specSessionCreate(backend, model, draftFile, SPEC_DEFAULT_PROPOSALS, true) ?? return serveFail("setting up speculation failed: ${speculateLastError()} ${cudaLastDiagnostic()}; try a smaller --ctx")
     session.exactWindow = 192
     if (!serveWarmPrefill(backend, model, context)) return 1
-    var listener = tcpListenAddress(ipv4SocketAddress("127.0.0.1", port), 16)
-    if (listener.descriptor < 0) {
-        eprintln("serve: cannot listen on 127.0.0.1:$port")
-        return 1
+    val listener = tcpListenAddress(ipv4SocketAddress("127.0.0.1", port), 16)
+    if (listener.descriptor < 0 || !listener.setNonblocking()) return serveFail("cannot listen on 127.0.0.1:$port")
+    val poller = socketPoller()
+    if (poller.descriptor < 0 || !poller.watchDescriptor(listener.descriptor) || !poller.watchGracefulShutdown()) {
+        return serveFail("cannot start the request poller")
     }
+    val queue = ServeQueue(listener.descriptor, poller.descriptor)
+    defer { queue.closePending() }
     val capture = if (capturePath == "") null else serveCaptureFile(capturePath)
     if (capture != null && capture.descriptor < 0) return serveFail("could not create a new request capture file at $capturePath")
     eprintln("serve: listening on http://127.0.0.1:$port (model '$modelName')")
     val counters = ServeCounters()
     counters.plainOnly = plainOnly
     val created = realtimeMilliseconds() / 1000
-    tcpEnableGracefulShutdown()
     while (!tcpShutdownRequested()) {
-        var connection = listener.acceptUntilShutdown()
+        queue.pump(if (queue.waiting.size == 0) 1000 else 0)
+        if (queue.failed) return serveFail("the request poller failed")
+        if (tcpShutdownRequested()) break
+        val entry = queue.take()
+        if (entry == null) continue
+        var connection = serveQueuedConnection(entry.descriptor)
         if (connection.descriptor < 0) continue
-        val raw = httpReadRequest(connection, 65536, 67108864)
-        if (raw == "") {
-            connection.close()
-            continue
-        }
-        val request = httpParseRequest(raw)
+        val request = entry.request
         val path = request.path
         if (request.method == "OPTIONS") {
             connection.write("HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nConnection: close\r\n\r\n")
@@ -427,18 +437,14 @@ fun cmdServe(args: array<string>): int {
                 connection.close()
                 return serveFail("writing the request capture failed")
             }
-            val keepServing = serveChat(backend, model, session, connection, tokenizer, stops, ids, request.body, modelName, context, maxTokens, counters)
+            val keepServing = serveChat(backend, model, session, connection, tokenizer, stops, ids, request.body, modelName, context, maxTokens, entry.session, counters, queue)
             connection.close()
-            if (!keepServing) {
-                listener.close()
-                return 1
-            }
+            if (!keepServing) return 1
         } else {
             serveWriteError(connection, 404, "no such endpoint: ${request.method} $path", "invalid_request_error", "not_found")
             connection.close()
         }
     }
-    listener.close()
     0
 }
 

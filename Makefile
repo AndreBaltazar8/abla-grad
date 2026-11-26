@@ -18,6 +18,7 @@ test-host:
 	@dir=$$(mktemp -d) && trap 'rm -f -- "$$dir/input.gguf" "$$dir/output.gguf"; rmdir -- "$$dir"' EXIT && $(BUILD)/pack_inkling_test $(BUILD)/pack-inkling "$$dir"
 	$(COMPILER) build tests/generate_host_test.ab -o $(BUILD)/generate_host_test --fast --no-cache && $(BUILD)/generate_host_test
 	$(COMPILER) build tests/serve_tool_schema_test.ab -o $(BUILD)/serve_tool_schema_test --fast --no-cache && $(BUILD)/serve_tool_schema_test
+	$(COMPILER) build tests/serve_queue_test.ab -o $(BUILD)/serve_queue_test --fast --no-cache && $(BUILD)/serve_queue_test
 	tools/test-fuse.sh $(COMPILER)
 
 # Tests that need the GPU (the CUDA backend and its kernels). Run in `nix-shell shell.nix`.
