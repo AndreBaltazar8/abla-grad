@@ -17,11 +17,11 @@ fun groupedLaunch(backend: Backend, name: string, w: DeviceBuffer, x: DeviceBuff
     backend.launch(name, kernelArgs().pointer(w).pointer(x).pointer(xmap).pointer(y).pointer(scales).pointer(plan).u32(rows).u32(cols).u32(nExpert).u64(stride),
         [rows, maxTiles])
 
-trusted fun testGrouped(backend: Backend, kind: string, elements: int, blockBytes: int, decode: (string) -> array<f32>, tile: int, identityMap: bool, direct: bool = false, blockCount: int = 0, int8: bool = false): bool {
+trusted fun testGrouped(backend: Backend, kind: string, elements: int, blockBytes: int, decode: (string) -> array<f32>, tile: int, identityMap: bool, direct: bool = false, blockCount: int = 0, int8: bool = false, packedTest: bool = false): bool {
     val nExpert = 6
     val k = 2
-    val tokens = 50
-    val rows = if (int8) 130 else 70
+    val tokens = if (packedTest) 129 else 50
+    val rows = if (packedTest) 256 else if (int8) 130 else 70
     val blocks = if (blockCount > 0) blockCount else if (elements == 256) 1 else 3
     val cols = blocks * elements
     val rowBytes = blocks * blockBytes
@@ -114,6 +114,28 @@ trusted fun testGrouped(backend: Backend, kind: string, elements: int, blockByte
                 if (!testNear("fused gate-up $tile", i, testLoadFloat(fa, i),
                     f32ToF64(testLoadFloat(ua, i)), 0.000001, 0.000001)) return false
             }
+            if (packedTest) {
+                val packedBytes = pairs * features
+                val scaleBytes = packedBytes / 8
+                val output = backend.allocate(packedBytes + scaleBytes) ?? return false
+                val reference = backend.allocate(packedBytes + scaleBytes) ?? return false
+                if (!backend.launch("matmul_nvfp4_grouped_i8_situ_pack", kernelArgs().pointer(dw).pointer(qx).pointer(dsorted)
+                    .pointer(output).pointer(dscales).pointer(dplan).u32(rows).u32(cols).u32(nExpert).u64(stride).pointer(sx)
+                    .f32(beta).f32(lb).pointer(output, packedBytes), [features, maxTiles]) ||
+                    !backend.launch("quantize_rows_i8", kernelArgs().pointer(fused).pointer(reference).pointer(reference, packedBytes)
+                        .u32(pairs).u32(features), [features / 4, pairs])) return false
+                val packedHost = nativeByteBuffer(packedBytes + scaleBytes)
+                val referenceHost = nativeByteBuffer(packedBytes + scaleBytes)
+                val pa = nativePointerAddress(packedHost.address)
+                val ra = nativePointerAddress(referenceHost.address)
+                if (!backend.download(output, 0, pa, packedHost.capacity) || !backend.download(reference, 0, ra, referenceHost.capacity)) return false
+                for (word in 0 until packedHost.capacity / 4) {
+                    if (loadU32(pa, word) != loadU32(ra, word)) {
+                        eprintln("packed SiTU word $word differs from standalone quantization")
+                        return false
+                    }
+                }
+            }
         }
         true
     } else if (identityMap) groupedLaunch(backend, "matmul_${kind}_grouped${suffix}", dw, dx, diota, dy, dscales, dplan, rows, cols, nExpert, stride, maxTiles)
@@ -180,6 +202,7 @@ fun verify(backend: Backend): bool {
     if (!testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, false, false, 2, true) ||
         !testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, 64, false, false, 4, true) ||
         !testGrouped(backend, "q5_k", 256, 176, oracleQ5K, 64, false, false, 1, true)) return false
+    if (!testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, 64, false, false, 3, true, true)) return false
     for (tile in [64, 32]) {
         if (!testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, tile, false) || !testGrouped(backend, "nvfp4", 64, 36, oracleNvfp4, tile, true)) return false
         if (!testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, tile, false) || !testGrouped(backend, "q8_0", 32, 34, oracleQ8_0, tile, true)) return false

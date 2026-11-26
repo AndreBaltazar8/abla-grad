@@ -42,6 +42,9 @@ private val prefillNvfp4I8Body = """
 #ifndef I8_FUSED
 #define I8_FUSED 0
 #endif
+#ifndef I8_PACK_SITU
+#define I8_PACK_SITU 0
+#endif
 #ifndef I8_Q8
 #define I8_Q8 0
 #endif
@@ -82,6 +85,36 @@ static __device__ __forceinline__ void i8_mma(int (&d)[4], const unsigned (&a)[2
         : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(b), "r"(zero));
 }
+
+#if I8_PACK_SITU
+static __device__ __forceinline__ void i8_store_situ_pack(
+    unsigned *out, float *scales, unsigned col, unsigned features, unsigned feature,
+    unsigned g, bool validToken, float a, float b, float c, float d) {
+    float peak = fmaxf(fmaxf(fabsf(a), fabsf(b)), fmaxf(fabsf(c), fabsf(d)));
+    // Four lanes per feature group hold the four token pairs. For one
+    // token, the lanes at strides of four collectively hold 32 features.
+    #pragma unroll
+    for (unsigned offset = 16; offset >= 4; offset >>= 1)
+        peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, offset));
+    const float inv = peak > 0.0f ? 127.0f / peak : 0.0f;
+    const unsigned qa = unsigned(int(roundf(a * inv))) & 255u;
+    const unsigned qb = unsigned(int(roundf(b * inv))) & 255u;
+    const unsigned qc = unsigned(int(roundf(c * inv))) & 255u;
+    const unsigned qd = unsigned(int(roundf(d * inv))) & 255u;
+    const unsigned low = qa | (qb << 8);
+    const unsigned high = qc | (qd << 8);
+    const unsigned lowPeer = __shfl_xor_sync(0xffffffffu, low, 4);
+    const unsigned highPeer = __shfl_xor_sync(0xffffffffu, high, 4);
+    if (validToken && (g & 1u) == 0) {
+        const unsigned group = feature - g;
+        const auto row = static_cast<unsigned long long>(col);
+        const auto word = row * (features / 4) + group / 4 + g / 2;
+        out[word] = low | (lowPeer << 16);
+        out[word + 4] = high | (highPeer << 16);
+        if (g == 0) scales[row * (features / 32) + group / 32] = inv != 0.0f ? 1.0f / inv : 0.0f;
+    }
+}
+#endif
 
 extern "C" __global__ void I8_LAUNCH_BOUNDS I8_KERNEL(
 #if I8_X5
@@ -125,6 +158,9 @@ extern "C" __global__ void I8_LAUNCH_BOUNDS I8_KERNEL(
     unsigned nExpert, unsigned long long expertStride, const float *sx
 #if I8_FUSED
     , float beta, float lb
+#endif
+#if I8_PACK_SITU
+    , float *packedScales
 #endif
     ) {
     if (blockIdx.y >= plan[nExpert + 1]) return;
@@ -353,6 +389,25 @@ extern "C" __global__ void I8_LAUNCH_BOUNDS I8_KERNEL(
         }
     }
     __syncthreads();
+#if I8_PACK_SITU
+    if (!gateWarp && n0 + mr % (I8_ROWS / 2) < features) {
+        #pragma unroll
+        for (unsigned n = 0; n < 4; ++n) {
+            if (begin + mt + 8 * n >= end) break;
+            const unsigned col = mt + 8 * n + 2 * t;
+            const unsigned r = n0 + featureLane;
+            #pragma unroll
+            for (unsigned j = 0; j < 2; ++j) {
+                const float a = grad_situ(storage.gate[col + j][featureLane], acc[0][n][j] * scale, beta, lb);
+                const float b = grad_situ(storage.gate[col + j][featureLane + 8], acc[0][n][j + 2] * scale, beta, lb);
+                const float c = grad_situ(storage.gate[col + j][featureLane + 16], acc[1][n][j] * scale, beta, lb);
+                const float d = grad_situ(storage.gate[col + j][featureLane + 24], acc[1][n][j + 2] * scale, beta, lb);
+                i8_store_situ_pack(reinterpret_cast<unsigned *>(y), packedScales, begin + col + j, features, r, g,
+                    begin + col + j < end, a, b, c, d);
+            }
+        }
+    }
+#else
     if (!gateWarp) {
         #pragma unroll
         for (unsigned i = 0; i < 2; ++i) {
@@ -372,6 +427,7 @@ extern "C" __global__ void I8_LAUNCH_BOUNDS I8_KERNEL(
             }
         }
     }
+#endif
 #else
     #pragma unroll
     for (unsigned i = 0; i < 2; ++i) {
@@ -399,4 +455,7 @@ val kernelPrefillQ8I8X5 = "#define I8_Q8 1\n#define I8_X5 1\n#define I8_KERNEL m
 val kernelPrefillQ5GroupedI8 = "#define I8_Q5 1\n#define I8_KERNEL matmul_q5_k_grouped_i8\n" + prefillNvfp4I8Body
 
 val kernelPrefillInt8Situ = "#define I8_LAUNCH_BOUNDS __launch_bounds__(256, 3)\n#define I8_FUSED 1\n#define I8_KERNEL matmul_nvfp4_grouped_i8_situ\n" +
+    kernelSituDeviceSource + "\n" + prefillNvfp4I8Body
+
+val kernelPrefillInt8SituPack = "#define I8_LAUNCH_BOUNDS __launch_bounds__(256, 3)\n#define I8_FUSED 1\n#define I8_PACK_SITU 1\n#define I8_KERNEL matmul_nvfp4_grouped_i8_situ_pack\n" +
     kernelSituDeviceSource + "\n" + prefillNvfp4I8Body
