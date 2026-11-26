@@ -4,6 +4,7 @@ import "abla/bytes"
 import "abla/fs"
 import "abla/json"
 import "abla/text"
+import "abla/unsafe/memory"
 
 private var tokenizerError = ""
 
@@ -36,18 +37,37 @@ private fun bpeByteAlphabet(): array<int> {
 
 private val bpeInverseAlphabet = bpeByteAlphabet()
 
-private fun bpeDecodeAlphabet(encoded: string): string {
-    val output = byteBuffer()
+private trusted fun bpeDecodeAlphabet(encoded: string): string {
+    // The printable ASCII tokens already contain their original bytes.
     var at = 0
+    while (at < encoded.size && encoded[at] >= 33 && encoded[at] <= 126) at += 1
+    if (at == encoded.size) return encoded
+    val output = nativeByteBuffer(encoded.size + 1)
+    // Copy the unchanged prefix only when conversion is actually needed.
+    for (i in 0 until at) output.store(i, encoded[i])
+    var length = at
     while (at < encoded.size) {
-        val scalar = utf8DecodeAt(encoded, at)
-        if (scalar < 0 || scalar >= bpeInverseAlphabet.size) return ""
-        val byte = bpeInverseAlphabet[scalar]
-        if (byte < 0) return ""
-        output.appendByteValue(byte)
-        at += utf8SequenceLength(encoded[at])
+        val lead = encoded[at]
+        var scalar = lead
+        at += 1
+        if (lead >= 128) {
+            // All non-ASCII entries in this alphabet are two-byte UTF-8.
+            if (lead < 194 || lead > 197 || at >= encoded.size ||
+                encoded[at] < 128 || encoded[at] > 191) {
+                output.close()
+                return ""
+            }
+            scalar = (lead - 192) * 64 + encoded[at] - 128
+            at += 1
+        }
+        if (scalar >= bpeInverseAlphabet.size || bpeInverseAlphabet[scalar] < 0) {
+            output.close()
+            return ""
+        }
+        output.store(length, bpeInverseAlphabet[scalar])
+        length += 1
     }
-    output.toText()
+    output.adoptString(length)
 }
 
 private fun bpePair(left: int, right: int): int = (left << 32) | right
@@ -59,7 +79,7 @@ private class TokenizerVocabulary(
     val byteIds: array<int>, val special: array<TokenizerSpecial>, val heads: Map<int, bool>
 )
 
-private fun bpeVocabulary(encoded: array<string>, types: array<int>): TokenizerVocabulary? {
+private fun bpeVocabulary(encoded: array<string>, types: array<int>, var encodedIds: Map<string, int>): TokenizerVocabulary? {
     if (encoded.size != types.size || encoded.size == 0 || encoded.size > 1048576) return null
     val pieces: array<string> = []
     val ids: Map<string, int> = Map()
@@ -79,6 +99,7 @@ private fun bpeVocabulary(encoded: array<string>, types: array<int>): TokenizerV
             val raw = bpeDecodeAlphabet(spelling)
             if (raw == "" || ids.has(raw)) return null
             ids.set(raw, i)
+            encodedIds.set(spelling, i)
             pieces.append(raw)
         }
     }
@@ -93,12 +114,12 @@ private fun bpeVocabulary(encoded: array<string>, types: array<int>): TokenizerV
 
 private class TokenizerMerges(val ranks: Map<int, int>, val results: array<int>)
 
-private fun TokenizerMerges.addRule(vocab: TokenizerVocabulary, left: string, right: string): bool {
-    val l = bpeDecodeAlphabet(left)
-    val r = bpeDecodeAlphabet(right)
-    val a = vocab.ids.get(l)
-    val b = vocab.ids.get(r)
-    val merged = vocab.ids.get(l + r)
+private fun TokenizerMerges.addRule(encodedIds: Map<string, int>, left: string, right: string): bool {
+    // The byte alphabet is bijective, so the encoded pair and its
+    // concatenation identify the same tokens without decoding again.
+    val a = encodedIds.get(left)
+    val b = encodedIds.get(right)
+    val merged = encodedIds.get(left + right)
     if (a == null || b == null || merged == null) return false
     val pair = bpePair(a, b)
     if (this.ranks.has(pair)) return false
@@ -299,14 +320,15 @@ fun tokenizerFromGguf(file: GgufFile): Tokenizer? {
     val encoded = file.getStringArray("tokenizer.ggml.tokens") ?? return tokenizerFail("missing GGUF vocabulary")
     val types = file.getIntArray("tokenizer.ggml.token_type") ?? return tokenizerFail("missing GGUF token types")
     val rules = file.getStringArray("tokenizer.ggml.merges") ?? return tokenizerFail("missing GGUF merge rules")
-    val vocab = bpeVocabulary(encoded, types)
+    val encodedIds: Map<string, int> = Map()
+    val vocab = bpeVocabulary(encoded, types, encodedIds)
     if (vocab == null) return tokenizerFail("invalid GGUF token vocabulary")
     val merges = TokenizerMerges(Map(), [])
     for (i in 0 until rules.size) {
         val rule = rules[i]
         val space = textFindByte(rule, 32)
         if (space <= 0 || space + 1 >= rule.size ||
-            !merges.addRule(vocab, rule.slice(0, space), rule.slice(space + 1, rule.size))) {
+            !merges.addRule(encodedIds, rule.slice(0, space), rule.slice(space + 1, rule.size))) {
             return tokenizerFail("invalid GGUF merge rule $i")
         }
     }
@@ -390,13 +412,14 @@ fun tokenizerFromJson(filePath: string): Tokenizer? {
         if (content == "<|content_model_end_sampling|>") eos = id
     }
 
-    val vocab = bpeVocabulary(encoded, types)
+    val encodedIds: Map<string, int> = Map()
+    val vocab = bpeVocabulary(encoded, types, encodedIds)
     if (vocab == null) return tokenizerFail("invalid tokenizer.json byte alphabet")
     val merges = TokenizerMerges(Map(), [])
     for (i in 0 until rules.size()) {
         val rule = rules.at(i)
         if (!rule.isArray() || rule.size() != 2 ||
-            !merges.addRule(vocab, rule.at(0).asString(), rule.at(1).asString())) {
+            !merges.addRule(encodedIds, rule.at(0).asString(), rule.at(1).asString())) {
             return tokenizerFail("invalid tokenizer.json merge rule $i")
         }
     }
