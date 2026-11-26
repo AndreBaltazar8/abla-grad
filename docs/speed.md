@@ -161,8 +161,8 @@ rows byte for byte. Raw measurements and commands are in
 Same private eight-request capture, original GGUF and DSpark. Session HTTP
 is the sum of the requests and excludes model load. Other columns describe
 the final request. Request 5 stopped after 261 tokens on `b22b960`
-and hit the 512-token limit from `cf6578c` through `aff4ad8`. The title request produced 167
-tokens on `2ea30b6`, down from 198 on `86df7a9`.
+and hit the 512-token limit from `cf6578c` through `5f39f33`. The title
+request produced 167 tokens on `2ea30b6`, down from 198 on `86df7a9`.
 
 | Main landing | Prompt tokens | Reused tokens | Generated tokens | First raw token (s) | Decode (tok/s) | Final HTTP (s) | Session HTTP (s) |
 |:---|---:|---:|---:|---:|---:|---:|---:|
@@ -178,6 +178,7 @@ tokens on `2ea30b6`, down from 198 on `86df7a9`.
 | `2ea30b6` | 74917 | 56662 | 202 | 9.005 | 108.13 | 10.874 | 45.100 |
 | `45da9c5` | 74917 | 56662 | 202 | 9.353 | 107.43 | 11.233 | 47.126 |
 | `aff4ad8` | 74917 | 56662 | 202 | 9.088 | 110.22 | 10.920 | 44.837 |
+| `5f39f33` | 74917 | 56662 | 202 | 7.463 | 113.04 | 9.251 | 40.547 |
 
 ```sh
 capture="$HOME/archive/abla-grad-serve-replay/capture/requests.jsonl"
