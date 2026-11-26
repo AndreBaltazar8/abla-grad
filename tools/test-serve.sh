@@ -33,6 +33,9 @@ if [[ ${2:-} == --batch ]]; then
         local index=$1 key=$2
         local text="Count upward from $((101 + 100 * index)), using comma separators and no explanation."
         local count=$((16 + 7 * index))
+        if [[ $index == 3 ]]; then
+            text="$(awk 'BEGIN { for (i=0;i<70;i++) printf "The last line lists a number. " }')$text"
+        fi
         curl --max-time 45 -fs "$u/v1/chat/completions" -H "X-Session-ID: $key" \
             --data-binary "$(jq -nc --arg text "$text" --argjson count "$count" \
                 '{messages:[{role:"user",content:$text}],max_tokens:$count}')"
@@ -41,9 +44,8 @@ if [[ ${2:-} == --batch ]]; then
     for i in 0 1 2 3; do chat_batch "$i" "single-$i" >"$run_dir/single-$i.json"; done
     # Hold the model briefly while the four HTTP requests become ready.
     # This makes the cohort independent of curl process scheduling.
-    curl --max-time 45 -fs "$u/v1/chat/completions" -H 'X-Session-ID: blocker' \
-        -d '{"messages":[{"role":"user","content":"List consecutive positive integers starting with 101, using comma separators and no explanation."}],"max_tokens":192}' \
-        >"$run_dir/blocker.json" &
+    barrier='{"messages":[{"role":"user","content":"List consecutive positive integers starting with 101, using comma separators and no explanation."}],"max_tokens":192}'
+    curl --max-time 45 -fs "$u/v1/chat/completions" -H 'X-Session-ID: blocker' -d "$barrier" >"$run_dir/blocker.json" &
     blocker=$!
     for _ in {1..300}; do
         [[ -z $(ss -Htn state established "sport = :$port") ]] || break
@@ -63,6 +65,9 @@ if [[ ${2:-} == --batch ]]; then
         [[ $(jq -er '.usage.prompt_tokens_details.cached_tokens' "$run_dir/batch-$i.json") == 0 ]] ||
             fail "batch lane $i reused another session's prompt"
     done
+    warm=$(curl --max-time 45 -fs "$u/v1/chat/completions" -H 'X-Session-ID: blocker' -d "${barrier/192/8}")
+    cached=$(jq -er '.usage.prompt_tokens_details.cached_tokens' <<<"$warm")
+    ((cached > 0)) || fail "the batch replaced a live serial prefix"
     echo "test-serve: four independent batched sessions match plain decode"
     exit 0
 fi
