@@ -135,6 +135,27 @@ tools/gpu-lock.sh -- taskset -c 24-27 "$ttft/run-ttft.sh" "$n" 18082 "$grad" rep
 The harness warms up once, sends the matching `chat$n.json` and records SSE
 and the server log. Source results are `raw/ttft-batch-d*.server.log`.
 
+### Packed global prefill
+
+RTX 4090, Inkling with DSpark, same natural-text requests and 512-token
+chunks as above. Each value is the median of two runs in opposite
+baseline/candidate order. Each request starts with zero reused tokens.
+
+| Prompt tokens | Raw TTFT `ea22de6` (s) | Raw TTFT `bac15d0` (s) | Streamed `ea22de6` (s) | Streamed `bac15d0` (s) |
+|---:|---:|---:|---:|---:|
+| 8,192 | 3.288 | 3.286 | 3.349 | 3.347 |
+| 32,768 | 9.802 | 9.576 | 9.866 | 9.639 |
+| 131,072 | 52.054 | 42.661 | 52.130 | 42.739 |
+
+In an Nsight Systems profile of the baseline's synthetic 128k prefill,
+global FP8 attention took 22.277 s of 43.757 s GPU time (51%). Matrix
+products took 14.511 s, sliding attention 2.081 s and KV writes 0.035 s.
+In isolation the packed eight-byte FP8 load cut the deepest 512-query
+attention call from 21.99 to 12.69 ms with identical output bytes.
+Forced block Q8 and native FP8 each matched all 1,624 reference logit
+rows byte for byte. Raw measurements and commands are in
+`~/archive/abla-grad-prefill-attention-1272.da3VLcEx`.
+
 ## Serve replay
 
 Same private eight-request capture, original GGUF and DSpark. Session HTTP
