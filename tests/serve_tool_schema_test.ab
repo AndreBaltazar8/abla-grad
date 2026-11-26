@@ -1,0 +1,20 @@
+import "abla/io"
+import "abla/json"
+import "../src/serve/tool_schema.ab"
+
+private fun repair(rules: array<ServeToolRule>, name: string, body: string): string? =
+    serveToolRepair(rules, name, body, jsonParse(body).value)
+
+fun main: int {
+    val rules = serveToolRules(jsonParse("[{\"function\":{\"name\":\"edit\",\"parameters\":{\"required\":[\"path\"],\"properties\":{\"options\":{\"required\":[\"mode\"]}}}}}]").value.values)
+    val invalid = "{ \"name\": \"edit\", \"args\": {\"oldString\":\"a\"} }"
+    val prefix = repair(rules, "edit", invalid)
+    if (prefix != "{ \"name\": \"edit\", \"args\": {\"oldString\":\"a\",\"path\":") return 1
+    val repaired = "${prefix ?? ""}\"style.css\"}}"
+    if (repair(rules, "edit", repaired) != null || jsonParse(repaired).value.get("args").getString("oldString") != "a") return 1
+    val nested = repair(rules, "edit", "{\"name\":\"edit\",\"args\":{\"options\":{\"keep\":true},\"path\":\"style.css\"}}")
+    if (nested != "{\"name\":\"edit\",\"args\":{\"path\":\"style.css\",\"options\":{\"keep\":true,\"mode\":") return 1
+    if (repair(rules, "other", invalid) != null) return 1
+    println("serve required tool fields and values passed")
+    0
+}

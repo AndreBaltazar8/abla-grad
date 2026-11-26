@@ -207,6 +207,9 @@ class Tokenizer(
         ids
     }
 
+    // Returns the original bytes of one token, including special spellings.
+    fun decodePiece(id: int): string = if (id >= 0 && id < this.vocab.pieces.size) this.vocab.pieces[id] else ""
+
     // Decodes token ids to original bytes, including special spellings.
     // Invalid ids produce an empty result.
     fun decode(ids: array<int>): string {

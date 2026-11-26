@@ -1,0 +1,96 @@
+// A candidate tool message can use the usual speculative decoder. If it
+// closes before writing a required key, reopen its object at that key and
+// resume sampling the value. No invalid candidate is sent to the client.
+import "abla/json"
+import "abla/text"
+import "../tokenizer/tokenizer.ab"
+
+class ServeToolRule(val name: string, val schema: Json)
+
+fun serveToolRules(tools: array<Json>): array<ServeToolRule> {
+    val rules: array<ServeToolRule> = []
+    for (tool in tools) {
+        val fn = if (tool.has("function")) tool.get("function") else tool
+        val schema = fn.get("parameters")
+        if (schema.isObject()) rules.append(ServeToolRule(fn.getString("name"), schema))
+    }
+    rules
+}
+
+private fun toolObjectPrefix(args: Json): string {
+    val text = jsonStringify(args)
+    text.slice(0, text.size - 1) + (if (args.size() == 0) "" else ",")
+}
+
+// Returns the prefix ending immediately after the colon of the first missing
+// required property. When it is nested, move that object last so its siblings
+// and any values already chosen by the model can stay in the prefix.
+private fun requiredPrefix(args: Json, schema: Json): string? {
+    if (!args.isObject() || !schema.isObject()) return null
+    val required = schema.get("required")
+    if (required.isArray()) {
+        for (property in required.values) {
+            if (property.isString() && !args.has(property.asString())) {
+                return toolObjectPrefix(args) + jsonStringify(property) + ":"
+            }
+        }
+    }
+    val children = schema.get("properties")
+    if (!children.isObject()) return null
+    for (key in args.keys) {
+        if (children.has(key)) {
+            val child = requiredPrefix(args.get(key), children.get(key))
+            if (child != null) {
+                val keys: array<string> = []
+                val values: array<Json> = []
+                for (sibling in args.keys) {
+                    if (sibling != key) {
+                        keys.append(sibling)
+                        values.append(args.get(sibling))
+                    }
+                }
+                return toolObjectPrefix(jsonObject(keys, values)) + jsonStringify(jsonString(key)) + ":" + child
+            }
+        }
+    }
+    null
+}
+
+// Keep the model's original spelling up to the args terminator if possible.
+// This also handles a token that contains both value bytes and closing braces.
+fun serveToolRepair(rules: array<ServeToolRule>, name: string, body: string, parsed: Json): string? {
+    for (rule in rules) {
+        if (rule.name != name) continue
+        val args = parsed.get("args")
+        val prefix = requiredPrefix(args, rule.schema) ?? return null
+        val canonical = toolObjectPrefix(args)
+        val outer = body.trim()
+        if (prefix.startsWith(canonical) && outer.endsWith("}") && parsed.keys[parsed.keys.size - 1] == "args") {
+            val inner = outer.slice(0, outer.size - 1).trim()
+            if (inner.endsWith("}")) {
+                val tail = prefix.slice(canonical.size, prefix.size)
+                val comma = if (args.size() > 0) "," else ""
+                return inner.slice(0, inner.size - 1) + comma + tail
+            }
+        }
+        return "{\"name\":${jsonStringify(jsonString(name))},\"args\":$prefix"
+    }
+    null
+}
+
+// Reuse the exact sampled tokens up to the repair rather than retokenizing the
+// conversation. Only the unmatched suffix of the new tool-body prefix is forced.
+fun serveToolContinuation(tokenizer: Tokenizer, seq: array<int>, bodyAt: int, body: string): array<int> {
+    var keep = bodyAt
+    var matched = 0
+    while (keep < seq.size && matched < body.size) {
+        val piece = tokenizer.decodePiece(seq[keep])
+        if (piece == "" || piece.size > body.size - matched || body.slice(matched, matched + piece.size) != piece) break
+        matched += piece.size
+        keep += 1
+    }
+    val tokens: array<int> = []
+    for (i in 0 until keep) tokens.append(seq[i])
+    for (id in tokenizer.encode(body.slice(matched, body.size), false)) tokens.append(id)
+    tokens
+}

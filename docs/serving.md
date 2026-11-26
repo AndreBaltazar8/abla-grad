@@ -11,6 +11,8 @@ SHA-256 `3da00cf7c31bbe5662b3c0d373ecf782d74d32ef43990acc158ce60c2add72e0`.
 - `GET /health`, `GET /v1/models`, and `POST /v1/chat/completions` support OpenAI clients. No API key is required.
 - Chat accepts JSON or SSE, including streaming usage, tool calls and tool results. Reasoning text is returned in `reasoning_content`.
 - The server honors `max_tokens`, `stop` and `reasoning_effort`. Generation is greedy.
+- Tool calls enforce `required` fields in the argument object and in nested objects declared with `properties`. If a call closes early, the server resumes generation at the missing field within the request budget.
+- The server warms the short and batched prefill kernels before it starts listening. A fresh CUDA cache can add compilation time to startup.
 - Requests are serialized. A shared prompt prefix can reuse KV and convolution state. The server checkpoints before the final prompt token and can keep a second checkpoint for edits at 4,096-token boundaries. Usage reports the actual reuse in `prompt_tokens_details.cached_tokens`.
 - `tools/gpu-lock.sh -- tools/test-serve.sh` checks response shapes, tool calls, prefix reuse and greedy parity.
 - `tools/test-allocation-failure.sh` injects CUDA allocation failures in `decode-bench` and `serve` and checks the requested byte counts and exit codes. It takes the GPU lock for each run.

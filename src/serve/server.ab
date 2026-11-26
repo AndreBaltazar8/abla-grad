@@ -25,6 +25,7 @@ import "../cli/chat.ab"
 import "template.ab"
 import "outparse.ab"
 import "openai.ab"
+import "tool_schema.ab"
 
 // Speculation stops paying near this prompt length (replay of the opencode capture on b97ba0d, speculation / plain decode tok/s: 19.5k 152.8 / 126.9, 38k 121.5 / 124.8,
 // 56k 115.2 / 117.6, 75k 109.1 / 113.0, 111k 101.4 / 105.2): longer prompts decode plain. The crossover lies between 19.5k and 38k.
@@ -184,24 +185,80 @@ private fun serveChat(
         connection.write(serveChunk(id, created, name, jsonObject(["role", "content"], [jsonString("assistant"), jsonString("")]), "", -1, 0, 0, true))
     }
     val run = ServeRun(fd, streaming, id, created, name, request.stop, "call_${counters.requests}")
-    val control = SpecControl()
+    val rules = serveToolRules(tools)
     val events: array<ServeEvent> = []
     var stats = SpecStats()
-    val ok = session.turn(backend, model, maxTokens, stops, true, counters.plainOnly || tokens.size > servePlainFrom, control, stats, { token ->
-        if (run.firstRaw == 0) run.firstRaw = monotonicNanoseconds()
-        parser.feed(token, tokenizer.decode([token]), events)
-        for (event in events) run.handle(event)
-        if (run.cancel) control.cancel = true
-        events.clear()
-    })
+    var decodeNanos = 0
+    var sampled = 0
+    var remaining = maxTokens
+    var bodyAt = 0
+    var constraintError = ""
+    var repairs = 0
+    var waitingTool = ""
+    var ok = true
+    while (remaining > 0) {
+        val control = SpecControl()
+        var repair: string? = null
+        var position = session.seq.size
+        stats = SpecStats()
+        ok = session.turn(backend, model, remaining, stops, true, counters.plainOnly || tokens.size > servePlainFrom, control, stats, { token ->
+            if (run.firstRaw == 0) run.firstRaw = monotonicNanoseconds()
+            if (token == ids[3] && parser.state == 1) bodyAt = position + 1
+            position += 1
+            parser.feed(token, tokenizer.decodePiece(token), events)
+            for (event in events) {
+                if (event.kind == 3 && rules.size > 0) {
+                    if (waitingTool != "" && event.name != waitingTool) continue
+                    repair = serveToolRepair(rules, event.name, parser.body, parser.parsedTool)
+                    if (repair != null) {
+                        waitingTool = event.name
+                        control.cancel = true
+                        break
+                    }
+                    waitingTool = ""
+                }
+                if (waitingTool == "") run.handle(event)
+            }
+            if (run.cancel) control.cancel = true
+            events.clear()
+        })
+        if (sampled > 0) decodeNanos += stats.feedNanos
+        decodeNanos += stats.loopNanos
+        sampled += stats.generated
+        val nextBody = repair
+        if (!ok || nextBody == null || run.cancel) break
+        val continuation = serveToolContinuation(tokenizer, session.seq, bodyAt, nextBody)
+        remaining = maxTokens - sampled
+        val outputBudget = maxTokens - (continuation.size - tokens.size)
+        if (remaining > outputBudget) remaining = outputBudget
+        val space = context - continuation.size
+        if (remaining > space) remaining = space
+        if (remaining <= 0) {
+            constraintError = "the token budget ended before a required tool argument could be generated"
+            ok = false
+            break
+        }
+        repairs += 1
+        session.reuse(backend, model, continuation)
+        parser.body = nextBody
+        parser.state = 2
+        parser.kind = 3
+    }
+    if (ok && waitingTool != "" && !run.cancel) {
+        constraintError = "generation ended before the required arguments for $waitingTool were complete"
+        ok = false
+    }
+    if (repairs > 0) eprintln("[serve] constrained tool arguments: $repairs continuations, id $id")
+    stats.loopNanos = decodeNanos
+    stats.generated = session.seq.size - tokens.size - (if (stats.stopped) 1 else 0)
     if (!ok) {
         val allocation = cudaLastAllocationError()
-        val detail = speculateLastError()
+        val detail = if (constraintError != "") constraintError else speculateLastError()
         val message = if (allocation == "") "generation failed: $detail" else "generation failed: $detail ($allocation)"
         session.restart()
         eprintln("serve: $message")
         if (!streaming) serveWriteError(connection, 500, message, "server_error", "")
-        else run.send("data: ${serveErrorBody(if (allocation == "") "generation failed" else message, "server_error", "")}\n\n")
+        else run.send("data: ${serveErrorBody(if (allocation == "" && constraintError == "") "generation failed" else message, "server_error", "")}\n\n")
         connection.close()
         return allocation == ""
     }
@@ -332,8 +389,7 @@ fun cmdServe(args: array<string>): int {
     if (!model.reset(backend)) return serveFail("clearing the model state failed: ${cudaLastDiagnostic()}")
     var session = specSessionCreate(backend, model, draftFile, SPEC_DEFAULT_PROPOSALS, true) ?? return serveFail("setting up speculation failed: ${speculateLastError()} ${cudaLastDiagnostic()}; try a smaller --ctx")
     session.exactWindow = 192
-    // the prompt feed needs a prefill workspace of its own on every request: check now that one fits, so a too large --ctx fails here and not on every request
-    if (!serveCheckWorkspace(backend, config, context)) return 1
+    if (!serveWarmPrefill(backend, model, context)) return 1
     var listener = tcpListenAddress(ipv4SocketAddress("127.0.0.1", port), 16)
     if (listener.descriptor < 0) {
         eprintln("serve: cannot listen on 127.0.0.1:$port")
@@ -386,11 +442,26 @@ fun cmdServe(args: array<string>): int {
     0
 }
 
-// Release the probe before the listener starts. Each request allocates its own feed workspace.
-private fun serveCheckWorkspace(var backend: Backend, config: InklingConfig, context: int): bool {
-    val probe = specSeedWorkspace(backend, config)
+// Load short and batched prefill kernels before accepting requests. The
+// temporary workspace is released before listening. Each request sizes its own.
+private fun serveWarmPrefill(var backend: Backend, var model: InklingModel, context: int): bool {
+    val probe = specSeedWorkspace(backend, model.config)
     if (probe == null) {
         eprintln("serve: setting up prefill at context $context failed: ${inklingPrefillLastError()} (${cudaLastDiagnostic()}); use a smaller --ctx")
+        return false
+    }
+    // Token zero is only a warmup input. Reset the convolution history
+    // afterwards; the first request overwrites the old KV and tap entries.
+    val batch: array<int> = []
+    val rows = if (probe.chunk < 64) probe.chunk else 64
+    for (i in 0 until rows) batch.append(0)
+    if (!model.prefill(backend, probe, batch, 0) || (rows > 1 && !model.prefill(backend, probe, [0], 0)) ||
+        !backend.synchronize()) {
+        eprintln("serve: warming the prefill kernels failed: ${inklingPrefillLastError()} (${cudaLastDiagnostic()})")
+        return false
+    }
+    if (!model.reset(backend)) {
+        eprintln("serve: clearing the warmup state failed: ${cudaLastDiagnostic()}")
         return false
     }
     eprintln("serve: prefill chunk ${probe.chunk}, ${backend.freeMemory() / 1048576} MiB of device memory to spare")

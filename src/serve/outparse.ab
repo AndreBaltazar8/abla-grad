@@ -19,6 +19,7 @@ class ServeOutputParser(
     var kind: int = 0,       // 1 thinking, 2 text, 3 tool call
     var header: string = "",
     var body: string = "",
+    var parsedTool: Json = jsonNull(),
     var stream: Utf8TokenStream = Utf8TokenStream()
 )
 
@@ -75,6 +76,7 @@ private fun ServeOutputParser.finishBody(var events: array<ServeEvent>): void {
         val name = this.header.trim()
         if (parsed.succeeded && parsed.value.isObject() && parsed.value.has("args") && parsed.value.get("args").isObject()) {
             val called = if (parsed.value.get("name").isString() && parsed.value.getString("name") != "") parsed.value.getString("name") else name
+            this.parsedTool = parsed.value
             events.append(ServeEvent(3, "", called, jsonStringify(parsed.value.get("args"))))
         } else {
             // not a well-formed call: the model's text is passed on as an answer
