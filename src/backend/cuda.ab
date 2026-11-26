@@ -164,7 +164,8 @@ private class CudaKernelSpec(
     val ablaElementBytes: array<int> = []
 )
 
-private class CudaFunction(val name: string, val module: int, val handle: int)
+private class CudaModule(val source: string, val abla: bool, val handle: int)
+private class CudaFunction(val name: string, val handle: int)
 
 private val cudaMatvecArguments = [
     KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
@@ -962,7 +963,8 @@ class CudaBackend(
     val sideEvents: array<int> = [],
     var forkEvent: int = 0,
     var forked: int = 0,
-    var currentBranch: int = 0
+    var currentBranch: int = 0,
+    val modules: array<CudaModule> = []
 ) : Backend {
     fun name(): string = "cuda"
     fun supportsFp8Kv(): bool = this.architecture == "compute_89"
@@ -1128,7 +1130,7 @@ class CudaBackend(
         }
         if (!this.pushContext()) return false
         val waited = cudaStatus(cuCtxSynchronize(), "cuCtxSynchronize")
-        for (function in this.functions) cuModuleUnload(nativePointerFromAddress(function.module))
+        for (module in this.modules) cuModuleUnload(nativePointerFromAddress(module.handle))
         this.popContext()
         val destroyed = cudaStatus(cuCtxDestroy_v2(nativePointerFromAddress(this.context)), "cuCtxDestroy")
         if (destroyed) this.context = 0
@@ -1192,40 +1194,49 @@ class CudaBackend(
         ok
     }
 
-    trusted fun loadPtx(name: string, ptx: string): CudaFunction? {
+    trusted fun bindFunction(name: string, module: i64*): CudaFunction? {
+        val function = nativePointerCell(nativeNullPointer())
+        if (!cudaStatus(cuModuleGetFunction(function.address, module, name), "cuModuleGetFunction")) return null
+        val loaded = CudaFunction(name, nativePointerAddress(function.load()))
+        this.functions.append(loaded)
+        loaded
+    }
+
+    trusted fun loadPtx(spec: CudaKernelSpec, ptx: string): CudaFunction? {
         val module = nativePointerCell(nativeNullPointer())
         if (!cudaStatus(cuModuleLoadData(module.address, ptx), "cuModuleLoadData")) return null
-        val function = nativePointerCell(nativeNullPointer())
-        if (!cudaStatus(cuModuleGetFunction(function.address, module.load(), name), "cuModuleGetFunction")) {
-            cuModuleUnload(module.load())
+        val handle = module.load()
+        val loaded = this.bindFunction(spec.name, handle)
+        if (loaded == null) {
+            cuModuleUnload(handle)
             return null
         }
-        CudaFunction(name, nativePointerAddress(module.load()), nativePointerAddress(function.load()))
+        this.modules.append(CudaModule(spec.source, spec.abla, nativePointerAddress(handle)))
+        loaded
     }
 
     trusted fun loadKernel(spec: CudaKernelSpec): CudaFunction? {
         for (function in this.functions) if (function.name == spec.name) return function
-        if (spec.abla) {
-            val loaded = this.loadPtx(spec.name, kernelPtx())
-            if (loaded != null) this.functions.append(loaded)
-            return loaded
+        // NVRTC compiles all entry points in a source. Resolve later symbols
+        // from that same module instead of compiling and loading it again.
+        // Compiler-emitted Abla kernels likewise share kernelPtx().
+        for (module in this.modules) {
+            if (module.abla == spec.abla && (spec.abla || module.source == spec.source)) {
+                return this.bindFunction(spec.name, nativePointerFromAddress(module.handle))
+            }
         }
+        if (spec.abla) return this.loadPtx(spec, kernelPtx())
         val cache = cudaPtxCachePath(spec, this.architecture)
         if (cache != null) {
             val previous = cache.readText()
             if (previous != "") {
-                val cached = this.loadPtx(spec.name, previous)
-                if (cached != null) {
-                    this.functions.append(cached)
-                    return cached
-                }
+                val cached = this.loadPtx(spec, previous)
+                if (cached != null) return cached
             }
         }
         val ptx = cudaCompilePtx(spec.source, "${spec.name}.cu", this.architecture)
         if (ptx == null) return null
-        val loaded = this.loadPtx(spec.name, ptx)
-        if (loaded == null) return null
-        this.functions.append(loaded)
+        val loaded = this.loadPtx(spec, ptx) ?? return null
         if (cache != null) cache.writeTextAtomic(ptx, 0o600)
         loaded
     }
