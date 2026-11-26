@@ -573,7 +573,7 @@ private fun recordCycle(
 
 // Long serving contexts keep target/drafter caches and graphs resident while seeding.
 fun specSeedWorkspace(var backend: Backend, config: InklingConfig): PrefillWorkspace? {
-    var chunk = 512
+    var chunk = 1024
     while (chunk >= 1) {
         val workspace = prefillWorkspace(backend, config, chunk, false)
         if (workspace != null) return move(workspace)
