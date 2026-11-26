@@ -13,6 +13,7 @@ SHA-256 `3da00cf7c31bbe5662b3c0d373ecf782d74d32ef43990acc158ce60c2add72e0`.
 - The server honors `max_tokens`, `stop` and `reasoning_effort`. Generation is greedy.
 - Requests are serialized. A shared prompt prefix can reuse KV and convolution state. The server checkpoints before the final prompt token and can keep a second checkpoint for edits at 4,096-token boundaries. Usage reports the actual reuse in `prompt_tokens_details.cached_tokens`.
 - `tools/gpu-lock.sh -- tools/test-serve.sh` checks response shapes, tool calls, prefix reuse and greedy parity.
+- `tools/test-allocation-failure.sh` injects CUDA allocation failures in `decode-bench` and `serve` and checks the requested byte counts and exit codes. It takes the GPU lock for each run.
 - For local interactive use, `chat MODEL` supports `/reset`, `/quit`, `/help`, `--show-thinking` and `--speculate off`. `generate MODEL --chat TEXT` streams one response; use `--temp`, `--top-p` and `--seed` for sampling.
 
 ## Capture and replay

@@ -71,11 +71,9 @@ fun dsparkLoad(var backend: Backend, file: GgufFile, maxCtx: int, maxProposals: 
     val layout = dsparkScratch(maxProposals)
     val cacheBytes = if (maxCtx >= INKLING_HALF_KV_CONTEXT) (2 * INKLING_DRAFT_RING + maxCtx + DSPARK_BLOCK - 1) * dsparkKv * 2
         else DSPARK_LAYERS * (maxCtx + DSPARK_BLOCK - 1) * dsparkKv * 4
-    dsparkError = "allocating DSpark scratch or KV failed"
-    val scratch = backend.allocate(layout.total) ?? return null
-    val keys = backend.allocate(cacheBytes) ?? return null
-    val values = backend.allocate(cacheBytes) ?? return null
-    dsparkError = ""
+    val scratch = allocateBuffer(backend, layout.total, "DSpark scratch", { message -> dsparkError = message }) ?? return null
+    val keys = allocateBuffer(backend, cacheBytes, "DSpark key cache", { message -> dsparkError = message }) ?? return null
+    val values = allocateBuffer(backend, cacheBytes, "DSpark value cache", { message -> dsparkError = message }) ?? return null
     DsparkDrafter(config, plan, layout, maxCtx, maxProposals, move(arena), move(scratch), move(keys), move(values))
 }
 

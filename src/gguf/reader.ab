@@ -397,7 +397,7 @@ trusted fun ggufOpen(path: string): GgufFile? {
     // mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0)
     val address = linuxSyscall6(9, 0, size, 1, 2, fd, 0)
     linuxSyscall1(3, fd)
-    if (address < 0) return ggufFail("could not mmap GGUF '$path' (errno ${-address})")
+    if (address < 0) return ggufFail("could not mmap GGUF '$path' ($size bytes, errno ${-address})")
     val model = ggufParse(address, size)
     if (model == null) ggufUnmap(address, size)
     model

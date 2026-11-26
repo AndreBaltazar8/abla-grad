@@ -68,6 +68,7 @@ private trusted noescape extern:"c" fun nvrtcGetPTX(program: i64*, output: i64*)
 private trusted noescape extern:"c" fun nvrtcDestroyProgram(program: i64*): i32
 
 private var cudaError = ""
+private var cudaAllocationError = ""
 
 // Kernel name -> launches recorded so far (debug: decode-bench --launches prints it).
 val cudaLaunchCounts: Map<string, int> = Map()
@@ -83,16 +84,23 @@ val cudaKernelNanos: Map<string, int> = Map()
 
 fun cudaLastError(): string = cudaError
 
-private fun cudaStatus(status: i32, call: string): bool {
+// CUDA reports sizes only for explicit allocations. Track opaque driver OOMs
+// too, even if cleanup replaces the most recent CUDA error.
+fun cudaLastAllocationError(): string = cudaAllocationError
+fun cudaLastDiagnostic(): string = if (cudaAllocationError != "") cudaAllocationError else cudaError
+fun cudaClearAllocationError(): void { cudaAllocationError = "" }
+
+private fun cudaStatus(status: i32, call: string, outOfMemory: i32 = 2): bool {
     if (status == 0) return true
     cudaError = "${call} failed with status ${status}"
+    if (status == outOfMemory) cudaAllocationError = "$cudaError (CUDA did not report the allocation size)"
     false
 }
 
 private trusted fun cudaCompilePtx(source: string, name: string, architecture: string): string? {
     val program = nativePointerCell(nativeNullPointer())
     if (!cudaStatus(nvrtcCreateProgram(program.address, source, name, 0,
-        nativeNullPointer(), nativeNullPointer()), "nvrtcCreateProgram")) return null
+        nativeNullPointer(), nativeNullPointer()), "nvrtcCreateProgram", 1)) return null
     val handle = program.load()
     val option = "--gpu-architecture=${architecture}"
     val optionBytes = nativeByteBuffer(option.size + 1)
@@ -105,16 +113,16 @@ private trusted fun cudaCompilePtx(source: string, name: string, architecture: s
     val options = nativePointerCell(optionBytes.address)
     val length = nativeI64Cell(0)
     var ptx: string? = null
-    if (!cudaStatus(nvrtcCompileProgram(handle, 1, options.address), "nvrtcCompileProgram")) {
+    if (!cudaStatus(nvrtcCompileProgram(handle, 1, options.address), "nvrtcCompileProgram", 1)) {
         if (nvrtcGetProgramLogSize(handle, length.address) == 0 && length.load() > 0) {
             val log = nativeByteBuffer(length.load())
             if (nvrtcGetProgramLog(handle, log.address) == 0) {
                 cudaError = "${cudaError}: ${nativeCString(log.address)}"
             }
         }
-    } else if (cudaStatus(nvrtcGetPTXSize(handle, length.address), "nvrtcGetPTXSize")) {
+    } else if (cudaStatus(nvrtcGetPTXSize(handle, length.address), "nvrtcGetPTXSize", 1)) {
         val bytes = nativeByteBuffer(length.load())
-        if (cudaStatus(nvrtcGetPTX(handle, bytes.address), "nvrtcGetPTX")) {
+        if (cudaStatus(nvrtcGetPTX(handle, bytes.address), "nvrtcGetPTX", 1)) {
             ptx = nativeCString(bytes.address)
         }
     }
@@ -1128,15 +1136,21 @@ class CudaBackend(
     }
 
     trusted fun allocate(bytes: int): DeviceBuffer? {
-        if (bytes < 1) {
-            cudaError = "CUDA allocation size must be positive"
+        cudaClearAllocationError()
+        if (bytes < 1 || !this.pushContext()) {
+            if (bytes < 1) cudaError = "CUDA allocation size must be positive"
+            cudaAllocationError = "$cudaError while allocating $bytes bytes"
+            cudaError = cudaAllocationError
             return null
         }
-        if (!this.pushContext()) return null
         val address = nativeI64Cell(0)
-        val ok = cudaStatus(cuMemAlloc_v2(address.address, u64(bytes)), "cuMemAlloc")
+        val status = cuMemAlloc_v2(address.address, u64(bytes))
         this.popContext()
-        if (!ok) return null
+        if (status != 0) {
+            cudaAllocationError = "cuMemAlloc failed with status $status while allocating $bytes bytes"
+            cudaError = cudaAllocationError
+            return null
+        }
         this.liveBuffers += 1
         DeviceBuffer(this, address.load(), bytes)
     }

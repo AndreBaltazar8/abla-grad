@@ -103,16 +103,12 @@ fun specSessionCreate(var backend: Backend, var model: InklingModel, draftFile: 
         speculateError = inklingPrefillLastError()
         return null
     }
-    val spec = backend.allocate(128)
-    if (spec == null || !specZero(backend, spec)) {
-        speculateError = "device memory for the speculation state is not available"
+    val spec = allocateBuffer(backend, 128, "speculation state", { message -> speculateError = message }) ?? return null
+    if (!specZero(backend, spec)) {
+        speculateError = "clearing the speculation state failed"
         return null
     }
-    val snap = backend.allocate(model.history.bytes + 16)
-    if (snap == null) {
-        speculateError = "device memory for the history snapshot is not available"
-        return null
-    }
+    val snap = allocateBuffer(backend, model.history.bytes + 16, "speculation history snapshot", { message -> speculateError = message }) ?? return null
     // the graphs: kernels are loaded as the recording launches them; recording runs nothing
     val plain = model.capture(backend)
     if (plain == null) {
@@ -128,12 +124,8 @@ fun specSessionCreate(var backend: Backend, var model: InklingModel, draftFile: 
     }
     val slotBytes = if (persistent) promptCheckpointBytes(model) else model.history.bytes
     val wantStride = persistent && model.maxCtx > PROMPT_CHECKPOINT_STRIDE + SPEC_CONTEXT_SLACK
-    val promptSnap = if (wantStride) backend.allocate(2 * slotBytes) ?? backend.allocate(slotBytes)
-        else backend.allocate(slotBytes)
-    if (promptSnap == null) {
-        speculateError = "device memory for the prompt snapshot is not available"
-        return null
-    }
+    val pair = if (wantStride) backend.allocate(2 * slotBytes) else null
+    val promptSnap = (move(pair) ?? allocateBuffer(backend, slotBytes, "prompt checkpoint", { message -> speculateError = message })) ?? return null
     val session = SpecSession(move(drafter), move(ws), move(spec), move(snap), move(promptSnap), move(plain), move(cycle2), move(cycle3), move(cycle4), maxProposals, slotBytes, persistent)
     for (i in 0 until 20) session.hist.append(0.0)
     session

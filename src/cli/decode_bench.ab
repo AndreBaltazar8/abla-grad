@@ -47,6 +47,17 @@ private fun decodeBenchSeed(var backend: Backend, model: InklingModel, ids: arra
     true
 }
 
+private fun decodeBenchFail(phase: string, detail: string = ""): int {
+    val cuda = cudaLastDiagnostic()
+    val reason = if (detail != "") ": $detail" else ""
+    val driver = if (cuda != "") " ($cuda)" else ""
+    eprintln("decode-bench: $phase failed$reason$driver")
+    1
+}
+
+private fun decodeBenchSeedFail(ws: PrefillWorkspace?): int =
+    decodeBenchFail("seeding the prompt", if (ws == null) inklingLastError() else inklingPrefillLastError())
+
 fun cmdDecodeBench(args: array<string>): int {
     var count = 128
     var mode = "graph"
@@ -146,10 +157,10 @@ fun cmdDecodeBench(args: array<string>): int {
         println("decode-bench: ${inklingConfigLastError()} (decode-bench supports Inkling models)")
         return 2
     }
-    var backend = cudaBackend() ?? return 2
+    var backend = cudaBackend() ?? return decodeBenchFail("creating the CUDA backend")
     val context = if (maxCtx > 0) maxCtx else ids.size + count + 8
-    var model = inklingLoad(backend, file, config, context, 5, halfKv, false, globalBits, fp8) ?? return 1
-    if (!model.reset(backend)) return 1
+    var model = inklingLoad(backend, file, config, context, 5, halfKv, false, globalBits, fp8) ?? return decodeBenchFail("loading Inkling", inklingLastError())
+    if (!model.reset(backend)) return decodeBenchFail("clearing the model state")
     model.useStep = true
     model.splitAttention = !noSplit
     if (splits > 0) model.attentionSplits = splits
@@ -161,18 +172,15 @@ fun cmdDecodeBench(args: array<string>): int {
     val prefix: array<int> = []
     if (batchSeed) for (i in 0 until ids.size - 1) prefix.append(ids[i])
     val ws = if (batchSeed && prefix.size > 0) prefillWorkspace(backend, config, 512, false) else null
-    if (batchSeed && prefix.size > 0 && ws == null) return 1
-    if (mode != "graph" && !decodeBenchSeed(backend, model, ids, prefix, ws)) return 1
+    if (batchSeed && prefix.size > 0 && ws == null) return decodeBenchFail("setting up batched prefill", inklingPrefillLastError())
+    if (mode != "graph" && !decodeBenchSeed(backend, model, ids, prefix, ws)) return decodeBenchSeedFail(ws)
     val last = ids.size - 1
     val generated: array<int> = []
     if (mode == "graph") {
         // Warm the decode kernels before capture, then reset once and seed the timed graph.
-        if (!model.forward(backend, ids[0], 0)) return 1
+        if (!model.forward(backend, ids[0], 0)) return decodeBenchFail("warming the decode kernels", inklingLastError())
         val recording = model.capture(backend)
-        if (recording == null) {
-            println("decode-bench: ${inklingLastError()} (${cudaLastError()})")
-            return 1
-        }
+        if (recording == null) return decodeBenchFail("recording the decode graph", inklingLastError())
         if (launches) {
             var total = 0
             for (name in cudaLaunchCounts.keys()) {
@@ -182,17 +190,14 @@ fun cmdDecodeBench(args: array<string>): int {
             }
             println("decode-bench: launches per token: $total")
         }
-        if (!model.reset(backend)) return 1
-        if (!decodeBenchSeed(backend, model, ids, prefix, ws)) return 1
-        if (!model.seed(backend, ids[last], last)) return 1
-        if (!backend.synchronize()) return 1
+        if (!model.reset(backend)) return decodeBenchFail("clearing the model state")
+        if (!decodeBenchSeed(backend, model, ids, prefix, ws)) return decodeBenchSeedFail(ws)
+        if (!model.seed(backend, ids[last], last)) return decodeBenchFail("seeding the decode graph")
+        if (!backend.synchronize()) return decodeBenchFail("synchronizing the prompt")
         val start = monotonicNanoseconds()
-        if (!model.replayMany(backend, recording, count)) {
-            println("decode-bench: ${inklingLastError()} (${cudaLastError()})")
-            return 1
-        }
+        if (!model.replayMany(backend, recording, count)) return decodeBenchFail("replaying the decode graph", inklingLastError())
         val elapsed = monotonicNanoseconds() - start
-        val log = model.readLog(backend, last, count) ?? return 1
+        val log = model.readLog(backend, last, count) ?? return decodeBenchFail("reading the token log")
         for (t in log) generated.append(t)
         return benchReport("graph", count, elapsed, generated, logPath)
     }
@@ -200,12 +205,9 @@ fun cmdDecodeBench(args: array<string>): int {
     var token = ids[last]
     val start = monotonicNanoseconds()
     for (step in 0 until count) {
-        if (!model.forward(backend, token, last + step)) {
-            println("decode-bench: ${inklingLastError()} (${cudaLastError()})")
-            return 1
-        }
-        if (!opArgmax(backend, model.scratch, model.so("logits"), config.nVocab, model.step, 0)) return 1
-        val next = model.readStepWord(backend, 0) ?? return 1
+        if (!model.forward(backend, token, last + step)) return decodeBenchFail("decoding token $step", inklingLastError())
+        if (!opArgmax(backend, model.scratch, model.so("logits"), config.nVocab, model.step, 0)) return decodeBenchFail("selecting the next token")
+        val next = model.readStepWord(backend, 0) ?? return decodeBenchFail("reading the next token")
         generated.append(next)
         token = next
     }

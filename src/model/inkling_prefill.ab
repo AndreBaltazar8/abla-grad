@@ -148,19 +148,13 @@ fun prefillWorkspace(var backend: Backend, c: InklingConfig, chunk: int, allLogi
     at = wsAdd(offsets, "preludeOut", chunk * n, at)
     at = wsAdd(offsets, "bankOut", chunk * n, at)
     at = wsAdd(offsets, "logits", (if (allLogits) chunk else 1) * c.nVocabPadded, at)
-    val buffer = backend.allocate(at)
-    val blocks = backend.allocate(chunk * (c.nLayer + 2) * n * 4)
-    val bank = backend.allocate(chunk * (c.nLayer + 2) * n * 4)
-    if (buffer == null || blocks == null || bank == null) {
-        prefillError = "device memory for the prefill workspace (chunk $chunk) is not available"
-        return null
-    }
+    val buffer = allocateBuffer(backend, at, "prefill workspace (chunk $chunk)", { message -> prefillError = message }) ?? return null
+    val outputBytes = chunk * (c.nLayer + 2) * n * 4
+    val blocks = allocateBuffer(backend, outputBytes, "prefill block outputs (chunk $chunk)", { message -> prefillError = message }) ?? return null
+    val bank = allocateBuffer(backend, outputBytes, "prefill bank outputs (chunk $chunk)", { message -> prefillError = message }) ?? return null
     val historyBytes = inklingVisits(c) * (c.nConv - 1) * (2 * c.nHeadKv * c.headDim + 2 * n) * 4
-    val snapshots = backend.allocate(if (verifyRows > 0) verifyRows * historyBytes else 256)
-    if (snapshots == null) {
-        prefillError = "device memory for the verification snapshots is not available"
-        return null
-    }
+    val snapshotBytes = if (verifyRows > 0) verifyRows * historyBytes else 256
+    val snapshots = allocateBuffer(backend, snapshotBytes, "prefill verification snapshots (chunk $chunk)", { message -> prefillError = message }) ?? return null
     val workspace = PrefillWorkspace(chunk, allLogits, offsets, move(buffer), move(blocks), move(bank), move(snapshots), verifyRows, historyBytes)
     // iota[i] = i: the identity row map of the down projection
     val host = nativeByteBuffer(pairs * 4 + 8)

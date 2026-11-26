@@ -100,6 +100,13 @@ interface Backend {
     fun release(handle: int, bytes: int): void
 }
 
+// Keep the purpose and the requested size even when the backend supplies no details.
+fun allocateBuffer(var backend: Backend, bytes: int, purpose: string, var report: FnMut(string) -> void): DeviceBuffer? {
+    val buffer = backend.allocate(bytes)
+    if (buffer == null) report("could not allocate $purpose ($bytes bytes)")
+    move(buffer)
+}
+
 // These copies borrow the start of a live, owned host buffer only for the call.
 // The backend checks the device range and completes the host-memory access before returning.
 trusted fun uploadFrom(backend: Backend, destination: DeviceBuffer, offset: int, host: NativeByteBuffer, bytes: int): bool =

@@ -148,25 +148,25 @@ class ServeRun(
 private fun serveChat(
     var backend: Backend, var model: InklingModel, var session: SpecSession, var connection: TcpConnection, tokenizer: Tokenizer, stops: array<int>,
     ids: array<int>, body: string, modelName: string, context: int, defaultMaxTokens: int, var counters: ServeCounters
-): void {
+): bool {
     val started = monotonicNanoseconds()
     val errors: array<string> = []
     val request = serveParseRequest(body, errors)
     if (request == null) {
         serveWriteError(connection, 400, if (errors.size > 0) errors[0] else "invalid request", "invalid_request_error", "")
-        return
+        return true
     }
     val tools = if (request.toolChoiceNone) [] else request.tools
     val text = serveRenderPrompt(request.messages, tools, request.effort, errors)
     if (text == "") {
         serveWriteError(connection, 400, if (errors.size > 0) errors[0] else "the prompt could not be rendered", "invalid_request_error", "")
-        return
+        return true
     }
     val tokens = tokenizer.encode(text, true, true)
     val room = context - tokens.size
     if (room < 16) {
         serveWriteError(connection, 400, "This model's context is ${context} tokens, but the conversation has ${tokens.size} tokens.", "invalid_request_error", "context_length_exceeded")
-        return
+        return true
     }
     var maxTokens = if (request.maxTokens > 0) request.maxTokens else defaultMaxTokens
     if (maxTokens > room) maxTokens = room
@@ -174,6 +174,7 @@ private fun serveChat(
     val id = "chatcmpl-${counters.requests}-${monotonicMilliseconds()}"
     val created = realtimeMilliseconds() / 1000
     val name = if (request.model != "") request.model else modelName
+    cudaClearAllocationError()
     val kept = session.reuse(backend, model, tokens)
     val parser = ServeOutputParser(ids[0], ids[1], ids[2], ids[3], ids[4])
     val streaming = request.stream
@@ -194,12 +195,15 @@ private fun serveChat(
         events.clear()
     })
     if (!ok) {
+        val allocation = cudaLastAllocationError()
+        val detail = speculateLastError()
+        val message = if (allocation == "") "generation failed: $detail" else "generation failed: $detail ($allocation)"
         session.restart()
-        eprintln("serve: generation failed: ${speculateLastError()}")
-        if (!streaming) serveWriteError(connection, 500, "generation failed: ${speculateLastError()}", "server_error", "")
-        else run.send("data: ${serveErrorBody("generation failed", "server_error", "")}\n\n")
+        eprintln("serve: $message")
+        if (!streaming) serveWriteError(connection, 500, message, "server_error", "")
+        else run.send("data: ${serveErrorBody(if (allocation == "") "generation failed" else message, "server_error", "")}\n\n")
         connection.close()
-        return
+        return allocation == ""
     }
     if (!run.stopMatched && run.pending != "") run.deliverContent(run.pending)
     val finish = if (run.calls.size > 0) "tool_calls" else if (run.stopMatched || stats.stopped) "stop" else "length"
@@ -216,6 +220,7 @@ private fun serveChat(
     val rawTtft = if (run.firstRaw > 0) f64FromInt(run.firstRaw - started) / 1000000000.0 else seconds
     val ttft = if (run.firstToken > 0) f64FromInt(run.firstToken - started) / 1000000000.0 else seconds
     eprintln("[serve] ${tokens.size} prompt tokens (${kept} reused), ${stats.generated} generated, first output after ${ttft} s (first token ${rawTtft} s), ${f64FromInt(stats.generated) / (if (decodeSeconds > 0.0) decodeSeconds else 1.0)} tok/s, finish $finish${if (streaming) ", streamed" else ""}, id $id")
+    true
 }
 
 private fun serveFail(message: string): int {
@@ -305,7 +310,7 @@ fun cmdServe(args: array<string>): int {
     val stops = generationStops(file, tokenizer, architecture)
     val ids = [serveSpecialId(tokenizer, "<|message_model|>"), serveSpecialId(tokenizer, "<|content_thinking|>"), serveSpecialId(tokenizer, "<|content_text|>"),
         serveSpecialId(tokenizer, "<|content_invoke_tool_json|>"), serveSpecialId(tokenizer, "<|end_message|>")]
-    var backend = cudaBackend() ?? return serveFail("no CUDA device: ${cudaLastError()}")
+    var backend = cudaBackend() ?? return serveFail("creating the CUDA backend failed: ${cudaLastDiagnostic()}")
     val freeBefore = backend.freeMemory()
     if (context == 0) {
         // The allocation includes SPEC_CONTEXT_SLACK above the advertised context.
@@ -317,12 +322,15 @@ fun cmdServe(args: array<string>): int {
             context = (freeBefore - SERVE_FIXED_BYTES) / SERVE_BYTES_PER_POSITION - SPEC_CONTEXT_SLACK
             if (context + SPEC_CONTEXT_SLACK >= SERVE_LONG_FROM) context = SERVE_LONG_FROM - SPEC_CONTEXT_SLACK - 1
         }
-        if (context < 1024) return serveFail("only ${freeBefore / 1048576} MiB of device memory are free: not enough for the model")
+        if (context < 1024) {
+            val minimum = SERVE_FIXED_BYTES + SERVE_BYTES_PER_POSITION * (1024 + SPEC_CONTEXT_SLACK)
+            return serveFail("the minimum model context needs an estimated $minimum bytes of device memory ($freeBefore bytes free)")
+        }
     }
     eprintln("serve: ${freeBefore / 1048576} MiB of device memory free; loading the model (context $context tokens)...")
-    var model = inklingLoad(backend, file, config, context + SPEC_CONTEXT_SLACK) ?? return serveFail("loading the model failed (context $context): ${inklingLastError()} ${cudaLastError()}; try a smaller --ctx")
-    if (!model.reset(backend)) return serveFail("clearing the model state failed: ${cudaLastError()}")
-    var session = specSessionCreate(backend, model, draftFile, SPEC_DEFAULT_PROPOSALS, true) ?? return serveFail("setting up speculation failed: ${speculateLastError()} ${cudaLastError()}; try a smaller --ctx")
+    var model = inklingLoad(backend, file, config, context + SPEC_CONTEXT_SLACK) ?? return serveFail("loading the model failed (context $context): ${inklingLastError()} ${cudaLastDiagnostic()}; try a smaller --ctx")
+    if (!model.reset(backend)) return serveFail("clearing the model state failed: ${cudaLastDiagnostic()}")
+    var session = specSessionCreate(backend, model, draftFile, SPEC_DEFAULT_PROPOSALS, true) ?? return serveFail("setting up speculation failed: ${speculateLastError()} ${cudaLastDiagnostic()}; try a smaller --ctx")
     session.exactWindow = 192
     // the prompt feed needs a prefill workspace of its own on every request: check now that one fits, so a too large --ctx fails here and not on every request
     if (!serveCheckWorkspace(backend, config, context)) return 1
@@ -363,8 +371,12 @@ fun cmdServe(args: array<string>): int {
                 connection.close()
                 return serveFail("writing the request capture failed")
             }
-            serveChat(backend, model, session, connection, tokenizer, stops, ids, request.body, modelName, context, maxTokens, counters)
+            val keepServing = serveChat(backend, model, session, connection, tokenizer, stops, ids, request.body, modelName, context, maxTokens, counters)
             connection.close()
+            if (!keepServing) {
+                listener.close()
+                return 1
+            }
         } else {
             serveWriteError(connection, 404, "no such endpoint: ${request.method} $path", "invalid_request_error", "not_found")
             connection.close()
@@ -378,7 +390,7 @@ fun cmdServe(args: array<string>): int {
 private fun serveCheckWorkspace(var backend: Backend, config: InklingConfig, context: int): bool {
     val probe = specSeedWorkspace(backend, config)
     if (probe == null) {
-        eprintln("serve: device memory for the prefill workspace is not available at context $context (${backend.freeMemory() / 1048576} MiB free); use a smaller --ctx")
+        eprintln("serve: setting up prefill at context $context failed: ${inklingPrefillLastError()} (${cudaLastDiagnostic()}); use a smaller --ctx")
         return false
     }
     eprintln("serve: prefill chunk ${probe.chunk}, ${backend.freeMemory() / 1048576} MiB of device memory to spare")

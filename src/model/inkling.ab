@@ -180,7 +180,6 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
     }
     val map = inklingScratch(c)
     val visits = inklingVisits(c)
-    val scratch = backend.allocate(map.total)
     val groupedShape = c.nHead == 3 * c.nHeadKv && c.headDim == 128
     val groupedContext = groupedShape && maxCtx >= INKLING_GROUPED_CONTEXT
     val autoQuantize = quantizeKv || (!halfKv && (maxCtx > INKLING_Q8_KV_CONTEXT || groupedContext))
@@ -214,17 +213,15 @@ fun inklingLoad(var backend: Backend, file: GgufFile, c: InklingConfig, maxCtx: 
         cacheOffsets.append(cacheOffsets[visit] + bytes)
     }
     val kvBytes = cacheOffsets[visits]
-    val kCache = backend.allocate(kvBytes)
-    val vCache = backend.allocate(kvBytes)
-    val history = backend.allocate(visits * historyBytesPerVisit(c))
-    val blocks = backend.allocate((c.nLayer + 2) * c.nEmbd * 4)
-    val bank = backend.allocate((c.nLayer + 2) * c.nEmbd * 4)
-    val step = backend.allocate(16 + 4 * maxCtx)
-    val taps = backend.allocate(16)
-    if (scratch == null || kCache == null || vCache == null || history == null || blocks == null || bank == null || step == null || taps == null) {
-        inklingError = "device memory for the activations, KV caches and convolution histories is not available"
-        return null
-    }
+    val scratch = allocateBuffer(backend, map.total, "Inkling scratch", { message -> inklingError = message }) ?? return null
+    val kCache = allocateBuffer(backend, kvBytes, "Inkling key cache", { message -> inklingError = message }) ?? return null
+    val vCache = allocateBuffer(backend, kvBytes, "Inkling value cache", { message -> inklingError = message }) ?? return null
+    val history = allocateBuffer(backend, visits * historyBytesPerVisit(c), "Inkling convolution history", { message -> inklingError = message }) ?? return null
+    val stateBytes = (c.nLayer + 2) * c.nEmbd * 4
+    val blocks = allocateBuffer(backend, stateBytes, "Inkling block outputs", { message -> inklingError = message }) ?? return null
+    val bank = allocateBuffer(backend, stateBytes, "Inkling bank outputs", { message -> inklingError = message }) ?? return null
+    val step = allocateBuffer(backend, 16 + 4 * maxCtx, "Inkling decode state and token log", { message -> inklingError = message }) ?? return null
+    val taps = allocateBuffer(backend, 16, "Inkling tap placeholder", { message -> inklingError = message }) ?? return null
     InklingModel(c, plan, map, maxCtx, kvElementBytes, bits, fp8, ringVisits, hasSlidingRing, visits, cacheOffsets, move(arena), move(scratch), move(kCache), move(vCache), move(history), move(blocks), move(bank), move(step), move(taps))
 }
 
@@ -797,11 +794,7 @@ trusted fun InklingModel.readStepWord(var backend: Backend, index: int): int? {
 // Allocates the tap records (position-major [position][4][nEmbd] f32, maxCtx positions) and turns tap capture on for the step-mode forward.
 fun InklingModel.enableTaps(var backend: Backend, streaming: bool = false): bool {
     val slots = if (streaming && this.maxCtx > INKLING_DRAFT_RING) INKLING_DRAFT_RING else this.maxCtx
-    val buffer = backend.allocate(slots * 4 * this.config.nEmbd * 4)
-    if (buffer == null) {
-        inklingError = "device memory for the taps is not available"
-        return false
-    }
+    val buffer = allocateBuffer(backend, slots * 4 * this.config.nEmbd * 4, "Inkling drafter taps", { message -> inklingError = message }) ?? return false
     this.taps = move(buffer)
     this.rollingTaps = slots < this.maxCtx
     this.tapsOn = true
