@@ -22,6 +22,7 @@ import "abla/process/environment"
 import "abla/process/time"
 import "../kernels/rmsnorm.ab"
 import "../kernels/abla_rmsnorm.ab"
+import "../kernels/abla_moe_route.ab"
 import "../kernels/abla_depth_mix.ab"
 import "abla/kernel"
 import "../kernels/rope.ab"
@@ -280,6 +281,9 @@ private val cudaArgsDepthMix = [
     KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_POINTER, KERNEL_ARG_U32, KERNEL_ARG_F32
 ]
 private fun cudaMoeCombineShape(args: KernelArgs, problem: array<int>): bool = args.words[3] == problem[0] && args.words[4] > 0
+// The Abla moe_route (src/kernels/abla_moe_route.ab): one thread an expert, up to 256 (as the CUDA C one).
+private fun cudaAblaMoeRouteShape(args: KernelArgs, problem: array<int>): bool =
+    problem[0] == 1 && args.words[2] > 0 && args.words[2] <= 256 && args.words[3] > 0 && args.words[3] <= 64 && args.words[3] <= args.words[2]
 private fun cudaMoeRouteShape(args: KernelArgs, problem: array<int>): bool =
     problem[0] == 1 && args.words[2] > 0 && args.words[2] <= 256 && args.words[3] > 0 && args.words[3] <= 64 && args.words[3] <= args.words[2]
 private fun cudaRelTableShape(args: KernelArgs, problem: array<int>): bool =
@@ -661,7 +665,7 @@ private val cudaKernels = [
     CudaKernelSpec("argmax", kernelArgmax, 1, 1024, cudaArgsArgmax, cudaArgmaxShape),
     // Inkling small kernels (60-2)
     CudaKernelSpec("moe_combine", kernelMoeCombine, 256, 256, cudaArgsMoeCombine, cudaMoeCombineShape),
-    CudaKernelSpec("moe_route", kernelMoeRoute, 1, 32, cudaArgsMoeRoute, cudaMoeRouteShape, 1, 1),
+    CudaKernelSpec(ablaMoeRouteKernel, kernelMoeRoute, 1, 256, cudaArgsMoeRoute, cudaAblaMoeRouteShape, 1, 1, abla = true),
     CudaKernelSpec("rel_table", kernelRelTable, 256, 256, cudaArgsRelTable, cudaRelTableShape),
     CudaKernelSpec("conv_step", kernelConvStep, 256, 256, cudaArgsConvStep, cudaConvStepShape, 1, 3),
     CudaKernelSpec(ablaDepthMixKernel, kernelDepthMix, 1, 1024, cudaArgsDepthMix, cudaDepthMixShape),

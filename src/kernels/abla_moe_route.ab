@@ -1,0 +1,109 @@
+import "abla/float"
+import "abla/kernel"
+
+// moe_route (the MoE router's top k on Inkling's decode path) as an Abla `@kernel`, in place of the CUDA C one in
+// inkling_small.ab, with the same ids and weights bit for bit. The CUDA C kernel takes the k experts one at a time, each
+// a shuffle butterfly in one subgroup; this one gives every expert a thread, which counts the experts that beat it (a
+// higher selection score, or the same score and a lower id), so its rank, and the k with rank below k write themselves
+// in one step. One group of 256 threads; up to 256 experts.
+
+// The launch name of this kernel: the CudaKernelSpec that runs it, and its PTX entry (the function's own name).
+val ablaMoeRouteKernel = "moe_route"
+
+// The sigmoid moe_route uses, 1 / (1 + expf(-x)) (kernelExp is expf), so the weights keep their bits.
+fun routerSigmoid(x: f32): f32 = f32(1.0) / (f32(1.0) + kernelExp(-x))
+
+// The selection score of expert `expert`: its probability plus its bias (when there is one).
+fun routerSelection(logits: KernelF32Buffer, bias: KernelF32Buffer, expert: int): f32 {
+    val p = routerSigmoid(logits.load(expert))
+    if (bias.size() > 0) p + bias.load(expert) else p
+}
+
+// moe_route_serial_nan: the serial scan moe_route falls back to when a selection score is NaN (a leading NaN stays the
+// best, as there). One thread; up to 256 experts (four 64-bit masks of the experts already chosen).
+fun routerSerial(logits: KernelF32Buffer, bias: KernelF32Buffer, nExpert: int, k: int, ids: KernelU32Buffer,
+    weights: KernelF32Buffer, normEps: f32, weightScale: f32) {
+    var used0 = 0
+    var used1 = 0
+    var used2 = 0
+    var used3 = 0
+    val count = if (k < 64) k else 64
+    var sum = f32(0.0)
+    var t = 0
+    while (t < count) {
+        var best = -1
+        var bestSelection = f32(0.0)
+        var i = 0
+        while (i < nExpert) {
+            val word = if (i < 64) used0 else if (i < 128) used1 else if (i < 192) used2 else used3
+            val used = ((word >> (i % 64)) & 1) == 1
+            if (!used) {
+                val selection = routerSelection(logits, bias, i)
+                if (best < 0 || selection > bestSelection) {
+                    best = i
+                    bestSelection = selection
+                }
+            }
+            i = i + 1
+        }
+        val bit = 1 << (best % 64)
+        if (best < 64) used0 = used0 | bit else if (best < 128) used1 = used1 | bit else if (best < 192) used2 = used2 | bit else used3 = used3 | bit
+        val p = routerSigmoid(logits.load(best))
+        ids.store(t, best)
+        weights.store(t, p)
+        sum = sum + p
+        t = t + 1
+    }
+    t = 0
+    while (t < count) {
+        weights.store(t, weights.load(t) / (sum + normEps) * weightScale)
+        t = t + 1
+    }
+}
+
+@kernel
+fun moe_route(logits: KernelF32Buffer, bias: KernelF32Buffer, nExpert: int, k: int, ids: KernelU32Buffer,
+    weights: KernelF32Buffer, normEps: f32, weightScale: f32) {
+    val selections = kernelSharedF32(256)
+    val chosen = kernelSharedF32(64)
+    val nan = kernelSharedU32(1)
+    val i = kernelLocalId()
+    if (i == 0) nan.store(0, 0)
+    kernelBarrier()
+    val live = i < nExpert
+    val selection = if (live) routerSelection(logits, bias, i) else f32(0.0)
+    if (live) {
+        selections.store(i, selection)
+        if (selection != selection) nan.store(0, 1)
+    }
+    kernelBarrier()
+    if (nan.load(0) != 0) {
+        // A NaN selection score: moe_route's serial scan, as the CUDA C kernel does.
+        if (i == 0) routerSerial(logits, bias, nExpert, k, ids, weights, normEps, weightScale)
+        return
+    }
+    if (live) {
+        var rank = 0
+        var j = 0
+        while (j < nExpert) {
+            val other = selections.load(j)
+            if (other > selection || (other == selection && j < i)) rank = rank + 1
+            j = j + 1
+        }
+        if (rank < k) {
+            ids.store(rank, i)
+            chosen.store(rank, routerSigmoid(logits.load(i)))
+        }
+    }
+    kernelBarrier()
+    // The probabilities summed in rank order, as moe_route adds them, then every chosen weight normalized at once.
+    if (i < k) {
+        var sum = f32(0.0)
+        var r = 0
+        while (r < k) {
+            sum = sum + chosen.load(r)
+            r = r + 1
+        }
+        weights.store(i, chosen.load(i) / (sum + normEps) * weightScale)
+    }
+}
