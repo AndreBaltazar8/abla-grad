@@ -60,13 +60,15 @@ Aggregate greedy tokens per second of two to four independent sessions decoded i
 short seeded prefix (3 to 30 tokens), so attention is shallow. Every run compares each lane's greedy IDs and all
 200,058 final logits with the same lane replayed alone, and all matched bit for bit.
 
-| Lanes | abla-grad `63d7c54` tok/s | abla-grad `ce57198` tok/s |
-|---:|---:|---:|
-| 2 | 183.1 | 207.6 |
-| 3 | 200.8 | 241.5 |
-| 4 | 218.5 | 283.7 |
+| Lanes | abla-grad `63d7c54` tok/s | abla-grad `ce57198` tok/s | abla-grad `524259e` tok/s |
+|---:|---:|---:|---:|
+| 2 | 183.1 | 207.6 | 219.5 |
+| 3 | 200.8 | 241.5 | 265.0 |
+| 4 | 218.5 | 283.7 | 291.1 |
 
-`ce57198` runs each lane's unbatched launches on its own graph branch. Build `tests/bench/decode_sessions.ab` with
+`ce57198` runs each lane's unbatched launches on its own graph branch outside the model's fork, and `524259e` inside it
+too. Each pair of columns is one interleaved session: `524259e` was measured against `ce57198` at 214.0 / 256.2 / 277.7
+in its own. Build `tests/bench/decode_sessions.ab` with
 the installed ablac and the Nix shell's CUDA and NVRTC, then run, for each lane count:
 
 ```sh
