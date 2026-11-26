@@ -44,6 +44,9 @@ private var prefillVerifyRows = 0
 
 // The most rows the R-row matvec kernels take (3 until the 4/5-row union kernels land); more rows use the tile kernels.
 private val prefillRowsMax = 5
+// Key splits of the global-attention verify kernel (R rows, many keys). Measured on verify-bench, rows 3: 8 / 32 splits take 20.0 / 15.3 ms at depth 32768, 38.6 / 25.4 ms at
+// 131072, 13.0 / 12.2 ms at 8192 and 11.0 / 10.9 ms at 1000 (64 splits: no better). Sliding visits keep 8.
+var verifyGlobalSplits = 32
 
 // false: the scalar attention kernel (f32 throughout), for A/B checks.
 private var prefillTensorAttention = true
@@ -114,8 +117,9 @@ fun prefillWorkspace(var backend: Backend, c: InklingConfig, chunk: int, allLogi
     at = wsAdd(offsets, "sortedToken", pairs, at)
     at = wsAdd(offsets, "slotOfPair", pairs, at)
     at = wsAdd(offsets, "iota", pairs, at)
-    at = wsAdd(offsets, "attPartO", 8 * chunk * c.nHead * 128, at)
-    at = wsAdd(offsets, "attPartML", 8 * chunk * c.nHead * 2, at)
+    val splitCapacity = if (verifyRows > 0) verifyGlobalSplits else 8
+    at = wsAdd(offsets, "attPartO", splitCapacity * chunk * c.nHead * 128, at)
+    at = wsAdd(offsets, "attPartML", splitCapacity * chunk * c.nHead * 2, at)
     // int8 activations of the expert matmuls (bytes, in float units): the gate/up input (one row per token) and the down input (one row per pair)
     at = wsAdd(offsets, "qxA", (chunk * c.nEmbd + 3) / 4, at)
     at = wsAdd(offsets, "sxA", chunk * (c.nEmbd / 32), at)
@@ -533,13 +537,13 @@ private fun InklingModel.layerRows(var backend: Backend, ws: PrefillWorkspace, i
                 .pointer(this.vCache, cache).pointer(ws.buffer, table + start * c.nHead * (extent + 1) * 4).pointer(ws.buffer, att + start * qDim * 4).u32(c.nHead).u32(c.nHeadKv).u32(c.headDim)
                 .u32(if (isSwa) c.nSwa else 0).u32(firstPos + start).u32(extent).u32(this.maxCtx).f32(scale), [c.nHead, count])
         } else if (prefillVerifyRows > 0 && count <= 32) {
-            // few rows, many keys: split the keys over 8 blocks per head and merge (with the sink)
+            val splits = if (isSwa) 8 else verifyGlobalSplits
             ok = ok && backend.launch("attention_prefill_tc_split" + suffix, kernelArgs().pointer(ws.buffer, q + start * qDim * 4).pointer(this.kCache, cache)
                 .pointer(this.vCache, cache).pointer(ws.buffer, table + start * c.nHead * (extent + 1) * 4).pointer(ws.buffer, att + start * qDim * 4).u32(c.nHead).u32(c.nHeadKv)
-                .u32(if (isSwa) c.nSwa else 0).pointer(posBuf, segmentPosOffset).u32(extent).u32(this.maxCtx).f32(scale).u32(count).u32(8)
-                .pointer(ws.buffer, ws.o("attPartO")).pointer(ws.buffer, ws.o("attPartML")), [c.nHead, (count + 31) / 32 * 8])
+                .u32(if (isSwa) c.nSwa else 0).pointer(posBuf, segmentPosOffset).u32(extent).u32(this.maxCtx).f32(scale).u32(count).u32(splits)
+                .pointer(ws.buffer, ws.o("attPartO")).pointer(ws.buffer, ws.o("attPartML")), [c.nHead, (count + 31) / 32 * splits])
             ok = ok && backend.launch("attention_prefill_merge", kernelArgs().pointer(ws.buffer, ws.o("attPartO")).pointer(ws.buffer, ws.o("attPartML"))
-                .pointer(ws.buffer, att + start * qDim * 4).u32(c.nHead).u32(count).u32(8), [c.nHead, count])
+                .pointer(ws.buffer, att + start * qDim * 4).u32(c.nHead).u32(count).u32(splits), [c.nHead, count])
         } else {
             val kernel = if ((suffix == "_q8" || suffix == "_fp8") && c.nHead == 3 * c.nHeadKv && count >= 256)
                 "attention_prefill_tc${suffix}_gqa3" else "attention_prefill_tc" + suffix

@@ -530,10 +530,18 @@ fun cmdVerifyArgmax(args: array<string>): int {
 fun cmdVerifyBench(args: array<string>): int {
     var rows = 3
     var reps = 50
+    var context = 0
     val positional: array<string> = []
     var index = 0
     while (index < args.size) {
-        if (args[index] == "--rows" && index + 1 < args.size) {
+        if (args[index] == "--global-splits" && index + 1 < args.size) {
+            verifyGlobalSplits = args[index + 1].parseInt() ?? 0
+            if (verifyGlobalSplits < 8 || verifyGlobalSplits > 128 || verifyGlobalSplits % 8 != 0) return 2
+            index += 2
+        } else if (args[index] == "--ctx" && index + 1 < args.size) {
+            context = args[index + 1].parseInt() ?? 0
+            index += 2
+        } else if (args[index] == "--rows" && index + 1 < args.size) {
             rows = args[index + 1].parseInt() ?? 0
             index = index + 2
         } else if (args[index] == "--reps" && index + 1 < args.size) {
@@ -563,7 +571,9 @@ fun cmdVerifyBench(args: array<string>): int {
     val config = inklingConfigFrom(file) ?? return 2
     var backend = cudaBackend() ?? return 2
     val length = ids.size
-    var model = inklingLoad(backend, file, config, length + 16) ?? return loadFailed()
+    if (context == 0) context = length + 16
+    if (context < length + rows) return 2
+    var model = inklingLoad(backend, file, config, context) ?? return loadFailed()
     if (!model.reset(backend)) return 1
     val seed = prefillWorkspace(backend, config, 512, false) ?? return 1
     if (!model.prefill(backend, seed, ids, 0)) {
