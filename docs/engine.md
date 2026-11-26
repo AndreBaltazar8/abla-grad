@@ -31,7 +31,9 @@ rows and group the union of routed experts.
 The 64-token expert tile uses int8 activations for NVFP4, Q8_0 and Q5_K.
 The Q5_K kernel uses the activation sum to apply the weight block's
 affine minimum. NVFP4 targets three CTAs per Ada SM and the gate/up
-kernel applies SiTU before writing the down projection's input.
+kernel applies SiTU before writing the down projection's input. For
+aligned NVFP4 experts it also packs the down input into INT8 blocks
+with one scale per 32 features.
 
 ## DSpark
 

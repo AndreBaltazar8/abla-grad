@@ -183,6 +183,19 @@ before and 10.18240 after. The 64k and 128k retrieval fixtures each
 scored 1/1 for the badge and 3/3 for the facts. Trace, timing logs
 and gate commands are in `~/archive/abla-grad-prefill-profile-1275.sQakOmXj`.
 
+### NVFP4 down activation packing
+
+The SiTU epilogue in `a235a10` writes the aligned down projection's
+INT8 input and scales. On the same fixed 128k HTTP request with
+1,024-row chunks, paired raw TTFT moved from 32.474 to 32.268 s and
+streamed TTFT from 32.550 to 32.345 s. These are the midpoints of two
+runs per arm in opposite order against `b03bd24`.
+
+All 32,768 FP8-context logit rows matched bit for bit at both 512- and
+1,024-row chunks. The grouped CUDA test also compares every activation
+word and scale against standalone packing. See the hashes and timing
+logs in `~/archive/abla-grad-long-gemm-cx5.raJMRiJS`.
+
 ## Serve replay
 
 Same private eight-request capture, original GGUF and DSpark. Session HTTP
