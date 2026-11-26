@@ -437,6 +437,10 @@ private val cudaArgsPrefillAttMerge = [prefillArgP, prefillArgP, prefillArgP, pr
 private fun cudaPrefillAttentionSplitShape(args: KernelArgs, problem: array<int>): bool =
     args.words[5] == problem[0] && args.words[6] > 0 && args.words[5] % args.words[6] == 0 && args.words[12] > 0 && args.words[13] > 0 &&
         problem[1] == (args.words[12] + 31) / 32 * args.words[13] && args.words[0] % 16 == 0 && args.words[1] % 16 == 0 && args.words[2] % 16 == 0
+private fun cudaPrefillAttentionFp8SplitShape(args: KernelArgs, problem: array<int>): bool =
+    args.words[5] == problem[0] && args.words[6] > 0 && args.words[5] == 3 * args.words[6] && args.words[7] == 0 &&
+        args.words[12] == 512 && args.words[13] == 2 && problem[1] == 16 &&
+        args.words[0] % 16 == 0 && args.words[1] % 16 == 0 && args.words[2] % 16 == 0
 private fun cudaPrefillAttentionMergeShape(args: KernelArgs, problem: array<int>): bool = args.words[3] == problem[0] && args.words[4] == problem[1] && args.words[5] > 0
 private val cudaArgsGatherRows = [prefillArgP, prefillArgP, prefillArgP, prefillArgU, prefillArgU]
 private val cudaArgsCopyRows = [prefillArgP, prefillArgU, prefillArgP, prefillArgU, prefillArgU, prefillArgU]
@@ -760,6 +764,9 @@ private val cudaPrefillKernels = [
         kernelPrefillAttentionTc, 3, 192, cudaArgsAttentionTc, cudaPrefillAttentionGqa3Shape, 2),
     CudaKernelSpec("attention_prefill_tc_fp8_gqa3", "#define INKLING_FP8_KV\n#define INKLING_PREFILL_GQA3\n#define attention_prefill_tc attention_prefill_tc_fp8_gqa3\n" +
         kernelPrefillAttentionTc, 3, 192, cudaArgsAttentionTc, cudaPrefillAttentionGqa3Shape, 2),
+    CudaKernelSpec("attention_prefill_tc_fp8_gqa3_split",
+        "#define INKLING_FP8_KV\n#define INKLING_PREFILL_GQA3\n#define INKLING_PREFILL_GQA3_SPLIT\n#define attention_prefill_tc attention_prefill_tc_fp8_gqa3_split\n" +
+        kernelPrefillAttentionTc, 3, 384, cudaArgsPrefillAttSplit, cudaPrefillAttentionFp8SplitShape, 2),
     CudaKernelSpec("matmul_f32_split", kernelPrefillMatmul, 128, 256, cudaArgsMatmulSplit, cudaPrefillSplitF32Shape, 2),
     CudaKernelSpec("matmul_bf16_split", kernelPrefillMatmul, 128, 256, cudaArgsMatmulSplit, cudaPrefillSplitF32Shape, 2),
     CudaKernelSpec("sum_slices", kernelPrefillMatmul, 256, 256, cudaArgsSumSlices, cudaPrefillSumSlicesShape),

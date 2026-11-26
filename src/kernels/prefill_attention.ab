@@ -46,14 +46,23 @@ static __device__ __forceinline__ void at_mma(float (&c)[4], const unsigned (&a)
 
 enum { AT_KEYS = 32, AT_DIM = 128, AT_PITCH = 136, AT_WARPS = 2 };
 
+#ifdef INKLING_PREFILL_GQA3_SPLIT
+#define AT_QUERY_WARPS 4
+#define AT_BLOCK_THREADS 384
+#else
+#define AT_QUERY_WARPS AT_WARPS
 #ifdef INKLING_PREFILL_GQA3
 #define AT_BLOCK_THREADS 192
+#else
+#define AT_BLOCK_THREADS 64
+#endif
+#endif
+
+#ifdef INKLING_PREFILL_GQA3
 #ifdef INKLING_FP8_KV
 // Every stored finite E4M3 value is exactly representable in FP16.
 #define AT_DIRECT_FP8
 #endif
-#else
-#define AT_BLOCK_THREADS 64
 #endif
 
 #ifdef AT_DIRECT_FP8
@@ -65,7 +74,11 @@ static __device__ __forceinline__ uint4 at_expand_fp8_8(uint2 bytes) {
 
 extern "C" __global__ void __launch_bounds__(AT_BLOCK_THREADS) attention_prefill_tc(
     const float *q, const kv_element *kCache, const kv_element *vCache, const float *table, float *out, unsigned nHead, unsigned nKvHead,
-    unsigned window, const unsigned *posPtr, unsigned extent, unsigned maxCtx, float scale, unsigned tokens) {
+    unsigned window, const unsigned *posPtr, unsigned extent, unsigned maxCtx, float scale, unsigned tokens
+#ifdef INKLING_PREFILL_GQA3_SPLIT
+    , unsigned splits, float *partO, float *partML
+#endif
+) {
     const unsigned firstPos = *posPtr;
     __shared__ __align__(16) unsigned short ks[AT_KEYS * AT_PITCH];
 #ifndef AT_DIRECT_FP8
@@ -76,17 +89,21 @@ extern "C" __global__ void __launch_bounds__(AT_BLOCK_THREADS) attention_prefill
     const unsigned lane = tid & 31u;
     const unsigned warp = tid >> 5;
 #ifdef INKLING_PREFILL_GQA3
-    // Two query warps per head. All three heads in this block read the
-    // same K/V head and stage each tile together.
+    // All three query heads in this block stage the same K/V tile together.
     const unsigned kvHead = blockIdx.x;
-    const unsigned head = kvHead * 3 + warp / AT_WARPS;
-    const unsigned queryWarp = warp % AT_WARPS;
+    const unsigned head = kvHead * 3 + warp / AT_QUERY_WARPS;
+    const unsigned queryWarp = warp % AT_QUERY_WARPS;
 #else
     const unsigned head = blockIdx.x;
     const unsigned kvHead = head / (nHead / nKvHead);
     const unsigned queryWarp = warp;
 #endif
-    const unsigned tileFirst = blockIdx.y * (AT_WARPS * 16);
+#ifdef INKLING_PREFILL_GQA3_SPLIT
+    const unsigned tileFirst = blockIdx.y / splits * (AT_QUERY_WARPS * 16);
+    const unsigned split = blockIdx.y % splits;
+#else
+    const unsigned tileFirst = blockIdx.y * (AT_QUERY_WARPS * 16);
+#endif
     const unsigned group = lane >> 2;
     const unsigned quad = lane & 3u;
     const unsigned rowA = tileFirst + queryWarp * 16 + group;
@@ -118,15 +135,28 @@ extern "C" __global__ void __launch_bounds__(AT_BLOCK_THREADS) attention_prefill
         }
     }
     // key range of the block: from the first row's window start to the last valid row's position
-    const unsigned lastRow = (tileFirst + AT_WARPS * 16 < tokens ? tileFirst + AT_WARPS * 16 : tokens) - 1;
+    const unsigned lastRow = (tileFirst + AT_QUERY_WARPS * 16 < tokens ? tileFirst + AT_QUERY_WARPS * 16 : tokens) - 1;
     const unsigned posFirst = firstPos + tileFirst;
     const unsigned posLast = firstPos + lastRow;
+#ifdef INKLING_PREFILL_GQA3_SPLIT
+    // Split on whole key tiles. The merge supplies the sink and normalizes.
+    const unsigned keysPerSplit = ((posLast + splits) / splits + AT_KEYS - 1) / AT_KEYS * AT_KEYS;
+    const unsigned keyFirst = split * keysPerSplit;
+    const unsigned keyEnd = min(keyFirst + keysPerSplit, posLast + 1);
+#else
     const unsigned keyFirst = window != 0 && posFirst + 1 > window ? posFirst + 1 - window : 0;
+#endif
 
     float o[16][4];
     #pragma unroll
     for (int i = 0; i < 16; ++i) { o[i][0] = 0.f; o[i][1] = 0.f; o[i][2] = 0.f; o[i][3] = 0.f; }
+#ifdef INKLING_PREFILL_GQA3_SPLIT
+    // Use the sink's zero logit as the floor for every partition's maximum.
+    // The partial sums still exclude the sink, which the merge adds once.
+    float mA = 0.0f, mB = 0.0f, lA = 0.0f, lB = 0.0f;
+#else
     float mA = 0.0f, mB = 0.0f, lA = 1.0f, lB = 1.0f;   // the sink: logit 0
+#endif
     const float *tableA = table + (static_cast<unsigned long long>(validA ? rowA : 0) * nHead + head) * (extent + 1ull);
     const float *tableB = table + (static_cast<unsigned long long>(validB ? rowB : 0) * nHead + head) * (extent + 1ull);
 #ifdef INKLING_PREFILL_GQA3
@@ -135,7 +165,11 @@ extern "C" __global__ void __launch_bounds__(AT_BLOCK_THREADS) attention_prefill
     const float farA = tableA[farBias], farB = tableB[farBias];
 #endif
 
+#ifdef INKLING_PREFILL_GQA3_SPLIT
+    for (unsigned j0 = keyFirst; j0 < keyEnd; j0 += AT_KEYS) {
+#else
     for (unsigned j0 = keyFirst; j0 <= posLast; j0 += AT_KEYS) {
+#endif
         __syncthreads();
         // load the K and V tiles (rows beyond the last key are zero)
 #ifdef AT_DIRECT_FP8
@@ -226,7 +260,11 @@ extern "C" __global__ void __launch_bounds__(AT_BLOCK_THREADS) attention_prefill
                     const bool valid = lower ? validB : validA;
                     const unsigned key = j0 + nt * 8 + 2 * quad + (e & 1);
                     const unsigned d = pos - key;   // wraps for key > pos
+#ifdef INKLING_PREFILL_GQA3_SPLIT
+                    const bool visible = valid && key <= pos;
+#else
                     const bool visible = valid && key <= pos && (window == 0 || d < window);
+#endif
                     float value = -3.0e38f;
                     if (visible) value = s[nt][e] * scale + (lower ? tableB : tableA)[d < extent ? d : extent];
                     s[nt][e] = value;
@@ -281,6 +319,20 @@ extern "C" __global__ void __launch_bounds__(AT_BLOCK_THREADS) attention_prefill
             }
         }
     }
+#ifdef INKLING_PREFILL_GQA3_SPLIT
+    const auto a = (static_cast<unsigned long long>(split) * tokens + rowA) * nHead + head;
+    const auto b = (static_cast<unsigned long long>(split) * tokens + rowB) * nHead + head;
+    #pragma unroll
+    for (int dt = 0; dt < 16; ++dt) {
+        const unsigned dim = dt * 8 + 2 * quad;
+        if (validA) *reinterpret_cast<float2 *>(partO + a * AT_DIM + dim) = make_float2(o[dt][0], o[dt][1]);
+        if (validB) *reinterpret_cast<float2 *>(partO + b * AT_DIM + dim) = make_float2(o[dt][2], o[dt][3]);
+    }
+    if (quad == 0) {
+        if (validA) *reinterpret_cast<float2 *>(partML + a * 2) = make_float2(mA, lA);
+        if (validB) *reinterpret_cast<float2 *>(partML + b * 2) = make_float2(mB, lB);
+    }
+#else
     const float invA = 1.0f / lA;
     const float invB = 1.0f / lB;
     #pragma unroll
@@ -289,8 +341,10 @@ extern "C" __global__ void __launch_bounds__(AT_BLOCK_THREADS) attention_prefill
         if (validA) *reinterpret_cast<float2 *>(out + (static_cast<unsigned long long>(rowA) * nHead + head) * AT_DIM + dim) = make_float2(o[dt][0] * invA, o[dt][1] * invA);
         if (validB) *reinterpret_cast<float2 *>(out + (static_cast<unsigned long long>(rowB) * nHead + head) * AT_DIM + dim) = make_float2(o[dt][2] * invB, o[dt][3] * invB);
     }
+#endif
 }
 #undef AT_BLOCK_THREADS
+#undef AT_QUERY_WARPS
 #undef AT_DIRECT_FP8
 extern "C" __global__ void __launch_bounds__(64) attention_prefill_tc_split(
     const float *q, const kv_element *kCache, const kv_element *vCache, const float *table, float *out, unsigned nHead, unsigned nKvHead,
