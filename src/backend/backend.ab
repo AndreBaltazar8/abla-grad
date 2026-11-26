@@ -102,6 +102,10 @@ interface Backend {
     fun fork(count: int): bool
     fun branch(index: int): bool
     fun join(): bool
+    // Inside an open fork while recording: branch `target`'s following launches also wait for everything launched so
+    // far on each branch in `sources` (the multi-session decode graph orders a model branch's lanes around a batched
+    // launch with it). Backends without branches have nothing to order.
+    fun waitBranches(target: int, sources: array<int>): bool = true
     // Called by Recording.drop only.
     fun releaseRecording(handle: int): void
     // Called by DeviceBuffer.drop only.

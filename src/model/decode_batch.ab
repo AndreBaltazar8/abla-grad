@@ -180,21 +180,72 @@ private fun captureDecodePlans(var backend: Backend, plans: array<DecodePlan>): 
     }
     if (!backend.beginRecording()) return null
     var ok = true
-    // Outside the model's own fork, a run of launches that do not join into one batched launch goes to one branch a
-    // lane, so the lanes' small kernels run side by side instead of one after another on the main stream; each lane
-    // keeps its own order, and the branches join before the next batched or structural node. Inside the model's fork
-    // (which cannot nest) the lanes stay in order on their model branch.
-    var modelFork = false
+    // A launch that does not join into one batched launch runs once a lane, each lane on its own graph branch, so the
+    // lanes' small kernels run side by side instead of one after another; each lane keeps its own order.
+    // Outside the model's fork, a run of such launches gets a fork of one branch a lane, joined before the next batched or
+    // structural node. The model's own fork of c + 1 branches becomes one of (c + 1) * lanes: model branch b, lane l is
+    // branch b * lanes + l. There a batched launch runs on branch b * lanes after it waits for the branch's other lanes,
+    // and those lanes wait for it before their next launch (waitBranches), since forks cannot nest.
+    val lanes = plans.size
+    var modelBranches = 0
+    var modelBranch = 0
+    var lanesAhead: array<bool> = []
+    var batchedAhead: array<bool> = []
     var laneFork = false
     for (step in 0 until nodes) {
         val first = a.launches[step]
-        val perLane = first.name != "" && !batchedDecodeNode(plans, step)
-        if (perLane && !modelFork) {
+        val batched = first.name != "" && batchedDecodeNode(plans, step)
+        if (first.name == "") {
+            if (laneFork) {
+                ok = ok && backend.join()
+                laneFork = false
+            }
+            val action = first.problem[0]
+            if (action == 0) {
+                modelBranches = first.problem[1] + 1
+                modelBranch = 0
+                lanesAhead = []
+                batchedAhead = []
+                for (b in 0 until modelBranches) {
+                    lanesAhead.append(false)
+                    batchedAhead.append(false)
+                }
+                ok = ok && backend.fork(modelBranches * lanes - 1)
+            } else if (action == 1) {
+                modelBranch = first.problem[1]
+            } else {
+                ok = ok && backend.join()
+                modelBranches = 0
+                modelBranch = 0
+            }
+        } else if (modelBranches > 0) {
+            val base = modelBranch * lanes
+            if (batched) {
+                if (lanesAhead[modelBranch]) {
+                    var others: array<int> = []
+                    for (lane in 1 until lanes) others.append(base + lane)
+                    ok = ok && backend.waitBranches(base, others)
+                    lanesAhead[modelBranch] = false
+                }
+                ok = ok && backend.branch(base) && launchDecodeNode(backend, plans, step)
+                batchedAhead[modelBranch] = true
+            } else {
+                if (batchedAhead[modelBranch]) {
+                    for (lane in 1 until lanes) ok = ok && backend.waitBranches(base + lane, [base])
+                    batchedAhead[modelBranch] = false
+                }
+                for (lane in 0 until lanes) {
+                    val launch = plans[lane].launches[step]
+                    ok = ok && backend.branch(base + lane) && backend.launch(launch.name, launch.args, launch.problem)
+                }
+                lanesAhead[modelBranch] = true
+            }
+        } else if (!batched) {
             if (!laneFork) {
-                ok = backend.fork(plans.size - 1)
+                ok = ok && backend.fork(lanes - 1)
                 laneFork = true
             }
-            for (lane in 0 until plans.size) {
+            for (lane in 0 until lanes) {
                 val launch = plans[lane].launches[step]
                 ok = ok && backend.branch(lane) && backend.launch(launch.name, launch.args, launch.problem)
             }
@@ -202,10 +253,6 @@ private fun captureDecodePlans(var backend: Backend, plans: array<DecodePlan>): 
             if (laneFork) {
                 ok = ok && backend.join()
                 laneFork = false
-            }
-            if (first.name == "") {
-                if (first.problem[0] == 0) modelFork = true
-                if (first.problem[0] == 2) modelFork = false
             }
             ok = ok && launchDecodeNode(backend, plans, step)
         }

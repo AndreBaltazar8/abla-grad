@@ -1275,6 +1275,33 @@ class CudaBackend(
         true
     }
 
+    // Branch `target` waits for each source branch's work so far: an event recorded on the source's stream, waited on by
+    // the target's. Under capture each pair becomes a graph edge at once, so a branch's event can be recorded again.
+    trusted fun waitBranches(target: int, sources: array<int>): bool {
+        if (!this.recording) return true
+        if (this.forked == 0 || target < 0 || target > this.forked) {
+            cudaError = "waitBranches: no such branch"
+            return false
+        }
+        if (!this.pushContext()) return false
+        var ok = true
+        val targetStream = if (target == 0) this.stream else this.sideStreams[target - 1]
+        for (source in sources) {
+            if (source < 0 || source > this.forked) {
+                cudaError = "waitBranches: no such branch"
+                ok = false
+            }
+            if (!ok) break
+            if (source == target) continue
+            val event = if (source == 0) this.forkEvent else this.sideEvents[source - 1]
+            val sourceStream = if (source == 0) this.stream else this.sideStreams[source - 1]
+            ok = cudaStatus(cuEventRecord(nativePointerFromAddress(event), nativePointerFromAddress(sourceStream)), "cuEventRecord") &&
+                cudaStatus(cuStreamWaitEvent(nativePointerFromAddress(targetStream), nativePointerFromAddress(event), 0), "cuStreamWaitEvent")
+        }
+        this.popContext()
+        ok
+    }
+
     trusted fun join(): bool {
         if (!this.recording || this.forked == 0) return true
         if (!this.pushContext()) return false
