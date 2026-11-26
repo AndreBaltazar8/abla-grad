@@ -1,0 +1,31 @@
+import "../../src/backend/backend.ab"
+import "device_test_support.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+private trusted fun verify(backend: Backend): bool {
+    // The two workers split the second input, so it crosses both a worker
+    // boundary and the boundary of a staging slot.
+    val first = 3 * 1024 * 1024 + 13
+    val second = 9 * 1024 * 1024 + 7
+    val gap = 256
+    val source = nativeByteBuffer(first + second)
+    val out = nativeByteBuffer(first + gap + second)
+    ablaUnsafeSetMemory(source.address, 0x35, first)
+    ablaUnsafeSetMemory(source.pointerAt(first), 0xa9, second)
+    val base = nativePointerAddress(source.address)
+    val address = nativePointerAddress(out.address)
+    val buffer = backend.allocate(out.capacity) ?? return false
+    if (!backend.uploadBatch(buffer, [HostUpload(0, base, first), HostUpload(first + gap, base + first, second)]) ||
+        !backend.download(buffer, 0, address, out.capacity)) return false
+    for (i in 0 until first) if (out.load(i) != 0x35) return false
+    for (i in 0 until second) if (out.load(first + gap + i) != 0xa9) return false
+
+    // Overlapping destination slices keep their original ordering semantics.
+    if (!backend.uploadBatch(buffer, [HostUpload(0, base, 8), HostUpload(2, base + first, 4)]) ||
+        !backend.download(buffer, 0, address, 8)) return false
+    for (i in 0 until 8) if (out.load(i) != (if (i >= 2 && i < 6) 0xa9 else 0x35)) return false
+    true
+}
+
+fun main: int = runCudaKernelTest("upload_batch", verify)

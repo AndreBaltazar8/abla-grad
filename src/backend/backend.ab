@@ -66,6 +66,8 @@ resource class DeviceBuffer(val owner: Backend, val handle: int, val bytes: int)
     }
 }
 
+class HostUpload(val offset: int, val address: int, val bytes: int)
+
 interface Backend {
     fun name(): string
     fun supportsFp8Kv(): bool
@@ -73,6 +75,10 @@ interface Backend {
     fun allocate(bytes: int): DeviceBuffer?
     // Copies `bytes` from host memory at `hostAddress` to `destination` at `offset`. Ordered with launches.
     fun upload(destination: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool
+    // Uploads the slices in order and finishes reading their source memory before returning.
+    fun uploadBatch(destination: DeviceBuffer, slices: array<HostUpload>): bool =
+        uploadBatchSync(this, destination, slices)
+
     // Copies back to host memory at `hostAddress`; waits for every queued launch and copy first.
     fun download(source: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool
     // Queues kernel `kernel` (by name; the backend registry lists them) with `args` over `problem`, the op-specific sizes (a matvec:
@@ -98,6 +104,13 @@ interface Backend {
     fun releaseRecording(handle: int): void
     // Called by DeviceBuffer.drop only.
     fun release(handle: int, bytes: int): void
+}
+
+fun uploadBatchSync(backend: Backend, destination: DeviceBuffer, slices: array<HostUpload>): bool {
+    for (slice in slices) {
+        if (!backend.upload(destination, slice.offset, slice.address, slice.bytes)) return false
+    }
+    true
 }
 
 // Keep the purpose and the requested size even when the backend supplies no details.

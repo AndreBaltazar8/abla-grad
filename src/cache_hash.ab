@@ -1,0 +1,46 @@
+// Use the Linux hash socket for large local cache keys when it is available.
+import "abla/crypto"
+import "abla/sys/linux"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+private trusted fun kernelHashFd(): int {
+    val socket = linuxSyscall3(41, 38, 5 | 524288, 0) // AF_ALG, SOCK_SEQPACKET | SOCK_CLOEXEC
+    if (socket < 0) return socket
+    val address = nativeByteBuffer(88) // sockaddr_alg
+    ablaUnsafeSetMemory(address.address, 0, 88)
+    address.store(0, 38)
+    val kind = "hash"
+    val name = "sha256"
+    for (i in 0 until kind.size) address.store(2 + i, kind[i])
+    for (i in 0 until name.size) address.store(24 + i, name[i])
+    val bound = linuxSyscall3(49, socket, nativePointerAddress(address.address), 88)
+    address.close()
+    val hash = if (bound == 0) linuxSyscall4(288, socket, 0, 0, 524288) else bound
+    linuxSyscall1(3, socket)
+    hash
+}
+
+// The caller keeps the memory mapped until this synchronous hash finishes.
+trusted fun kernelSha256Memory(address: int, size: int): string? {
+    val hash = kernelHashFd()
+    if (hash < 0) return null
+    var at = 0
+    while (at < size) {
+        val remaining = size - at
+        val count = if (remaining < 1048576) remaining else 1048576
+        val sent = linuxSyscall6(44, hash, address + at, count, 32768, 0, 0) // send MSG_MORE
+        if (sent == -4) continue // EINTR
+        if (sent <= 0) break
+        at += sent
+    }
+    val output = nativeByteBuffer(33)
+    val received = if (at == size) linuxSyscall3(0, hash, nativePointerAddress(output.address), 32) else -1
+    linuxSyscall1(3, hash)
+    if (received == 32) return output.adoptString(32)
+    output.close()
+    null
+}
+
+trusted fun cacheSha256(bytes: string): string =
+    kernelSha256Memory(nativeStringDataAddress(bytes), bytes.size) ?? sha256(bytes)

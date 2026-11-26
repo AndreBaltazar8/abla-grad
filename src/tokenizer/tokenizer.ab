@@ -1,5 +1,9 @@
 import "../gguf/reader.ab"
 import "pretokenize.ab"
+import "cache_bytes.ab"
+import "../cache_hash.ab"
+import "abla/crypto"
+import "abla/process/environment"
 import "abla/bytes"
 import "abla/fs"
 import "abla/json"
@@ -103,6 +107,11 @@ private fun bpeVocabulary(encoded: array<string>, types: array<int>, var encoded
             pieces.append(raw)
         }
     }
+    finishVocabulary(pieces, ids, special, heads)
+}
+
+private fun finishVocabulary(pieces: array<string>, ids: Map<string, int>,
+    special: array<TokenizerSpecial>, heads: Map<int, bool>): TokenizerVocabulary? {
     val byteIds: array<int> = []
     for (byte in 0 until 256) {
         val id = ids.get(byteEncode(byte))
@@ -121,7 +130,11 @@ private fun TokenizerMerges.addRule(encodedIds: Map<string, int>, left: string, 
     val b = encodedIds.get(right)
     val merged = encodedIds.get(left + right)
     if (a == null || b == null || merged == null) return false
-    val pair = bpePair(a, b)
+    this.addIds(a, b, merged)
+}
+
+private fun TokenizerMerges.addIds(left: int, right: int, merged: int): bool {
+    val pair = bpePair(left, right)
     if (this.ranks.has(pair)) return false
     this.ranks.set(pair, this.results.size)
     this.results.append(merged)
@@ -309,6 +322,130 @@ private fun tokenizerCreate(
     Tokenizer(vocab, merges, pre, ignoreMerges, bos, eos, addBos, addEos)
 }
 
+private val TOKENIZER_CACHE_MAX_BYTES = 128 * 1024 * 1024
+private val TOKENIZER_CACHE_MAX_ENTRIES = 1048576
+
+private class TokenizerCache(val location: Path, val key: string) {
+    fun read(): Tokenizer? {
+        val info = this.location.info()
+        if (!info.isFile() || info.size > TOKENIZER_CACHE_MAX_BYTES) return null
+        val entry = this.location.readText()
+        val offset = this.key.size + 1
+        val header = offset + 65
+        if (entry.size <= header || !entry.startsWith("${this.key}\n") || entry[header - 1] != 10) return null
+        val payload = entry.slice(header, entry.size)
+        if (hexEncode(cacheSha256(payload)) != entry.slice(offset, header - 1)) return null
+        tokenizerReadTables(payload)
+    }
+
+    fun write(tokenizer: Tokenizer): void {
+        val payload = tokenizerWriteTables(tokenizer)
+        if (payload != "") this.location.writeTextAtomic("${this.key}\n${hexEncode(cacheSha256(payload))}\n$payload", 0o600)
+        return
+    }
+}
+
+private fun tokenizerCache(key: string): TokenizerCache? {
+    var root = processEnvironmentOr("XDG_CACHE_HOME", "")
+    if (root == "" || root[0] != 47) {
+        val home = processEnvironmentOr("HOME", "")
+        if (home == "" || home[0] != 47) return null
+        root = "$home/.cache"
+    }
+    val directory = "$root/abla-grad/tokenizers-v1"
+    if (!path(directory).createDirectories(0o700)) return null
+    TokenizerCache(path("$directory/$key.bin"), key)
+}
+
+private fun tokenizerReadTables(payload: string): Tokenizer? {
+    val reader = TokenizerCacheReader(payload)
+    val count = reader.uint()
+    val rules = reader.uint()
+    val pre = reader.uint()
+    val flags = reader.uint()
+    val bos = reader.uint()
+    val eos = reader.uint()
+    if (count < 256 || count > TOKENIZER_CACHE_MAX_ENTRIES || rules < 0 ||
+        rules > TOKENIZER_CACHE_MAX_ENTRIES || count > (payload.size - reader.at) / 8 ||
+        (pre != BPE_PRE_INKLING && pre != BPE_PRE_LLAMA3) ||
+        flags < 0 || flags > 7 || bos < 0 || bos > count || eos < 0 || eos > count) return null
+
+    val pieces: array<string> = []
+    val kinds: array<int> = []
+    val special: array<TokenizerSpecial> = []
+    val ids: Map<string, int> = Map()
+    val heads: Map<int, bool> = Map()
+    for (id in 0 until count) {
+        val kind = reader.uint()
+        val piece = reader.text() ?? return null
+        if (kind < 0 || kind > 3 || (kind != 1 && piece == "")) return null
+        if (kind == 0) {
+            if (ids.has(piece)) return null
+            ids.set(piece, id)
+        } else if (kind >= 2) {
+            special.append(TokenizerSpecial(id, piece, kind == 3))
+            heads.set(piece[0], true)
+        }
+        kinds.append(kind)
+        pieces.append(piece)
+    }
+    if (payload.size - reader.at != 12 * rules) return null
+    val merges = TokenizerMerges(Map(), [])
+    for (i in 0 until rules) {
+        val left = reader.uint()
+        val right = reader.uint()
+        val result = reader.uint()
+        if (left < 0 || left >= count || right < 0 || right >= count || result < 0 || result >= count ||
+            kinds[left] != 0 || kinds[right] != 0 || kinds[result] != 0 ||
+            !merges.addIds(left, right, result)) return null
+    }
+    val vocab = finishVocabulary(pieces, ids, special, heads) ?? return null
+    tokenizerCreate(vocab, merges, pre, (flags & 1) != 0, if (bos == 0) null else bos - 1,
+        if (eos == 0) null else eos - 1, (flags & 2) != 0, (flags & 4) != 0)
+}
+
+private fun tokenizerWriteTables(tokenizer: Tokenizer): string {
+    val vocab = tokenizer.vocab
+    val merges = tokenizer.merges
+    val count = vocab.pieces.size
+    val rules = merges.results.size
+    if (count > TOKENIZER_CACHE_MAX_ENTRIES || rules > TOKENIZER_CACHE_MAX_ENTRIES) return ""
+    var size = 24 + 8 * count + 12 * rules
+    for (piece in vocab.pieces) size += piece.size
+    if (size >= TOKENIZER_CACHE_MAX_BYTES - 140) return ""
+    val writer = tokenizerCacheWriter(size)
+    writer.uint(count)
+    writer.uint(rules)
+    writer.uint(tokenizer.pre)
+    writer.uint((if (tokenizer.ignoreMerges) 1 else 0) + (if (tokenizer.addsBos) 2 else 0) +
+        (if (tokenizer.addsEos) 4 else 0))
+    writer.uint((tokenizer.bos ?? -1) + 1)
+    writer.uint((tokenizer.eos ?? -1) + 1)
+    var special = 0
+    for (id in 0 until count) {
+        val piece = vocab.pieces[id]
+        if (special < vocab.special.size && vocab.special[special].id == id) {
+            writer.uint(if (vocab.special[special].alwaysParse) 3 else 2)
+            special += 1
+        } else {
+            writer.uint(if (vocab.ids.get(piece) == id) 0 else 1)
+        }
+        writer.text(piece)
+    }
+    val ranked: array<int> = []
+    for (i in 0 until rules) ranked.append(0)
+    for (pair in merges.ranks.keys()) {
+        val rank = merges.ranks.get(pair) ?? return ""
+        ranked[rank] = pair
+    }
+    for (i in 0 until rules) {
+        writer.uint(ranked[i] >> 32)
+        writer.uint(ranked[i] & 4294967295)
+        writer.uint(merges.results[i])
+    }
+    writer.finish()
+}
+
 // Loads the Llama 3 or Inkling byte-level BPE from GGUF metadata. The result
 // owns its strings and survives closing the file.
 fun tokenizerFromGguf(file: GgufFile): Tokenizer? {
@@ -317,6 +454,10 @@ fun tokenizerFromGguf(file: GgufFile): Tokenizer? {
     val name = file.getString("tokenizer.ggml.pre")
     val pre = if (name == "llama-bpe") BPE_PRE_LLAMA3 else if (name == "inkling2") BPE_PRE_INKLING else 0
     if (pre == 0) return tokenizerFail("unsupported GGUF pre-tokenizer")
+    val digest = file.headerSha256()
+    val cache = if (digest != null) tokenizerCache("gguf-${hexEncode(digest)}") else null
+    val cached = if (cache != null) cache.read() else null
+    if (cached != null) return cached
     val encoded = file.getStringArray("tokenizer.ggml.tokens") ?? return tokenizerFail("missing GGUF vocabulary")
     val types = file.getIntArray("tokenizer.ggml.token_type") ?? return tokenizerFail("missing GGUF token types")
     val rules = file.getStringArray("tokenizer.ggml.merges") ?? return tokenizerFail("missing GGUF merge rules")
@@ -332,10 +473,12 @@ fun tokenizerFromGguf(file: GgufFile): Tokenizer? {
             return tokenizerFail("invalid GGUF merge rule $i")
         }
     }
-    tokenizerCreate(vocab, merges, pre, pre == BPE_PRE_INKLING,
+    val tokenizer = tokenizerCreate(vocab, merges, pre, pre == BPE_PRE_INKLING,
         file.getInt("tokenizer.ggml.bos_token_id"), file.getInt("tokenizer.ggml.eos_token_id"),
         file.getBool("tokenizer.ggml.add_bos_token") ?? false,
-        file.getBool("tokenizer.ggml.add_eos_token") ?? false)
+    file.getBool("tokenizer.ggml.add_eos_token") ?? false)
+if (cache != null && tokenizer != null) cache.write(tokenizer)
+tokenizer
 }
 
 private val inklingPattern = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
@@ -362,6 +505,9 @@ fun tokenizerFromJson(filePath: string): Tokenizer? {
     if (!info.isFile() || info.size <= 0 || info.size > 67108864) return tokenizerFail("invalid tokenizer.json file size")
     val result = inputPath.readTextResult()
     if (!result.succeeded) return tokenizerFail("could not read tokenizer.json (errno ${result.errorCode})")
+    val cache = tokenizerCache("json-${hexEncode(cacheSha256(result.text))}")
+    val cached = if (cache != null) cache.read() else null
+    if (cached != null) return cached
     val parsed = jsonParse(result.text, JsonLimits(67108864, 20, 2500000, 1048576, 1048576, true))
     if (!parsed.succeeded) return tokenizerFail("tokenizer.json: ${parsed.error.message} at byte ${parsed.error.byteOffset}")
     val root = parsed.value
@@ -423,6 +569,8 @@ fun tokenizerFromJson(filePath: string): Tokenizer? {
             return tokenizerFail("invalid tokenizer.json merge rule $i")
         }
     }
-    tokenizerCreate(vocab, merges, BPE_PRE_INKLING, model.get("ignore_merges").asBoolean(),
+    val tokenizer = tokenizerCreate(vocab, merges, BPE_PRE_INKLING, model.get("ignore_merges").asBoolean(),
         null, eos, false, false)
+    if (cache != null && tokenizer != null) cache.write(tokenizer)
+    tokenizer
 }

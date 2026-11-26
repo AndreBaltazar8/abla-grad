@@ -53,6 +53,9 @@ private trusted noescape extern:"c" fun cuCtxSynchronize(): i32
 private trusted noescape extern:"c" fun cuMemAlloc_v2(address: i64*, bytes: u64): i32
 private trusted noescape extern:"c" fun cuMemFree_v2(address: u64): i32
 private trusted noescape extern:"c" fun cuMemcpyHtoD_v2(destination: u64, source: i64*, bytes: u64): i32
+private trusted noescape extern:"c" fun cuMemHostAlloc(address: i64*, bytes: u64, flags: u32): i32
+private trusted noescape extern:"c" fun cuMemFreeHost(address: i64*): i32
+private trusted noescape extern:"c" fun cuMemcpyHtoDAsync_v2(destination: u64, source: i64*, bytes: u64, stream: i64*): i32
 private trusted noescape extern:"c" fun cuMemcpyDtoH_v2(destination: i64*, source: u64, bytes: u64): i32
 private trusted noescape extern:"c" fun cuModuleLoadData(module: i64*, data: i64*): i32
 private trusted noescape extern:"c" fun cuModuleUnload(module: i64*): i32
@@ -146,6 +149,8 @@ private trusted noescape extern:"c" fun cuStreamSynchronize(stream: i64*): i32
 private trusted noescape extern:"c" fun cuStreamBeginCapture_v2(stream: i64*, mode: i32): i32
 private trusted noescape extern:"c" fun cuStreamEndCapture(stream: i64*, graph: i64*): i32
 private trusted noescape extern:"c" fun cuEventCreate(event: i64*, flags: u32): i32
+private trusted noescape extern:"c" fun cuEventSynchronize(event: i64*): i32
+private trusted noescape extern:"c" fun cuEventDestroy_v2(event: i64*): i32
 private trusted noescape extern:"c" fun cuEventRecord(event: i64*, stream: i64*): i32
 private trusted noescape extern:"c" fun cuStreamWaitEvent(stream: i64*, event: i64*, flags: u32): i32
 private trusted noescape extern:"c" fun cuGraphInstantiateWithFlags(exec: i64*, graph: i64*, flags: u64): i32
@@ -170,6 +175,66 @@ private class CudaKernelSpec(
     // For an Abla kernel, the bytes of one element of each pointer parameter by position (0 or missing: 4).
     val ablaElementBytes: array<int> = []
 )
+
+// Each upload worker owns two bounded write-combined host slots and one stream.
+// A CUDA event guards reuse of each slot while the other copy is in flight.
+private val CUDA_UPLOAD_SLOT_BYTES = 4 * 1024 * 1024
+private class CudaUploadResult(val status: i32, val call: string)
+private resource class CudaWeightUpload(val context: int, val destination: int, val slices: array<HostUpload>) {
+    trusted fun run(): CudaUploadResult? {
+        val pushed = cuCtxPushCurrent_v2(nativePointerFromAddress(this.context))
+        if (pushed != 0) return CudaUploadResult(pushed, "cuCtxPushCurrent")
+        val storage = nativePointerCell(nativeNullPointer())
+        val allocated = cuMemHostAlloc(storage.address, u64(2 * CUDA_UPLOAD_SLOT_BYTES), 4) == 0 // WRITECOMBINED
+        val result = if (allocated) this.withStaging(nativePointerAddress(storage.load())) else null
+        if (allocated) cuMemFreeHost(storage.load())
+        cuCtxPopCurrent_v2(storage.address)
+        result
+    }
+
+    trusted fun withStaging(base: int): CudaUploadResult? {
+        val streamCell = nativePointerCell(nativeNullPointer())
+        if (cuStreamCreate(streamCell.address, 1) != 0) return null // NON_BLOCKING
+        val stream = streamCell.load()
+        val events: array<int> = []
+        for (index in 0 until 2) {
+            val event = nativePointerCell(nativeNullPointer())
+            if (cuEventCreate(event.address, 2) != 0) break // DISABLE_TIMING
+            events.append(nativePointerAddress(event.load()))
+        }
+        val result = if (events.size == 2) this.enqueue(base, stream, events) else null
+        val drained = cuStreamSynchronize(stream)
+        for (event in events) cuEventDestroy_v2(nativePointerFromAddress(event))
+        cuStreamDestroy_v2(stream)
+        if (result != null && result.status != 0) return result
+        if (drained != 0) return CudaUploadResult(drained, "cuStreamSynchronize")
+        result
+    }
+
+    trusted fun enqueue(base: int, stream: i64*, events: array<int>): CudaUploadResult {
+        var slot = 0
+        for (slice in this.slices) {
+            var sent = 0
+            while (sent < slice.bytes) {
+                val event = nativePointerFromAddress(events[slot])
+                val waited = cuEventSynchronize(event)
+                if (waited != 0) return CudaUploadResult(waited, "cuEventSynchronize")
+                val remaining = slice.bytes - sent
+                val bytes = if (remaining < CUDA_UPLOAD_SLOT_BYTES) remaining else CUDA_UPLOAD_SLOT_BYTES
+                val staging = base + slot * CUDA_UPLOAD_SLOT_BYTES
+                ablaUnsafeCopyMemory(staging, slice.address + sent, bytes)
+                val copied = cuMemcpyHtoDAsync_v2(u64(this.destination + slice.offset + sent),
+                    nativePointerFromAddress(staging), u64(bytes), stream)
+                if (copied != 0) return CudaUploadResult(copied, "cuMemcpyHtoDAsync ($bytes bytes)")
+                val queued = cuEventRecord(event, stream)
+                if (queued != 0) return CudaUploadResult(queued, "cuEventRecord")
+                sent += bytes
+                slot = 1 - slot
+            }
+        }
+        CudaUploadResult(0, "")
+    }
+}
 
 private class CudaModule(val source: string, val abla: bool, val handle: int)
 private class CudaFunction(val name: string, val handle: int)
@@ -1233,6 +1298,40 @@ class CudaBackend(
             nativePointerFromAddress(hostAddress), u64(bytes)), "cuMemcpyHtoD")
         this.popContext()
         ok
+    }
+
+    trusted fun uploadBatch(destination: DeviceBuffer, slices: array<HostUpload>): bool {
+        var end = 0
+        var size = 0
+        for (slice in slices) {
+            if (!this.copyRange(destination, slice.offset, slice.address, slice.bytes)) return false
+            if (slice.offset < end) return uploadBatchSync(this, destination, slices)
+            end = slice.offset + slice.bytes
+            size += slice.bytes
+        }
+        if (size < 2 * CUDA_UPLOAD_SLOT_BYTES || this.recording) return uploadBatchSync(this, destination, slices)
+        // The two streams need nonoverlapping writes and must see earlier work on the arena.
+        if (!this.synchronize()) return false
+        val first: array<HostUpload> = []
+        val second: array<HostUpload> = []
+        var remaining = size / 2
+        for (slice in slices) {
+            val left = if (slice.bytes < remaining) slice.bytes else remaining
+            if (left > 0) first.append(HostUpload(slice.offset, slice.address, left))
+            if (left < slice.bytes) second.append(HostUpload(slice.offset + left, slice.address + left, slice.bytes - left))
+            remaining -= left
+        }
+        val mine = CudaWeightUpload(this.context, destination.handle, first)
+        val theirs = Shared(CudaWeightUpload(this.context, destination.handle, second))
+        val worker = thread { theirs.get().run() }
+        val a = mine.run()
+        val b = await worker
+        if (a != null && !cudaStatus(a.status, a.call)) return false
+        if (b != null && !cudaStatus(b.status, b.call)) return false
+        // If pinning or stream setup was unavailable, both halves are drained
+        // and it is safe to redo the batch with the normal synchronous path.
+        if (a == null || b == null) return uploadBatchSync(this, destination, slices)
+        true
     }
 
     trusted fun download(source: DeviceBuffer, offset: int, hostAddress: int, bytes: int): bool {

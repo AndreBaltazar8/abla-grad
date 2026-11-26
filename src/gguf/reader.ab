@@ -1,5 +1,7 @@
 import "quant.ab"
+import "../cache_hash.ab"
 import "abla/float"
+import "abla/crypto"
 import "abla/sys/linux"
 import "abla/text"
 import "abla/unsafe/memory"
@@ -185,6 +187,25 @@ resource class GgufFile(
     fun has(key: string): bool = this.ggufKeys.has(key)
 
     // Returns the metadata keys in file order.
+    // The embedded tokenizer is part of the header. Hash it without reading
+    // tensor payloads or depending on timestamps, file names, or inode IDs.
+    trusted fun headerSha256(): string? {
+        if (this.ggufMapping.closed) return null
+        val accelerated = kernelSha256Memory(this.ggufMapping.address, this.ggufDataStart)
+        if (accelerated != null) return accelerated
+        val digest = sha256Stream()
+        var offset = 0
+        while (offset < this.ggufDataStart) {
+            val remaining = this.ggufDataStart - offset
+            val size = if (remaining < 1048576) remaining else 1048576
+            val chunk = nativeByteBuffer(size + 1)
+            ablaUnsafeCopyMemory(nativePointerAddress(chunk.address), this.ggufMapping.address + offset, size)
+            digest.update(chunk.adoptString(size))
+            offset += size
+        }
+        digest.finish()
+    }
+
     fun metadataKeys(): array<string> {
         val out: array<string> = []
         for (key in this.ggufKeys.keys()) out.append(key)

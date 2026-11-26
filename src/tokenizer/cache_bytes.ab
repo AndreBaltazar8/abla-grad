@@ -1,0 +1,39 @@
+// The tokenizer cache uses little-endian u32 fields and length-prefixed bytes.
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+class TokenizerCacheReader(val data: string, var at: int = 0) {
+    trusted fun uint(): int {
+        if (this.data.size - this.at < 4) return -1
+        val value = ablaUnsafeLoadU32(nativePointerFromAddress(nativeStringDataAddress(this.data) + this.at))
+        this.at += 4
+        value
+    }
+
+    fun text(): string? {
+        val length = this.uint()
+        if (length < 0 || length > this.data.size - this.at) return null
+        val result = this.data.slice(this.at, this.at + length)
+        this.at += length
+        result
+    }
+}
+
+class TokenizerCacheWriter(val data: NativeByteBuffer, var at: int = 0) {
+    trusted fun uint(value: int): void {
+        ablaUnsafeStoreU32(this.data.pointerAt(this.at), value)
+        this.at += 4
+    }
+
+    trusted fun text(value: string): void {
+        this.uint(value.size)
+        if (value.size > 0) ablaUnsafeCopyMemory(nativePointerAddress(this.data.address) + this.at,
+            nativeStringDataAddress(value), value.size)
+        this.at += value.size
+    }
+
+    trusted fun finish(): string = this.data.adoptString(this.at)
+}
+
+trusted fun tokenizerCacheWriter(size: int): TokenizerCacheWriter =
+    TokenizerCacheWriter(nativeByteBuffer(size + 1))

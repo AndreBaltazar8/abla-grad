@@ -61,6 +61,7 @@ fun weightOf(plan: ArenaPlan, name: string): WeightRef = plan.refs.get(name) ?? 
 /** Allocates the arena and copies every planned tensor from the mapped file. */
 fun uploadWeights(var backend: Backend, file: GgufFile, plan: ArenaPlan): DeviceBuffer? {
     val arena = allocateBuffer(backend, plan.total, "weight arena", { message -> weightsError = message }) ?? return null
+    val uploads: array<HostUpload> = []
     for (name in plan.names) {
         val info = file.tensor(name)
         val ref = plan.refs.get(name)
@@ -71,6 +72,11 @@ fun uploadWeights(var backend: Backend, file: GgufFile, plan: ArenaPlan): Device
             return null
         }
         if (ref.type == GGML_TYPE_Q6_K && info.type == GGML_TYPE_Q8_0) {
+            if (!backend.uploadBatch(arena, uploads)) {
+                weightsError = "uploading the weight arena failed"
+                return null
+            }
+            uploads.clear()
             // re-quantize to Q6_K on the device: the Q8_0 bytes go to a temporary buffer, a kernel writes the Q6_K blocks into the arena
             val temp = allocateBuffer(backend, info.bytes, "requantization buffer for $name", { message -> weightsError = message }) ?? return null
             val blocksPerRow = ref.cols / 256
@@ -80,10 +86,11 @@ fun uploadWeights(var backend: Backend, file: GgufFile, plan: ArenaPlan): Device
                 weightsError = "re-quantizing $name failed"
                 return null
             }
-        } else if (!backend.upload(arena, ref.offset, address, info.bytes)) {
-            weightsError = "uploading $name failed"
-            return null
-        }
+        } else uploads.append(HostUpload(ref.offset, address, info.bytes))
+    }
+    if (!backend.uploadBatch(arena, uploads)) {
+        weightsError = "uploading the weight arena failed"
+        return null
     }
     arena
 }
