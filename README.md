@@ -27,10 +27,10 @@ to the model. See [Serving](docs/serving.md) for setup, endpoints and replay.
 
 | Workload | Result | Measured build |
 |---|---:|---|
-| Plain decode, 0 / 32k / 128k cached | 138.57 / 119.01 / 95.58 tok/s | `cf6578c` |
+| Plain decode, 0 / 32k / 128k cached | 138.69 / 125.54 / 101.39 tok/s | `9b3bbf3` |
 | Prompt processing, 512 tokens | 5547.60 tok/s | `515ce8f` |
 | Server TTFT, 32k / 128k prompt | 10.30 / 53.95 s | `9aaccb1` |
-| 75k serve replay, final request / whole session | 11.593 / 47.226 s | `9aaccb1` |
+| 75k serve replay, final request / whole session | 7.843 / 33.721 s | `34e6098` |
 
 [Benchmarks and reproduction](docs/speed.md) · [Engine](docs/engine.md) ·
 [GGUF packing](docs/gguf-packing.md) · [Reference oracle](tools/oracle/README.md)
