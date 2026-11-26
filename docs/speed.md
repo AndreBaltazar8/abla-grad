@@ -156,6 +156,33 @@ Forced block Q8 and native FP8 each matched all 1,624 reference logit
 rows byte for byte. Raw measurements and commands are in
 `~/archive/abla-grad-prefill-attention-1272.da3VLcEx`.
 
+### Split-key FP8 and 1,024-row prefill
+
+After packing FP8 tiles, the same 128k Nsight workload spent 14.471 s
+in GEMMs and 12.946 s in global attention out of 34.362 GPU seconds.
+The next build, `b03bd24`, doubles the serving prefill workspace to
+1,024 rows when it fits. Deep FP8 global attention processes that
+workspace in two 512-row segments. Each 384-thread block shares its
+key tiles across three query heads and 64 query positions per head.
+Two key partitions feed the same online-softmax merge.
+
+Fixed natural-text requests, zero reused tokens, median of two
+baseline/candidate pairs in opposite order on the RTX 4090.
+
+| Prompt tokens | Raw TTFT `21bc496` (s) | Raw TTFT `b03bd24` (s) | Streamed `21bc496` (s) | Streamed `b03bd24` (s) |
+|---:|---:|---:|---:|---:|
+| 8,192 | 3.241 | 3.027 | 3.300 | 3.086 |
+| 32,768 | 9.554 | 8.323 | 9.617 | 8.386 |
+| 131,072 | 41.292 | 32.472 | 41.368 | 32.548 |
+
+Split-K changes the floating-point reduction order, so deep FP8
+prefill differs at the byte level. Against the pinned reference,
+worst KL was .464 at 32,768 rows and 1.076 at 102,400, within the
+calibrated .727 and 1.469 limits. Dickens perplexity was 10.18635
+before and 10.18240 after. The 64k and 128k retrieval fixtures each
+scored 1/1 for the badge and 3/3 for the facts. Trace, timing logs
+and gate commands are in `~/archive/abla-grad-prefill-profile-1275.sQakOmXj`.
+
 ## Serve replay
 
 Same private eight-request capture, original GGUF and DSpark. Session HTTP
