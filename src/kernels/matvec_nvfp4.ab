@@ -92,4 +92,32 @@ extern "C" __global__ void matvec_nvfp4_indexed(
             sum * expertScales[expertId] : sum;
     }
 }
+
+// matvec_nvfp4_indexed for up to four decode lanes in one launch (multi-session serve, #1292): lane l has its own input
+// xl, output yl and expert ids idsl (nUsed each, laid out as for matvec_nvfp4_indexed), and the lanes share w, the shape
+// and expertScales. blockIdx.y is lane * nUsed + slot; lanes from nLanes on do nothing, so their pointers may repeat
+// lane 0's. Each lane's rows are the same nvfp4_dot as matvec_nvfp4_indexed, bit for bit.
+extern "C" __global__ void matvec_nvfp4_indexed_lanes(
+    const unsigned char *w,
+    const float *x0, float *y0, const unsigned *ids0, const float *x1, float *y1, const unsigned *ids1,
+    const float *x2, float *y2, const unsigned *ids2, const float *x3, float *y3, const unsigned *ids3,
+    unsigned rows, unsigned cols, unsigned nUsed, unsigned nLanes, unsigned long long expertStrideBytes,
+    unsigned xStrideElems, const float *expertScales) {
+    unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (nUsed == 0) return;
+    unsigned lane = blockIdx.y / nUsed, slot = blockIdx.y % nUsed;
+    if (row >= rows || lane >= nLanes || lane >= 4) return;
+    const float *x = lane == 0 ? x0 : lane == 1 ? x1 : lane == 2 ? x2 : x3;
+    float *y = lane == 0 ? y0 : lane == 1 ? y1 : lane == 2 ? y2 : y3;
+    const unsigned *ids = lane == 0 ? ids0 : lane == 1 ? ids1 : lane == 2 ? ids2 : ids3;
+    unsigned long long rowBytes = static_cast<unsigned long long>(cols / 64) * 36;
+    unsigned expertId = ids[slot];
+    const unsigned char *expert = w + expertId * expertStrideBytes;
+    const float *input = x + static_cast<unsigned long long>(slot) * xStrideElems;
+    float sum = nvfp4_dot(expert + row * rowBytes, input, cols);
+    if ((threadIdx.x & 31u) == 0) {
+        y[static_cast<unsigned long long>(slot) * rows + row] = expertScales ?
+            sum * expertScales[expertId] : sum;
+    }
+}
 """

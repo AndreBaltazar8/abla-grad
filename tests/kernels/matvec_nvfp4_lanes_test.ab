@@ -1,0 +1,129 @@
+// matvec_nvfp4_indexed_lanes (multi-session decode, #1292): for 2, 3 and 4 lanes, each lane's output equals a separate
+// matvec_nvfp4_indexed launch on that lane's input and ids bit for bit, and an inactive lane's output buffer is never
+// written. Inputs round (thirds and sevenths of the weights' powers of two), so a changed order of additions would show.
+import "../../src/backend/backend.ab"
+import "device_test_support.ab"
+import "abla/float"
+import "abla/io"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+// A quiet NaN with a payload no kernel produces, filling an inactive lane's output.
+val lanesCanary = 2143292333
+
+/** A device buffer holding `bytes` (null when the allocation or upload fails). */
+trusted fun lanesUpload(backend: Backend, bytes: NativeByteBuffer): DeviceBuffer? {
+    val buffer = backend.allocate(bytes.capacity)
+    if (buffer == null) return null
+    if (!backend.upload(buffer, 0, nativePointerAddress(bytes.address), bytes.capacity)) return null
+    buffer
+}
+
+/** The u32 words of `buffer` on the device (`count` of them), or [] when the download fails. */
+trusted fun lanesDownload(backend: Backend, buffer: DeviceBuffer, count: int): array<int> {
+    val host = nativeByteBuffer(count * 4)
+    if (!backend.download(buffer, 0, nativePointerAddress(host.address), count * 4)) return []
+    var words: array<int> = []
+    for (i in 0 until count) words.append(ablaUnsafeLoadU32(nativePointerFromAddress(nativePointerAddress(host.address) + i * 4)))
+    words
+}
+
+/** One case: `lanes` active lanes of `nUsed` slots each over `experts` experts of rows x cols, inputs `xStride` apart. */
+trusted fun lanesCase(backend: Backend, lanes: int, rows: int, cols: int, experts: int, nUsed: int, xStride: int, withScales: bool): bool {
+    val rowBytes = cols / 64 * 36
+    val stride = rows * rowBytes + 16
+    val weights = nativeByteBuffer(experts * stride)
+    for (byte in 0 until weights.capacity) weights.store(byte, (byte * 53 + byte / 36 * 17 + byte / 11 + lanes) & 255)
+    // Zero, GGML's reserved 0x7f and subnormal scales among the codes.
+    weights.store(0, 0)
+    weights.store(1, 127)
+    weights.store(2, 7)
+    val scales = nativeByteBuffer(experts * 4)
+    for (e in 0 until experts) testStoreFloat(nativePointerAddress(scales.address), e, f32FromInt(e * 3 - 5) / f32(7.0))
+    val w = lanesUpload(backend, weights)
+    val gpuScales = lanesUpload(backend, scales)
+    if (w == null || gpuScales == null) return false
+    var xs: array<DeviceBuffer> = []
+    var ys: array<DeviceBuffer> = []
+    var refs: array<DeviceBuffer> = []
+    var idss: array<DeviceBuffer> = []
+    val inputFloats = (nUsed - 1) * xStride + cols
+    for (lane in 0 until 4) {
+        val input = nativeByteBuffer(inputFloats * 4)
+        for (i in 0 until inputFloats) {
+            val v = f32FromInt((i * 7919 + lane * 104729) % 2001 - 1000) / f32(3.0 * 337.0)
+            testStoreFloat(nativePointerAddress(input.address), i, v)
+        }
+        val ids = nativeByteBuffer(nUsed * 4)
+        // Lanes overlap in some experts and not others, as decode lanes do.
+        for (slot in 0 until nUsed) ablaUnsafeStoreU32(nativePointerFromAddress(nativePointerAddress(ids.address) + slot * 4), (slot * 2 + lane) % experts)
+        val canary = nativeByteBuffer(nUsed * rows * 4)
+        for (i in 0 until nUsed * rows) ablaUnsafeStoreU32(nativePointerFromAddress(nativePointerAddress(canary.address) + i * 4), lanesCanary)
+        val x = lanesUpload(backend, input)
+        val ids0 = lanesUpload(backend, ids)
+        val y = lanesUpload(backend, canary)
+        val ref = backend.allocate(nUsed * rows * 4)
+        if (x == null || ids0 == null || y == null || ref == null) return false
+        xs.append(move(x))
+        idss.append(move(ids0))
+        ys.append(move(y))
+        refs.append(move(ref))
+    }
+    // The reference: one matvec_nvfp4_indexed launch per active lane.
+    for (lane in 0 until lanes) {
+        var args = kernelArgs().pointer(w).pointer(xs[lane]).pointer(refs[lane]).u32(rows).u32(cols).pointer(idss[lane])
+        args.u32(nUsed)
+        args.u64(stride)
+        args.u32(xStride)
+        if (withScales) args.pointer(gpuScales) else args.u64(0)
+        if (!backend.launch("matvec_nvfp4_indexed", args, [rows, nUsed])) return false
+    }
+    var args = kernelArgs().pointer(w)
+    for (lane in 0 until 4) {
+        args.pointer(xs[lane])
+        args.pointer(ys[lane])
+        args.pointer(idss[lane])
+    }
+    args.u32(rows)
+    args.u32(cols)
+    args.u32(nUsed)
+    args.u32(lanes)
+    args.u64(stride)
+    args.u32(xStride)
+    if (withScales) args.pointer(gpuScales) else args.u64(0)
+    if (!backend.launch("matvec_nvfp4_indexed_lanes", args, [rows, lanes * nUsed]) || !backend.synchronize()) {
+        eprintln("lanes ${lanes}: the batched launch failed")
+        return false
+    }
+    for (lane in 0 until 4) {
+        val got = lanesDownload(backend, ys[lane], nUsed * rows)
+        if (got.size != nUsed * rows) return false
+        if (lane >= lanes) {
+            for (i in 0 until got.size) if (got[i] != lanesCanary) {
+                eprintln("lanes ${lanes}: inactive lane ${lane} was written at ${i}")
+                return false
+            }
+        } else {
+            val want = lanesDownload(backend, refs[lane], nUsed * rows)
+            if (want.size != got.size) return false
+            for (i in 0 until got.size) if (got[i] != want[i]) {
+                eprintln("lanes ${lanes} rows ${rows} cols ${cols}: lane ${lane} slot ${i / rows} row ${i % rows} has bits ${got[i]}, a lone launch ${want[i]}")
+                return false
+            }
+        }
+    }
+    true
+}
+
+fun lanesCases(backend: Backend): bool {
+    // 37 rows leave a last subgroup of one row; a 320-float stride keeps every slot's input 16-byte aligned (the fast
+    // path), and 1161 does not (the checked path).
+    var passed = true
+    for (lanes in 1 until 5) {
+        passed = passed && lanesCase(backend, lanes, 37, 320, 6, 4, 320, false) &&
+            lanesCase(backend, lanes, 37, 1152, 5, 3, 1161, true)
+    }
+    passed
+}
+
+fun main: int = runCudaKernelTest("NVFP4 indexed matvec for 1 to 4 lanes", lanesCases)

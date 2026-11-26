@@ -425,6 +425,30 @@ private fun cudaIndexedShape(args: KernelArgs, problem: array<int>, blockElement
 private fun cudaNvfp4IndexedShape(args: KernelArgs, problem: array<int>): bool =
     cudaIndexedShape(args, problem, 64, 36)
 
+// matvec_nvfp4_indexed_lanes (src/kernels/matvec_nvfp4.ab): w, then (x, y, ids) for four lanes, then rows, cols, nUsed,
+// nLanes, the expert stride in bytes, the input stride and the expert scales (which may be null).
+private val cudaIndexedLanesArguments = [
+    KERNEL_ARG_POINTER,
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
+    KERNEL_ARG_POINTER, KERNEL_ARG_POINTER, KERNEL_ARG_POINTER,
+    KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U32, KERNEL_ARG_U64, KERNEL_ARG_U32, KERNEL_ARG_POINTER
+]
+
+// The grid is [rows, nLanes * nUsed] with one to four lanes; the weight and input strides follow cudaIndexedShape's rules.
+private fun cudaNvfp4IndexedLanesShape(args: KernelArgs, problem: array<int>): bool {
+    val rows = args.words[13]
+    val cols = args.words[14]
+    val nUsed = args.words[15]
+    val nLanes = args.words[16]
+    val stride = args.words[17]
+    val xStride = args.words[18]
+    if (rows != problem[0] || cols <= 0 || cols % 64 != 0 || nUsed <= 0 || nLanes < 1 || nLanes > 4 ||
+        problem[1] != nUsed * nLanes) return false
+    stride > 0 && stride % 4 == 0 && args.words[0] % 4 == 0 && rows <= stride / (cols / 64 * 36) && (xStride == 0 || xStride >= cols)
+}
+
 private fun cudaQ8IndexedShape(args: KernelArgs, problem: array<int>): bool =
     cudaIndexedShape(args, problem, 32, 34)
 
@@ -738,6 +762,9 @@ private val cudaKernels = [
     CudaKernelSpec("matvec_nvfp4", kernelMatvecNvfp4, 4, 128, cudaMatvecArguments, cudaNvfp4Shape),
     CudaKernelSpec("matvec_nvfp4_indexed", kernelMatvecNvfp4, 4, 128,
         cudaIndexedMatvecArguments, cudaNvfp4IndexedShape, 2, 9),
+    // Its batched entry point: up to four lanes' (x, y, ids), blockIdx.y lane * nUsed + slot.
+    CudaKernelSpec("matvec_nvfp4_indexed_lanes", kernelMatvecNvfp4, 4, 128,
+        cudaIndexedLanesArguments, cudaNvfp4IndexedLanesShape, 2, 19),
     CudaKernelSpec("matvec_q8_0_decode_batch", kernelBatchQ8_0, 4, 128, cudaQ8DecodeBatchArguments, cudaQ8DecodeBatchShape),
     CudaKernelSpec("matvec_q8_0", kernelMatvecQ8_0, 4, 128, cudaMatvecArguments, cudaQ8Shape),
     CudaKernelSpec("matvec_q8_0_indexed", kernelMatvecQ8_0, 4, 128,

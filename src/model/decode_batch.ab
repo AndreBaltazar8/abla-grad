@@ -55,6 +55,45 @@ private fun launchDenseBatch(var backend: Backend, plans: array<DecodePlan>, ste
     backend.launch("matvec_q8_0_decode_batch", args, first.problem)
 }
 
+// matvec_nvfp4_indexed's arguments that every lane must share to join one launch: the expert weights, rows, cols,
+// nUsed, the expert stride, the input stride and the expert scales. Each lane keeps its own input (1), output (2) and
+// router ids (5).
+private val expertSharedArgs = [0, 3, 4, 6, 7, 8, 9]
+
+private fun expertLaunchesShare(plans: array<DecodePlan>, step: int): bool {
+    val first = plans[0].launches[step]
+    for (plan in plans) {
+        val launch = plan.launches[step]
+        if (launch.args.words.size != first.args.words.size) return false
+        for (i in expertSharedArgs) {
+            if (launch.args.kinds[i] != first.args.kinds[i] || launch.args.words[i] != first.args.words[i]) return false
+        }
+    }
+    true
+}
+
+// One matvec_nvfp4_indexed_lanes launch for the lanes' expert down projections: each lane's rows are the same dot as its
+// own launch, and the argument slots past the live lanes repeat lane 0's (the kernel does nothing for them).
+private fun launchExpertBatch(var backend: Backend, plans: array<DecodePlan>, step: int): bool {
+    val first = plans[0].launches[step]
+    var args = kernelArgs()
+    copyDecodeArg(args, first.args, 0)
+    for (lane in 0 until 4) {
+        val source = plans[if (lane < plans.size) lane else 0].launches[step].args
+        copyDecodeArg(args, source, 1)
+        copyDecodeArg(args, source, 2)
+        copyDecodeArg(args, source, 5)
+    }
+    copyDecodeArg(args, first.args, 3)
+    copyDecodeArg(args, first.args, 4)
+    copyDecodeArg(args, first.args, 6)
+    args.u32(plans.size)
+    copyDecodeArg(args, first.args, 7)
+    copyDecodeArg(args, first.args, 8)
+    copyDecodeArg(args, first.args, 9)
+    backend.launch("matvec_nvfp4_indexed_lanes", args, [first.problem[0], plans.size * first.problem[1]])
+}
+
 private fun splitAttentionLaunch(name: string): bool =
     name.startsWith("attention_rel_split_step") || name.startsWith("attention_rel_grouped_step")
 
@@ -98,6 +137,9 @@ private fun launchDecodeNode(var backend: Backend, plans: array<DecodePlan>, ste
         return backend.join()
     }
     if (first.name == "matvec_q8_0") return launchDenseBatch(backend, plans, step)
+    if (first.name == "matvec_nvfp4_indexed" && first.problem.size == 2 && expertLaunchesShare(plans, step)) {
+        return launchExpertBatch(backend, plans, step)
+    }
     if (splitAttentionLaunch(first.name) || first.name == "attention_rel_merge_gated") return launchAttentionBatch(backend, plans, step)
     for (plan in plans) {
         val launch = plan.launches[step]
