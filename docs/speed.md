@@ -53,6 +53,26 @@ bench=("$HOME/models/llama.cpp-33aeb17f85869279e3821f746bc645357139bc2c/cuda/bin
     -ngl 999 -ctk f16 -ctv f16 -fa auto -o json
 ```
 
+## Multi-session batched decode
+
+Aggregate greedy tokens per second of two to four independent sessions decoded in one graph (serve's
+`--batch-decode`), 128 timed steps, mean of three runs interleaved with the previous build. Each lane starts from a
+short seeded prefix (3 to 30 tokens), so attention is shallow. Every run compares each lane's greedy IDs and all
+200,058 final logits with the same lane replayed alone, and all matched bit for bit.
+
+| Lanes | abla-grad `63d7c54` tok/s | abla-grad `ce57198` tok/s |
+|---:|---:|---:|
+| 2 | 183.1 | 207.6 |
+| 3 | 200.8 | 241.5 |
+| 4 | 218.5 | 283.7 |
+
+`ce57198` runs each lane's unbatched launches on its own graph branch. Build `tests/bench/decode_sessions.ab` with
+the installed ablac and the Nix shell's CUDA and NVRTC, then run, for each lane count:
+
+```sh
+tools/gpu-lock.sh -- taskset -c 24-27 build/decode_sessions "$model" 128 "$lanes"
+```
+
 ## Prompt processing
 
 Synthetic prompts use each engine's own IDs. Abla reports its second timed
