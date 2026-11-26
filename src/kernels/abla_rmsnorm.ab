@@ -14,16 +14,16 @@ val ablaRmsnormKernel = "rmsnorm"
 private trusted fun rmsnormLoad(buffer: KernelF32Buffer, index: int, inside: bool): f32 =
     if (inside) buffer.loadUnchecked(index) else buffer.load(index)
 
-// y = x * factor (times w when weighted) at elements at, at + 128, ..., at + 640 of the row at `base`: the six x loads
-// (and w loads) first, then the six stores. Its caller has shown the row inside x and w.
-private trusted fun rmsnormScale6(x: KernelF32Buffer, w: KernelF32Buffer, y: KernelF32Buffer, base: int, at: int, factor: f32,
-    weighted: bool) {
-    val a = x.loadUnchecked(base + at)
-    val b = x.loadUnchecked(base + at + 128)
-    val c = x.loadUnchecked(base + at + 256)
-    val d = x.loadUnchecked(base + at + 384)
-    val e = x.loadUnchecked(base + at + 512)
-    val f = x.loadUnchecked(base + at + 640)
+// y = x * factor (times w when weighted) at elements at, at + 128, ..., at + 640 of the row at `xBase` in x and `yBase` in
+// y: the six x loads (and w loads) first, then the six stores. Its caller has shown the row inside x and w.
+private trusted fun rmsnormScale6(x: KernelF32Buffer, w: KernelF32Buffer, y: KernelF32Buffer, xBase: int, yBase: int, at: int,
+    factor: f32, weighted: bool) {
+    val a = x.loadUnchecked(xBase + at)
+    val b = x.loadUnchecked(xBase + at + 128)
+    val c = x.loadUnchecked(xBase + at + 256)
+    val d = x.loadUnchecked(xBase + at + 384)
+    val e = x.loadUnchecked(xBase + at + 512)
+    val f = x.loadUnchecked(xBase + at + 640)
     if (weighted) {
         val wa = w.loadUnchecked(at)
         val wb = w.loadUnchecked(at + 128)
@@ -31,31 +31,30 @@ private trusted fun rmsnormScale6(x: KernelF32Buffer, w: KernelF32Buffer, y: Ker
         val wd = w.loadUnchecked(at + 384)
         val we = w.loadUnchecked(at + 512)
         val wf = w.loadUnchecked(at + 640)
-        y.store(base + at, (a * factor) * wa)
-        y.store(base + at + 128, (b * factor) * wb)
-        y.store(base + at + 256, (c * factor) * wc)
-        y.store(base + at + 384, (d * factor) * wd)
-        y.store(base + at + 512, (e * factor) * we)
-        y.store(base + at + 640, (f * factor) * wf)
+        y.store(yBase + at, (a * factor) * wa)
+        y.store(yBase + at + 128, (b * factor) * wb)
+        y.store(yBase + at + 256, (c * factor) * wc)
+        y.store(yBase + at + 384, (d * factor) * wd)
+        y.store(yBase + at + 512, (e * factor) * we)
+        y.store(yBase + at + 640, (f * factor) * wf)
     } else {
-        y.store(base + at, a * factor)
-        y.store(base + at + 128, b * factor)
-        y.store(base + at + 256, c * factor)
-        y.store(base + at + 384, d * factor)
-        y.store(base + at + 512, e * factor)
-        y.store(base + at + 640, f * factor)
+        y.store(yBase + at, a * factor)
+        y.store(yBase + at + 128, b * factor)
+        y.store(yBase + at + 256, c * factor)
+        y.store(yBase + at + 384, d * factor)
+        y.store(yBase + at + 512, e * factor)
+        y.store(yBase + at + 640, f * factor)
     }
 }
 
-// The row's loads are on the unchecked fast path (#143) when the whole row is inside `x` and `w` covers the row (or is
-// empty): checked once here, so the loop's loads can be issued together instead of one branch each.
-@kernel
-fun rmsnorm(x: KernelF32Buffer, w: KernelF32Buffer, y: KernelF32Buffer, n: int, eps: f32) {
-    val sums = kernelSharedF32(128)
+// One row: y[yBase ..] = rmsnorm(x[xBase ..]) (times w when it is not empty), by the whole group (`sums` its 128 shared
+// floats). The row's loads are on the unchecked fast path (#143) when the whole row is inside `x` and `w` covers the
+// row (or is empty): checked once here, so the loop's loads can be issued together instead of one branch each.
+private fun rmsnormRow(x: KernelF32Buffer, xBase: int, w: KernelF32Buffer, y: KernelF32Buffer, yBase: int, n: int, eps: f32,
+    sums: KernelF32Buffer) {
     val lane = kernelLocalId()
     val size = kernelGroupSize()
-    val base = kernelGroupId() * n
-    val inside = n >= 0 && base >= 0 && base + n <= x.size()
+    val inside = n >= 0 && xBase >= 0 && xBase + n <= x.size()
     val weighted = w.size() > 0
     val weightsInside = !weighted || n <= w.size()
     var sum = f32(0.0)
@@ -66,7 +65,7 @@ fun rmsnorm(x: KernelF32Buffer, w: KernelF32Buffer, y: KernelF32Buffer, n: int, 
     if (row2304) {
         var k = 0
         while (k < 18) {
-            val value = rmsnormLoad(x, base + lane + k * 128, true)
+            val value = rmsnormLoad(x, xBase + lane + k * 128, true)
             sum = kernelFma(value, value, sum)
             k = k + 1
         }
@@ -75,10 +74,10 @@ fun rmsnorm(x: KernelF32Buffer, w: KernelF32Buffer, y: KernelF32Buffer, n: int, 
     if (inside) {
         // Four loads in flight before their fmas (the same fmas in the same order).
         while (i + 3 * size < n) {
-            val a = rmsnormLoad(x, base + i, true)
-            val b = rmsnormLoad(x, base + i + size, true)
-            val c = rmsnormLoad(x, base + i + 2 * size, true)
-            val d = rmsnormLoad(x, base + i + 3 * size, true)
+            val a = rmsnormLoad(x, xBase + i, true)
+            val b = rmsnormLoad(x, xBase + i + size, true)
+            val c = rmsnormLoad(x, xBase + i + 2 * size, true)
+            val d = rmsnormLoad(x, xBase + i + 3 * size, true)
             sum = kernelFma(a, a, sum)
             sum = kernelFma(b, b, sum)
             sum = kernelFma(c, c, sum)
@@ -87,7 +86,7 @@ fun rmsnorm(x: KernelF32Buffer, w: KernelF32Buffer, y: KernelF32Buffer, n: int, 
         }
     }
     while (i < n) {
-        val value = rmsnormLoad(x, base + i, inside)
+        val value = rmsnormLoad(x, xBase + i, inside)
         sum = kernelFma(value, value, sum)
         i = i + size
     }
@@ -116,14 +115,36 @@ fun rmsnorm(x: KernelF32Buffer, w: KernelF32Buffer, y: KernelF32Buffer, n: int, 
         // Six elements' loads in flight, then their stores (y may be x: each thread rewrites only what it read).
         var k = 0
         while (k < 18) {
-            rmsnormScale6(x, w, y, base, lane + k * 128, factor, weighted)
+            rmsnormScale6(x, w, y, xBase, yBase, lane + k * 128, factor, weighted)
             k = k + 6
         }
         i = n
     }
     while (i < n) {
-        val value = rmsnormLoad(x, base + i, inside) * factor
-        y.store(base + i, if (weighted) value * rmsnormLoad(w, i, weightsInside) else value)
+        val value = rmsnormLoad(x, xBase + i, inside) * factor
+        y.store(yBase + i, if (weighted) value * rmsnormLoad(w, i, weightsInside) else value)
         i = i + size
     }
+}
+
+@kernel
+fun rmsnorm(x: KernelF32Buffer, w: KernelF32Buffer, y: KernelF32Buffer, n: int, eps: f32) {
+    val sums = kernelSharedF32(128)
+    val base = kernelGroupId() * n
+    rmsnormRow(x, base, w, y, base, n, eps, sums)
+}
+
+// The launch name of rmsnorm_three below.
+val ablaRmsnormThreeKernel = "rmsnorm_three"
+
+// rmsnorm.ab's rmsnorm_three as an Abla kernel (the same bits): group j writes row j of `out` (n floats a row) as
+// rmsnorm(x_j) * w_j, the three inputs and weights each its own buffer. Three groups of 128 threads.
+@kernel
+fun rmsnorm_three(x0: KernelF32Buffer, x1: KernelF32Buffer, x2: KernelF32Buffer, w0: KernelF32Buffer, w1: KernelF32Buffer,
+    w2: KernelF32Buffer, out: KernelF32Buffer, n: int, eps: f32) {
+    val sums = kernelSharedF32(128)
+    val row = kernelGroupId()
+    if (row == 0) rmsnormRow(x0, 0, w0, out, 0, n, eps, sums)
+    else if (row == 1) rmsnormRow(x1, 0, w1, out, n, n, eps, sums)
+    else if (row == 2) rmsnormRow(x2, 0, w2, out, 2 * n, n, eps, sums)
 }
