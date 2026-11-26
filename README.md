@@ -28,7 +28,7 @@ to the model. See [Serving](docs/serving.md) for setup, endpoints and replay.
 | Workload | Result | Measured build |
 |---|---:|---|
 | Plain decode, 0 / 32k / 128k cached | 138.69 / 125.54 / 101.39 tok/s | `9b3bbf3` |
-| Batched decode, 2 / 3 / 4 sessions (aggregate) | 219.5 / 265.0 / 291.1 tok/s | `524259e` |
+| Batched decode, 2 / 3 / 4 sessions (aggregate) | 221.1 / 268.5 / 304.8 tok/s | `be1b654` |
 | Prompt processing, 512 tokens | 5547.60 tok/s | `515ce8f` |
 | Server TTFT, 32k / 128k prompt | 10.30 / 53.95 s | `9aaccb1` |
 | 75k serve replay, final request / whole session | 7.843 / 33.721 s | `34e6098` |
